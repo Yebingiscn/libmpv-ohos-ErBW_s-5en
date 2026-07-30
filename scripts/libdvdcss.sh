@@ -25,7 +25,7 @@ mkdir -p .build
 cd .build
 
 ../configure \
-  --host=aarch64-linux-ohos \
+  --host=aarch64-linux-musl \
   --prefix=$DEST \
   --disable-shared \
   --enable-static \
