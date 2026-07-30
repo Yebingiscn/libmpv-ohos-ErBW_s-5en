@@ -1,0 +1,412 @@
+diff --git a/src/dvd_iso9660.c b/src/dvd_iso9660.c
+new file mode 100644
+index 0000000..0c06779
+--- /dev/null
++++ b/src/dvd_iso9660.c
+@@ -0,0 +1,248 @@
++/*
++ * Minimal ISO 9660 file lookup for DVD images whose UDF metadata is missing
++ * or unreadable.
++ *
++ * This file is part of libdvdread.
++ *
++ * libdvdread is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#include "config.h"
++
++#include <ctype.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "dvd_iso9660.h"
++#include "dvdread_internal.h"
++
++#define ISO9660_PVD_SECTOR 16
++#define ISO9660_MAX_VOLUME_DESCRIPTORS 64
++#define ISO9660_ROOT_RECORD_OFFSET 156
++#define ISO9660_DIRECTORY_FLAG 0x02
++#define ISO9660_MAX_DIRECTORY_SIZE (16U * 1024U * 1024U)
++
++struct iso9660_record {
++  uint32_t extent;
++  uint32_t size;
++  uint8_t flags;
++};
++
++static uint32_t read_le32(const uint8_t *p)
++{
++  return (uint32_t)p[0] |
++         ((uint32_t)p[1] << 8) |
++         ((uint32_t)p[2] << 16) |
++         ((uint32_t)p[3] << 24);
++}
++
++static int read_blocks(dvd_reader_t *ctx, uint32_t sector, size_t count,
++                       uint8_t *data)
++{
++  return InternalUDFReadBlocksRaw(ctx, sector, count, data, 0) == (int)count;
++}
++
++static int read_record(const uint8_t *record, size_t available,
++                       struct iso9660_record *out)
++{
++  uint8_t record_length;
++  uint8_t name_length;
++
++  if (available < 34)
++    return 0;
++
++  record_length = record[0];
++  if (record_length < 34 || record_length > available)
++    return 0;
++
++  name_length = record[32];
++  if ((size_t)33 + name_length > record_length)
++    return 0;
++
++  out->extent = read_le32(record + 2) + record[1];
++  out->size = read_le32(record + 10);
++  out->flags = record[25];
++  return 1;
++}
++
++static int identifier_matches(const uint8_t *identifier, size_t length,
++                              const char *component, size_t component_length)
++{
++  size_t normalized_length = length;
++  size_t i;
++
++  if (length == 1 && (identifier[0] == 0 || identifier[0] == 1))
++    return 0;
++
++  for (i = 0; i < length; ++i) {
++    if (identifier[i] == ';') {
++      normalized_length = i;
++      break;
++    }
++  }
++
++  while (normalized_length > 0 &&
++         identifier[normalized_length - 1] == '.')
++    --normalized_length;
++
++  if (normalized_length != component_length)
++    return 0;
++
++  for (i = 0; i < normalized_length; ++i) {
++    unsigned char lhs = identifier[i];
++    unsigned char rhs = (unsigned char)component[i];
++    if (toupper(lhs) != toupper(rhs))
++      return 0;
++  }
++
++  return 1;
++}
++
++static int find_in_directory(dvd_reader_t *ctx,
++                             const struct iso9660_record *directory,
++                             const char *component, size_t component_length,
++                             int require_directory,
++                             struct iso9660_record *result)
++{
++  uint8_t *data;
++  size_t blocks;
++  size_t buffer_size;
++  size_t offset = 0;
++  int found = 0;
++
++  if (!(directory->flags & ISO9660_DIRECTORY_FLAG) ||
++      directory->size == 0 ||
++      directory->size > ISO9660_MAX_DIRECTORY_SIZE)
++    return 0;
++
++  blocks = (directory->size + DVD_VIDEO_LB_LEN - 1) / DVD_VIDEO_LB_LEN;
++  if (blocks > SIZE_MAX / DVD_VIDEO_LB_LEN)
++    return 0;
++
++  buffer_size = blocks * DVD_VIDEO_LB_LEN;
++  data = malloc(buffer_size);
++  if (!data)
++    return 0;
++
++  if (!read_blocks(ctx, directory->extent, blocks, data))
++    goto done;
++
++  while (offset < directory->size) {
++    size_t sector_offset = offset % DVD_VIDEO_LB_LEN;
++    size_t sector_remaining = DVD_VIDEO_LB_LEN - sector_offset;
++    uint8_t record_length = data[offset];
++    uint8_t name_length;
++    struct iso9660_record current;
++
++    if (record_length == 0) {
++      offset += sector_remaining;
++      continue;
++    }
++
++    if (record_length > sector_remaining ||
++        offset + record_length > buffer_size ||
++        !read_record(data + offset, record_length, &current))
++      break;
++
++    name_length = data[offset + 32];
++    if (identifier_matches(data + offset + 33, name_length,
++                           component, component_length) &&
++        (!require_directory ||
++         (current.flags & ISO9660_DIRECTORY_FLAG))) {
++      *result = current;
++      found = 1;
++      break;
++    }
++
++    offset += record_length;
++  }
++
++done:
++  free(data);
++  return found;
++}
++
++static int find_root_directory(dvd_reader_t *ctx,
++                               struct iso9660_record *root)
++{
++  uint8_t descriptor[DVD_VIDEO_LB_LEN];
++  uint32_t sector;
++
++  for (sector = ISO9660_PVD_SECTOR;
++       sector < ISO9660_PVD_SECTOR + ISO9660_MAX_VOLUME_DESCRIPTORS;
++       ++sector) {
++    if (!read_blocks(ctx, sector, 1, descriptor))
++      return 0;
++
++    if (memcmp(descriptor + 1, "CD001", 5) != 0 ||
++        descriptor[6] != 1)
++      continue;
++
++    if (descriptor[0] == 255)
++      return 0;
++
++    if (descriptor[0] == 1) {
++      uint16_t logical_block_size =
++          (uint16_t)descriptor[128] |
++          ((uint16_t)descriptor[129] << 8);
++
++      if (logical_block_size != DVD_VIDEO_LB_LEN)
++        return 0;
++
++      return read_record(descriptor + ISO9660_ROOT_RECORD_OFFSET,
++                         DVD_VIDEO_LB_LEN - ISO9660_ROOT_RECORD_OFFSET,
++                         root);
++    }
++  }
++
++  return 0;
++}
++
++uint32_t ISO9660FindFile(dvd_reader_t *ctx, const char *filename,
++                        uint32_t *size)
++{
++  struct iso9660_record current;
++  const char *cursor;
++
++  if (size)
++    *size = 0;
++  if (!ctx || !filename || !find_root_directory(ctx, &current))
++    return 0;
++
++  cursor = filename;
++  while (*cursor == '/')
++    ++cursor;
++
++  if (!*cursor) {
++    if (size)
++      *size = current.size;
++    return current.extent;
++  }
++
++  while (*cursor) {
++    const char *component = cursor;
++    size_t component_length;
++    int require_directory;
++
++    while (*cursor && *cursor != '/')
++      ++cursor;
++    component_length = (size_t)(cursor - component);
++
++    while (*cursor == '/')
++      ++cursor;
++    require_directory = *cursor != '\0';
++
++    if (component_length == 0 ||
++        !find_in_directory(ctx, &current, component, component_length,
++                           require_directory, &current))
++      return 0;
++  }
++
++  if (size)
++    *size = current.size;
++  return current.extent;
++}
+diff --git a/src/dvd_iso9660.h b/src/dvd_iso9660.h
+new file mode 100644
+index 0000000..75ef2ac
+--- /dev/null
++++ b/src/dvd_iso9660.h
+@@ -0,0 +1,20 @@
++/*
++ * This file is part of libdvdread.
++ *
++ * libdvdread is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#ifndef LIBDVDREAD_DVD_ISO9660_H
++#define LIBDVDREAD_DVD_ISO9660_H
++
++#include <stdint.h>
++
++#include "dvdread/dvd_reader.h"
++
++uint32_t ISO9660FindFile(dvd_reader_t *ctx, const char *filename,
++                        uint32_t *size);
++
++#endif /* LIBDVDREAD_DVD_ISO9660_H */
+diff --git a/src/dvd_reader.c b/src/dvd_reader.c
+index 8f791d5..83d2ef6 100644
+--- a/src/dvd_reader.c
++++ b/src/dvd_reader.c
+@@ -53,6 +53,7 @@
+ 
+ #include "dvdread/dvd_udf.h"
+ #include "dvdread/dvd_reader.h"
++#include "dvd_iso9660.h"
+ #include "dvd_input.h"
+ #include "dvdread_internal.h"
+ #include "md5.h"
+@@ -272,6 +273,20 @@ void SetUDFCacheHandle(dvd_reader_t *reader, void *cache)
+   dev->udfcache = cache;
+ }
+ 
++static uint32_t DVDImageFindFile(dvd_reader_t *ctx, const char *filename,
++                                 uint32_t *len)
++{
++  uint32_t start = UDFFindFile(ctx, filename, len);
++
++  if (!start) {
++    start = ISO9660FindFile(ctx, filename, len);
++    if (start)
++      Log1(ctx, "Using ISO9660 fallback for %s", filename);
++  }
++
++  return start;
++}
++
+ 
+ 
+ /* Loop over all titles and call dvdcss_title to crack the keys. */
+@@ -299,7 +314,7 @@ static int initAllCSSKeys( dvd_reader_t *ctx )
+     } else {
+       sprintf( filename, "/VIDEO_TS/VTS_%02d_%d.VOB", title, 0 );
+     }
+-    start = UDFFindFile( ctx, filename, &len );
++    start = DVDImageFindFile( ctx, filename, &len );
+     if( start != 0 && len != 0 ) {
+       /* Perform CSS key cracking for this title. */
+       Log3(ctx,"Get key for %s at 0x%08x",filename, start );
+@@ -314,7 +329,7 @@ static int initAllCSSKeys( dvd_reader_t *ctx )
+ 
+     gettimeofday( &t_s, NULL );
+     sprintf( filename, "/VIDEO_TS/VTS_%02d_%d.VOB", title, 1 );
+-    start = UDFFindFile( ctx, filename, &len );
++    start = DVDImageFindFile( ctx, filename, &len );
+     if( start == 0 || len == 0 ) break;
+ 
+     /* Perform CSS key cracking for this title. */
+@@ -817,9 +832,9 @@ static dvd_file_t *DVDOpenFileUDF( dvd_reader_t *ctx, const char *filename,
+   uint32_t start, len;
+   dvd_file_t *dvd_file;
+ 
+-  start = UDFFindFile( ctx, filename, &len );
++  start = DVDImageFindFile( ctx, filename, &len );
+   if( !start ) {
+-    Log0( ctx, "DVDOpenFileUDF:UDFFindFile %s failed", filename );
++    Log0( ctx, "DVDOpenFileUDF: cannot find %s in UDF or ISO9660", filename );
+     return NULL;
+   }
+ 
+@@ -977,7 +992,7 @@ static uint8_t *cppm_get_mkb_or_backup( dvd_reader_t *ctx, int backup )
+   /* exits early if there is no MKB file */
+   if( dvd->isImageFile ) 
+   {
+-    if( !UDFFindFile( ctx, filename, &len ) ) return NULL;
++    if( !DVDImageFindFile( ctx, filename, &len ) ) return NULL;
+     mkb_file= DVDOpenFileUDF( ctx, filename, 0 );
+   } else
+   {
+@@ -1018,7 +1033,7 @@ static dvd_file_t *DVDOpenVOBUDF( dvd_reader_t *ctx, int title, int menu )
+     sprintf( filename, "/%s_TS/%cTS_%02d_%d.%cOB", DVD_TYPE_STRING( ctx->dvd_type ), STREAM_TYPE_STRING( ctx->dvd_type ),
+             title, menu ? 0 : 1, STREAM_TYPE_STRING( ctx->dvd_type ) );
+   }
+-  start = UDFFindFile( ctx, filename, &len );
++  start = DVDImageFindFile( ctx, filename, &len );
+   if( start == 0 ) return NULL;
+ 
+   dvd_file = calloc( 1, sizeof( dvd_file_t ) );
+@@ -1038,8 +1053,9 @@ static dvd_file_t *DVDOpenVOBUDF( dvd_reader_t *ctx, int title, int menu )
+ 
+     for( cur = 2; cur < 10; cur++ ) {
+       sprintf( filename, "/%s_TS/%cTS_%02d_%d.%cOB", DVD_TYPE_STRING( ctx->dvd_type ), 
+-              STREAM_TYPE_STRING( ctx->dvd_type ), title, menu ? 0 : 1, STREAM_TYPE_STRING( ctx->dvd_type ) );
+-      if( !UDFFindFile( ctx, filename, &len ) ) break;
++              STREAM_TYPE_STRING( ctx->dvd_type ), title, cur,
++              STREAM_TYPE_STRING( ctx->dvd_type ) );
++      if( !DVDImageFindFile( ctx, filename, &len ) ) break;
+       dvd_file->filesize += len / DVD_VIDEO_LB_LEN;
+     }
+   }
+@@ -1240,7 +1256,7 @@ static int DVDFileStatVOBUDF( dvd_reader_t *dvd, int title,
+     sprintf( filename, "/%s_TS/%cTS_%02d_%d.%cOB", DVD_TYPE_STRING( dvd->dvd_type ), 
+             STREAM_TYPE_STRING( dvd->dvd_type ), title, menu ? 0 : 1, STREAM_TYPE_STRING( dvd->dvd_type ) );
+ 
+-  if( !UDFFindFile( dvd, filename, &size ) )
++  if( !DVDImageFindFile( dvd, filename, &size ) )
+     return -1;
+ 
+   tot_size = size;
+@@ -1253,7 +1269,7 @@ static int DVDFileStatVOBUDF( dvd_reader_t *dvd, int title,
+     for( cur = 2; cur < 10; cur++ ) {
+       sprintf( filename, "/%s_TS/%cTS_%02d_%d.%cOB", DVD_TYPE_STRING( dvd->dvd_type ),
+               STREAM_TYPE_STRING( dvd->dvd_type ), title, cur , STREAM_TYPE_STRING( dvd->dvd_type ) );
+-      if( !UDFFindFile( dvd, filename, &size ) )
++      if( !DVDImageFindFile( dvd, filename, &size ) )
+         break;
+ 
+       parts_size[ nr_parts ] = size;
+@@ -1391,7 +1407,7 @@ int DVDFileStat( dvd_reader_t *reader, int titlenum,
+   }
+ 
+   if( dvd->isImageFile ) {
+-    if( UDFFindFile( reader, filename, &size ) ) {
++    if( DVDImageFindFile( reader, filename, &size ) ) {
+       statbuf->size = size;
+       statbuf->nr_parts = 1;
+       statbuf->parts_size[ 0 ] = size;
+diff --git a/src/meson.build b/src/meson.build
+index a3b4d44..dac3473 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -5,6 +5,7 @@
+ dvdread_src = files(
+     'bitreader.c',
+     'dvd_input.c',
++    'dvd_iso9660.c',
+     'dvd_reader.c',
+     'dvd_udf.c',
+     'ifo_print.c',
