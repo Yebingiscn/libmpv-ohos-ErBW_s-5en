@@ -2,9 +2,9 @@
 
 set -euo pipefail
 
-ROOT_DIR=$(cd $(dirname "$0"); pwd)
+ROOT_DIR=$(cd "$(dirname "$0")"; pwd)
 
-. $ROOT_DIR/env.sh
+. "$ROOT_DIR/env.sh"
 
 LIBMPV=$DEST/libmpv.so
 
@@ -17,33 +17,34 @@ features=$("$STRINGS" "$LIBMPV" | grep "^List of enabled features:")
 configuration=$("$STRINGS" "$LIBMPV" | grep "^Configuration:")
 
 for feature in dvdnav libarchive libbluray ohos; do
-  if ! printf '%s\n' "$features" | grep -Eq "(^| )$feature( |$)"; then
+  if ! grep -Eq "(^| )$feature( |$)" <<< "$features"; then
     echo "Missing mpv feature: $feature" >&2
     exit 1
   fi
 done
 
-if ! printf '%s\n' "$configuration" | grep -q -- "-Dgpl=true"; then
+if ! grep -q -- "-Dgpl=true" <<< "$configuration"; then
   echo "mpv was not built with GPL support enabled" >&2
   exit 1
 fi
 
 symbols=$("$NM" -D --defined-only "$LIBMPV")
 for symbol in mpv_create; do
-  if ! printf '%s\n' "$symbols" | grep -Eq "[[:space:]]$symbol$"; then
+  if ! grep -Eq "[[:space:]]$symbol$" <<< "$symbols"; then
     echo "Missing required dynamic symbol: $symbol" >&2
     exit 1
   fi
 done
 
-if "$READELF" -d "$LIBMPV" | grep -Eq "NEEDED.*lib(dvd|bluray|archive)"; then
+dynamic_section=$("$READELF" -d "$LIBMPV")
+if grep -Eq "NEEDED.*lib(dvd|bluray|archive)" <<< "$dynamic_section"; then
   echo "Optical-media dependencies must be linked statically" >&2
   exit 1
 fi
 
 echo "$features"
 echo "$configuration"
-"$READELF" -d "$LIBMPV" | grep -E "NEEDED|SONAME"
+grep -E "NEEDED|SONAME" <<< "$dynamic_section"
 if command -v sha256sum >/dev/null 2>&1; then
   sha256sum "$LIBMPV"
 else
