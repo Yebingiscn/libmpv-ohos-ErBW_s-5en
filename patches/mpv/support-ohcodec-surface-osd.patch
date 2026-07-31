@@ -36,10 +36,10 @@ index c9cde3047838c84e80a6a875e5b8e21dd971539e..78837cd197c402885ee729027325ef5b
  #endif
 diff --git a/video/out/vo_ohcodec.c b/video/out/vo_ohcodec.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..89db981dabb610d9345e7d7f6269250e78b7cd7b
+index 0000000000000000000000000000000000000000..d1391d862cadafb2b969a301f337832bd0ea721c
 --- /dev/null
 +++ b/video/out/vo_ohcodec.c
-@@ -0,0 +1,595 @@
+@@ -0,0 +1,623 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -118,6 +118,8 @@ index 0000000000000000000000000000000000000000..89db981dabb610d9345e7d7f6269250e
 +
 +    OHNativeWindow *osd_window;
 +    uint64_t osd_surface_id;
++    int osd_surface_width;
++    int osd_surface_height;
 +    int osd_width;
 +    int osd_height;
 +    bool osd_force_upload;
@@ -250,6 +252,8 @@ index 0000000000000000000000000000000000000000..89db981dabb610d9345e7d7f6269250e
 +        OH_NativeWindow_DestroyNativeWindow(p->osd_window);
 +    p->osd_window = NULL;
 +    p->osd_surface_id = 0;
++    p->osd_surface_width = 0;
++    p->osd_surface_height = 0;
 +    p->osd_width = 0;
 +    p->osd_height = 0;
 +}
@@ -300,8 +304,8 @@ index 0000000000000000000000000000000000000000..89db981dabb610d9345e7d7f6269250e
 +    height = global_osd.height;
 +    mp_mutex_unlock(&global_osd.lock);
 +
-+    if (id == p->osd_surface_id && width == p->osd_width &&
-+        height == p->osd_height)
++    if (id == p->osd_surface_id && width == p->osd_surface_width &&
++        height == p->osd_surface_height)
 +        return p->osd_window != NULL;
 +
 +    destroy_osd_window(p);
@@ -329,6 +333,8 @@ index 0000000000000000000000000000000000000000..89db981dabb610d9345e7d7f6269250e
 +
 +    p->osd_window = window;
 +    p->osd_surface_id = id;
++    p->osd_surface_width = width;
++    p->osd_surface_height = height;
 +    p->osd_width = width;
 +    p->osd_height = height;
 +    p->warned_missing_osd = false;
@@ -407,15 +413,37 @@ index 0000000000000000000000000000000000000000..89db981dabb610d9345e7d7f6269250e
 +    }
 +
 +    int dst_stride = handle->stride;
-+    if (dst_stride < p->osd_width * 4)
-+        dst_stride *= 4;
-+    if (dst_stride < p->osd_width * 4 ||
-+        handle->height < p->osd_height ||
++    int buffer_width = handle->width;
++    int buffer_height = handle->height;
++    if (buffer_width <= 0 || buffer_height <= 0 ||
++        dst_stride < buffer_width * 4 ||
 +        (handle->size > 0 &&
-+         (int64_t)dst_stride * p->osd_height > handle->size))
++         (int64_t)dst_stride * buffer_height > handle->size))
 +    {
-+        MP_ERR(vo, "Invalid OSD buffer layout: stride=%d height=%d size=%d\n",
-+               dst_stride, handle->height, handle->size);
++        MP_ERR(vo, "Invalid OSD buffer layout: width=%d height=%d "
++               "stride=%d size=%d\n", buffer_width, buffer_height,
++               dst_stride, handle->size);
++        goto done;
++    }
++
++    /*
++     * An ArkUI XComponent can keep the same Surface id and requested size
++     * while its producer buffers switch to a new physical size on rotation.
++     * The BufferHandle is the authoritative layout. Re-render at that size
++     * before copying, otherwise the old, larger overlay either overflows the
++     * buffer or remains frozen on screen.
++     */
++    if (buffer_width != p->osd_width || buffer_height != p->osd_height) {
++        MP_INFO(vo, "OSD buffer geometry changed: requested=%dx%d, "
++                "render=%dx%d -> %dx%d (stride=%d size=%d)\n",
++                p->osd_surface_width, p->osd_surface_height,
++                p->osd_width, p->osd_height, buffer_width, buffer_height,
++                dst_stride, handle->size);
++        p->osd_width = buffer_width;
++        p->osd_height = buffer_height;
++        p->osd_force_upload = true;
++        update_osd_resolution(vo);
++        vo->want_redraw = true;
 +        goto done;
 +    }
 +
