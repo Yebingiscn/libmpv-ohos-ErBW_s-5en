@@ -17,20 +17,15 @@ else
   exit 1
 fi
 
-if [ ! -f configure ]; then
-  autoreconf -fi
-fi
-
 mkdir -p .build
 cd .build
 
-../configure \
-  --host=aarch64-linux-musl \
+meson setup .. \
+  --cross-file $ROOT_DIR/libmpv/arm64-crossfile.ini \
   --prefix=$DEST \
-  --disable-shared \
-  --enable-static \
-  --disable-doc
-make -j$CORES
-make install
+  -Denable_docs=false \
+  -Denable_examples=false
+ninja -j$CORES
+ninja install
 
 popd
