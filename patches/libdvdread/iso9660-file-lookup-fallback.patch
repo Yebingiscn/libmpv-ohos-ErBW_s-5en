@@ -350,25 +350,19 @@ index 8f791d5..83d2ef6 100644
      mkb_file= DVDOpenFileUDF( ctx, filename, 0 );
    } else
    {
-@@ -1018,7 +1033,7 @@ static dvd_file_t *DVDOpenVOBUDF( dvd_reader_t *ctx, int title, int menu )
-     sprintf( filename, "/%s_TS/%cTS_%02d_%d.%cOB", DVD_TYPE_STRING( ctx->dvd_type ), STREAM_TYPE_STRING( ctx->dvd_type ),
-             title, menu ? 0 : 1, STREAM_TYPE_STRING( ctx->dvd_type ) );
-   }
+@@ -1160,2 +1175,2 @@ static dvd_file_t *DVDOpenVOBUDF( dvd_reader_t *ctx, int title, int menu )
 -  start = UDFFindFile( ctx, filename, &len );
 +  start = DVDImageFindFile( ctx, filename, &len );
    if( start == 0 ) return NULL;
- 
-   dvd_file = calloc( 1, sizeof( dvd_file_t ) );
-@@ -1038,8 +1053,9 @@ static dvd_file_t *DVDOpenVOBUDF( dvd_reader_t *ctx, int title, int menu )
+@@ -1179,8 +1194,8 @@ static dvd_file_t *DVDOpenVOBUDF( dvd_reader_t *ctx, int title, int menu )
  
      for( cur = 2; cur < 10; cur++ ) {
        sprintf( filename, "/%s_TS/%cTS_%02d_%d.%cOB", DVD_TYPE_STRING( ctx->dvd_type ), 
--              STREAM_TYPE_STRING( ctx->dvd_type ), title, menu ? 0 : 1, STREAM_TYPE_STRING( ctx->dvd_type ) );
+-              STREAM_TYPE_STRING( ctx->dvd_type ), title, cur, STREAM_TYPE_STRING( ctx->dvd_type ) );
 -      if( !UDFFindFile( ctx, filename, &len ) ) break;
-+              STREAM_TYPE_STRING( ctx->dvd_type ), title, cur,
-+              STREAM_TYPE_STRING( ctx->dvd_type ) );
++              STREAM_TYPE_STRING( ctx->dvd_type ), title, cur, STREAM_TYPE_STRING( ctx->dvd_type ) );
 +      if( !DVDImageFindFile( ctx, filename, &len ) ) break;
-       dvd_file->filesize += len / DVD_VIDEO_LB_LEN;
+       dvd_file->filesize += BYTES_TO_DVD_BLOCKS_CEIL(len);
      }
    }
 @@ -1240,7 +1256,7 @@ static int DVDFileStatVOBUDF( dvd_reader_t *dvd, int title,

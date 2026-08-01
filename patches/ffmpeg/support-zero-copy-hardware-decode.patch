@@ -15,7 +15,7 @@ new file mode 100644
 index 0000000..a1d3d7d
 --- /dev/null
 +++ b/libavcodec/ohcodec_buffer.h
-@@ -0,0 +1,37 @@
+@@ -0,0 +1,38 @@
 +/*
 + * OpenHarmony Codec public output-buffer API
 + *
