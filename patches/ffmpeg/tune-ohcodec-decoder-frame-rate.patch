@@ -1,0 +1,40 @@
+diff --git a/libavcodec/ohdec.c b/libavcodec/ohdec.c
+index f745b7d..1ad6794 100644
+--- a/libavcodec/ohdec.c
++++ b/libavcodec/ohdec.c
+@@ -110,6 +110,7 @@ typedef struct OHCodecDecContext {
+ 
+     char *name;
+     int allow_sw;
++    double configured_frame_rate;
+ } OHCodecDecContext;
+ 
+ struct AVOHCodecBuffer {
+@@ -366,6 +367,18 @@ static int oh_decode_set_format(OHCodecDecContext *s, AVCodecContext *avctx)
+     else
+         OH_AVFormat_SetIntValue(format, OH_MD_KEY_PIXEL_FORMAT,
+                                 AV_PIXEL_FORMAT_SURFACE_FORMAT);
++    if (s->configured_frame_rate > 0.0) {
++        if (!OH_AVFormat_SetDoubleValue(format, OH_MD_KEY_FRAME_RATE,
++                                        s->configured_frame_rate)) {
++            OH_AVFormat_Destroy(format);
++            av_log(avctx, AV_LOG_ERROR,
++                   "Failed to set OHCodec configured frame rate %.3f\n",
++                   s->configured_frame_rate);
++            return AVERROR(EINVAL);
++        }
++        av_log(avctx, AV_LOG_INFO, "Set OHCodec configured frame rate to %.3f\n",
++               s->configured_frame_rate);
++    }
+     OH_AVErrCode err = OH_VideoDecoder_Configure(s->dec, format);
+     OH_AVFormat_Destroy(format);
+     if (err != AV_ERR_OK) {
+@@ -1024,5 +1037,8 @@ static const AVOption ohcodec_vdec_options[] = {
+     {"allow_sw", "Allow software decoding",
+          OFFSET(allow_sw), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, VD},
++    {"ohcodec_frame_rate", "Set OHCodec decoder frame-rate hint",
++         OFFSET(configured_frame_rate), AV_OPT_TYPE_DOUBLE, {.dbl = 0.0},
++         0.0, 1000.0, VD},
+     {NULL}
+ };
+ 
