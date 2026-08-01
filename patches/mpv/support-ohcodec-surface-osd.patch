@@ -39,7 +39,7 @@ new file mode 100644
 index 0000000000000000000000000000000000000000..d1391d862cadafb2b969a301f337832bd0ea721c
 --- /dev/null
 +++ b/video/out/vo_ohcodec.c
-@@ -0,0 +1,623 @@
+@@ -0,0 +1,641 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -62,6 +62,7 @@ index 0000000000000000000000000000000000000000..d1391d862cadafb2b969a301f337832b
 +#include <poll.h>
 +#include <stdint.h>
 +#include <string.h>
++#include <time.h>
 +#include <unistd.h>
 +
 +#include <libavcodec/ohcodec_buffer.h>
@@ -74,6 +75,7 @@ index 0000000000000000000000000000000000000000..d1391d862cadafb2b969a301f337832b
 +
 +#include "common/common.h"
 +#include "osdep/threads.h"
++#include "osdep/timer.h"
 +#include "sub/draw_bmp.h"
 +#include "sub/osd.h"
 +#include "video/hwdec.h"
@@ -128,7 +130,16 @@ index 0000000000000000000000000000000000000000..d1391d862cadafb2b969a301f337832b
 +    struct mp_draw_sub_cache *osd_cache;
 +    struct mp_osd_res osd_res;
 +    double last_pts;
++    int64_t next_render_time_ns;
 +};
++
++static int64_t get_surface_time_ns(void)
++{
++    struct timespec ts;
++    if (clock_gettime(CLOCK_MONOTONIC, &ts) < 0)
++        return 0;
++    return MP_TIME_S_TO_NS(ts.tv_sec) + ts.tv_nsec;
++}
 +
 +static void free_ohcodec_device(AVHWDeviceContext *ctx)
 +{
@@ -581,8 +592,12 @@ index 0000000000000000000000000000000000000000..d1391d862cadafb2b969a301f337832b
 +
 +    if (frame->current)
 +        p->last_pts = frame->current->pts;
-+    if (!frame->redraw && !frame->repeat && frame->current)
++    if (!frame->redraw && !frame->repeat && frame->current) {
 +        image = mp_image_new_ref(frame->current);
++        int64_t now = mp_time_ns();
++        int64_t delay = frame->pts > now ? frame->pts - now : 0;
++        p->next_render_time_ns = get_surface_time_ns() + delay;
++    }
 +
 +    mp_image_unrefp(&p->next_image);
 +    p->next_image = image;
@@ -602,7 +617,10 @@ index 0000000000000000000000000000000000000000..d1391d862cadafb2b969a301f337832b
 +    if (!buffer) {
 +        MP_ERR(vo, "OHCodec frame is missing its output token\n");
 +    } else {
-+        int ret = av_ohcodec_release_buffer(buffer, 1);
++        int ret = p->next_render_time_ns > 0
++            ? av_ohcodec_release_buffer_at_time(buffer,
++                                                p->next_render_time_ns)
++            : av_ohcodec_release_buffer(buffer, 1);
 +        if (ret < 0 && ret != AVERROR(EALREADY) && ret != AVERROR(ESTALE))
 +            MP_ERR(vo, "Failed to present OHCodec Surface frame: %d\n", ret);
 +    }

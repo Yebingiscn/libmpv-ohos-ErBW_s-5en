@@ -15,7 +15,7 @@ new file mode 100644
 index 0000000..a1d3d7d
 --- /dev/null
 +++ b/libavcodec/ohcodec_buffer.h
-@@ -0,0 +1,26 @@
+@@ -0,0 +1,37 @@
 +/*
 + * OpenHarmony Codec public output-buffer API
 + *
@@ -24,6 +24,8 @@ index 0000000..a1d3d7d
 +
 +#ifndef AVCODEC_OHCODEC_BUFFER_H
 +#define AVCODEC_OHCODEC_BUFFER_H
++
++#include <stdint.h>
 +
 +/** Opaque output token carried by AV_PIX_FMT_OHCODEC frames. */
 +typedef struct AVOHCodecBuffer AVOHCodecBuffer;
@@ -40,6 +42,16 @@ index 0000000..a1d3d7d
 + * remain idempotent.
 + */
 +int av_ohcodec_release_buffer(AVOHCodecBuffer *buffer, int render);
++
++/**
++ * Return an output buffer to the decoder and schedule it for presentation at
++ * the given CLOCK_MONOTONIC timestamp, in nanoseconds.
++ *
++ * The same lifetime and stale-token rules as av_ohcodec_release_buffer()
++ * apply. render_timestamp_ns must be greater than zero.
++ */
++int av_ohcodec_release_buffer_at_time(AVOHCodecBuffer *buffer,
++                                      int64_t render_timestamp_ns);
 +
 +#endif /* AVCODEC_OHCODEC_BUFFER_H */
 diff --git a/libavcodec/ohdec.c b/libavcodec/ohdec.c
@@ -495,7 +507,7 @@ index cf1177a..f745b7d 100644
  
      ff_mutex_destroy(&s->input_mutex);
      ff_cond_destroy(&s->input_cond);
-@@ -421,34 +672,36 @@ static av_cold int oh_decode_close(AVCodecContext *avctx)
+@@ -421,34 +672,54 @@ static av_cold int oh_decode_close(AVCodecContext *avctx)
      return 0;
  }
  
@@ -520,7 +532,25 @@ index cf1177a..f745b7d 100644
 +                 : OH_VideoDecoder_FreeOutputBuffer(ref->dec, buffer->index);
 +    return ff_oh_err_to_ff_err(err);
 +}
- 
++
++int av_ohcodec_release_buffer_at_time(AVOHCodecBuffer *buffer,
++                                      int64_t render_timestamp_ns)
++{
++    OHCodecDecRef *ref;
++    OH_AVErrCode err;
++    if (!buffer || render_timestamp_ns <= 0)
++        return AVERROR(EINVAL);
++    if (atomic_exchange_explicit(&buffer->released, true, memory_order_acq_rel))
++        return AVERROR(EALREADY);
++    ref = (OHCodecDecRef *)buffer->dec_ref->data;
++    if (buffer->generation != atomic_load_explicit(&ref->generation,
++                                                    memory_order_acquire))
++        return AVERROR(ESTALE);
++    err = OH_VideoDecoder_RenderOutputBufferAtTime(ref->dec, buffer->index,
++                                                   render_timestamp_ns);
++    return ff_oh_err_to_ff_err(err);
++}
+
 -    if (!buffer->dec_ref) {
 -        av_free(buffer);
 +static void oh_buffer_release(void *opaque, uint8_t *data)
