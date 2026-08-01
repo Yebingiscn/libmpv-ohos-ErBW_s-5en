@@ -1,0 +1,15 @@
+diff --git a/src/dvdread/dvd_filesystem.h b/src/dvdread/dvd_filesystem.h
+index ab2635f..8111327 100644
+--- a/src/dvdread/dvd_filesystem.h
++++ b/src/dvdread/dvd_filesystem.h
+@@ -38,7 +38,8 @@ typedef __int64 off64_t;
+ /* sys/types.h may have been included before _LARGEFILE64_SOURCE was defined. */
+ typedef __off64_t off64_t;
+-#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) || defined(__DragonFly__)
+-/* off_t is already 64 bit here so off64_t is not provided. */
++#elif defined(__MUSL__) || defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) || defined(__DragonFly__)
++/* off_t is already 64 bit here so off64_t is not provided. OpenHarmony's
++ * musl headers use a 64-bit off_t without exposing the glibc off64_t alias. */
+ typedef off_t off64_t;
+ #endif
+ 
