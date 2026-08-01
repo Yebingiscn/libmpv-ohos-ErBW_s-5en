@@ -1,6 +1,9 @@
 name: build libmpv for ohos
 
 on:
+  push:
+    branches:
+      - main
   pull_request:
   workflow_dispatch:
     inputs:
