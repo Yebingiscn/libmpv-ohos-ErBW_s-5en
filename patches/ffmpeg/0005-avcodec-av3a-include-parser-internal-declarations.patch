@@ -1,0 +1,18 @@
+From f05ed5d3f7790d92797151a75366ab861f8c06b7 Mon Sep 17 00:00:00 2001
+From: Codex <codex@local>
+Date: Sun, 2 Aug 2026 18:57:51 +0800
+Subject: [PATCH] avcodec/av3a: include parser internal declarations
+
+
+diff --git a/libavcodec/av3a_parser.c b/libavcodec/av3a_parser.c
+index 8425453..29b799a 100644
+--- a/libavcodec/av3a_parser.c
++++ b/libavcodec/av3a_parser.c
+@@ -24,6 +24,7 @@
+ #include <stdint.h>
+ #include "libavutil/intreadwrite.h"
+ #include "parser.h"
++#include "parser_internal.h"
+ #include "get_bits.h"
+ #include "av3a.h"
+ 
