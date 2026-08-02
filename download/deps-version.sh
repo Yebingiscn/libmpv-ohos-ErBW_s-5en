@@ -31,10 +31,10 @@ V_DOVI_TOOLS=2.3.3
 V_LCMS=lcms2.19.1
 V_SHADERC=v2026.3
 
-# mpv and its tightly-coupled dependencies. FFmpeg stays on the latest 8.0.x
-# release because the OHCodec and Audio Vivid patches target the 8.0 parser and
-# decoder internals. The OHOS mpv 0.41 branch accepts generic Lua only below 5.3.
-V_FFMPEG=n8.0.3
+# mpv and its tightly-coupled dependencies. The OHCodec, zero-copy and Audio
+# Vivid patches are rebased on FFmpeg 8.1.2. The OHOS mpv 0.41 branch accepts
+# generic Lua only below 5.3, so keep the final Lua 5.2 release for now.
+V_FFMPEG=n8.1.2
 V_LIBASS=0.17.5
 V_LIBPLACEBO=v7.360.1
 V_LUA=5.2.4

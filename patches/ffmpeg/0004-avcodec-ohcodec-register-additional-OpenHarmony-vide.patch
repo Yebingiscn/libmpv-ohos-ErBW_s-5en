@@ -1,0 +1,274 @@
+From c9928815b90e8180426bb4972d2ed9a056741772 Mon Sep 17 00:00:00 2001
+From: Codex <codex@local>
+Date: Sun, 2 Aug 2026 18:25:34 +0800
+Subject: [PATCH 4/4] avcodec/ohcodec: register additional OpenHarmony video
+ decoders
+
+
+diff --git a/configure b/configure
+index 2def3da..8b6e40e 100755
+--- a/configure
++++ b/configure
+@@ -3584,6 +3584,7 @@ h264_nvenc_encoder_deps="nvenc"
+ h264_nvenc_encoder_select="atsc_a53"
+ h264_oh_decoder_deps="ohcodec"
+ h264_oh_decoder_select="h264_mp4toannexb_bsf"
++h263_oh_decoder_deps="ohcodec"
+ h264_oh_encoder_deps="ohcodec"
+ h264_omx_encoder_deps="omx"
+ h264_qsv_decoder_select="h264_mp4toannexb_bsf qsvdec"
+@@ -3612,6 +3613,23 @@ hevc_oh_decoder_deps="ohcodec"
+ av3a_oh_decoder_deps="ohcodec"
+ hevc_oh_decoder_select="hevc_mp4toannexb_bsf"
+ hevc_oh_encoder_deps="ohcodec"
++av1_oh_decoder_deps="ohcodec"
++cinepak_oh_decoder_deps="ohcodec"
++dvvideo_oh_decoder_deps="ohcodec"
++mjpeg_oh_decoder_deps="ohcodec"
++mpeg1video_oh_decoder_deps="ohcodec"
++mpeg2video_oh_decoder_deps="ohcodec"
++mpeg4_oh_decoder_deps="ohcodec"
++msvideo1_oh_decoder_deps="ohcodec"
++rawvideo_oh_decoder_deps="ohcodec"
++rv30_oh_decoder_deps="ohcodec"
++rv40_oh_decoder_deps="ohcodec"
++vc1_oh_decoder_deps="ohcodec"
++vp8_oh_decoder_deps="ohcodec"
++vp9_oh_decoder_deps="ohcodec"
++vvc_oh_decoder_deps="ohcodec"
++vvc_oh_decoder_select="vvc_mp4toannexb_bsf"
++wmv3_oh_decoder_deps="ohcodec"
+ hevc_qsv_decoder_select="hevc_mp4toannexb_bsf qsvdec"
+ hevc_qsv_encoder_select="hevcparse qsvenc"
+ hevc_rkmpp_decoder_deps="rkmpp"
+diff --git a/libavcodec/Makefile b/libavcodec/Makefile
+index c9f43fe..0c1fcdf 100644
+--- a/libavcodec/Makefile
++++ b/libavcodec/Makefile
+@@ -442,6 +442,7 @@ OBJS-$(CONFIG_H264_MF_ENCODER)         += mfenc.o mf_utils.o
+ OBJS-$(CONFIG_H264_MMAL_DECODER)       += mmaldec.o
+ OBJS-$(CONFIG_H264_NVENC_ENCODER)      += nvenc_h264.o nvenc.o
+ OBJS-$(CONFIG_H264_OH_DECODER)         += ohcodec.o ohdec.o
++OBJS-$(CONFIG_H263_OH_DECODER)         += ohcodec.o ohdec.o
+ OBJS-$(CONFIG_H264_OH_ENCODER)         += ohcodec.o ohenc.o
+ OBJS-$(CONFIG_H264_OMX_ENCODER)        += omx.o
+ OBJS-$(CONFIG_H264_QSV_DECODER)        += qsvdec.o
+@@ -474,6 +475,22 @@ OBJS-$(CONFIG_HEVC_MF_ENCODER)         += mfenc.o mf_utils.o
+ OBJS-$(CONFIG_HEVC_NVENC_ENCODER)      += nvenc_hevc.o nvenc.o
+ OBJS-$(CONFIG_HEVC_OH_DECODER)         += ohcodec.o ohdec.o
+ OBJS-$(CONFIG_AV3A_OH_DECODER)         += ohcodec.o ohaudiodec.o
++OBJS-$(CONFIG_AV1_OH_DECODER)          += ohcodec.o ohdec.o
++OBJS-$(CONFIG_CINEPAK_OH_DECODER)      += ohcodec.o ohdec.o
++OBJS-$(CONFIG_DVVIDEO_OH_DECODER)      += ohcodec.o ohdec.o
++OBJS-$(CONFIG_MJPEG_OH_DECODER)        += ohcodec.o ohdec.o
++OBJS-$(CONFIG_MPEG1VIDEO_OH_DECODER)   += ohcodec.o ohdec.o
++OBJS-$(CONFIG_MPEG2VIDEO_OH_DECODER)   += ohcodec.o ohdec.o
++OBJS-$(CONFIG_MPEG4_OH_DECODER)        += ohcodec.o ohdec.o
++OBJS-$(CONFIG_MSVIDEO1_OH_DECODER)     += ohcodec.o ohdec.o
++OBJS-$(CONFIG_RAWVIDEO_OH_DECODER)     += ohcodec.o ohdec.o
++OBJS-$(CONFIG_RV30_OH_DECODER)         += ohcodec.o ohdec.o
++OBJS-$(CONFIG_RV40_OH_DECODER)         += ohcodec.o ohdec.o
++OBJS-$(CONFIG_VC1_OH_DECODER)          += ohcodec.o ohdec.o
++OBJS-$(CONFIG_VP8_OH_DECODER)          += ohcodec.o ohdec.o
++OBJS-$(CONFIG_VP9_OH_DECODER)          += ohcodec.o ohdec.o
++OBJS-$(CONFIG_VVC_OH_DECODER)          += ohcodec.o ohdec.o
++OBJS-$(CONFIG_WMV3_OH_DECODER)         += ohcodec.o ohdec.o
+ OBJS-$(CONFIG_HEVC_OH_ENCODER)         += ohcodec.o ohenc.o
+ OBJS-$(CONFIG_HEVC_QSV_DECODER)        += qsvdec.o
+ OBJS-$(CONFIG_HEVC_QSV_ENCODER)        += qsvenc_hevc.o hevc/ps_enc.o
+diff --git a/libavcodec/allcodecs.c b/libavcodec/allcodecs.c
+index aca5887..47b6b44 100644
+--- a/libavcodec/allcodecs.c
++++ b/libavcodec/allcodecs.c
+@@ -882,6 +882,7 @@ extern const FFCodec ff_h264_d3d12va_encoder;
+ extern const FFCodec ff_h264_mf_encoder;
+ extern const FFCodec ff_h264_nvenc_encoder;
+ extern const FFCodec ff_h264_oh_decoder;
++extern const FFCodec ff_h263_oh_decoder;
+ extern const FFCodec ff_av3a_oh_decoder;
+ extern const FFCodec ff_h264_oh_encoder;
+ extern const FFCodec ff_h264_omx_encoder;
+@@ -899,6 +900,22 @@ extern const FFCodec ff_hevc_mediacodec_encoder;
+ extern const FFCodec ff_hevc_mf_encoder;
+ extern const FFCodec ff_hevc_nvenc_encoder;
+ extern const FFCodec ff_hevc_oh_decoder;
++extern const FFCodec ff_av1_oh_decoder;
++extern const FFCodec ff_cinepak_oh_decoder;
++extern const FFCodec ff_dvvideo_oh_decoder;
++extern const FFCodec ff_mjpeg_oh_decoder;
++extern const FFCodec ff_mpeg1video_oh_decoder;
++extern const FFCodec ff_mpeg2video_oh_decoder;
++extern const FFCodec ff_mpeg4_oh_decoder;
++extern const FFCodec ff_msvideo1_oh_decoder;
++extern const FFCodec ff_rawvideo_oh_decoder;
++extern const FFCodec ff_rv30_oh_decoder;
++extern const FFCodec ff_rv40_oh_decoder;
++extern const FFCodec ff_vc1_oh_decoder;
++extern const FFCodec ff_vp8_oh_decoder;
++extern const FFCodec ff_vp9_oh_decoder;
++extern const FFCodec ff_vvc_oh_decoder;
++extern const FFCodec ff_wmv3_oh_decoder;
+ extern const FFCodec ff_hevc_oh_encoder;
+ extern const FFCodec ff_hevc_qsv_encoder;
+ extern const FFCodec ff_hevc_v4l2m2m_encoder;
+diff --git a/libavcodec/ohcodec.h b/libavcodec/ohcodec.h
+index 0747472..2ef900e 100644
+--- a/libavcodec/ohcodec.h
++++ b/libavcodec/ohcodec.h
+@@ -27,6 +27,7 @@
+ #include <multimedia/player_framework/native_avformat.h>
+ 
+ #include "libavutil/pixfmt.h"
++#include "libavutil/macros.h"
+ 
+ #include "codec_id.h"
+ 
+@@ -37,13 +38,49 @@ typedef struct OHBufferQueueItem {
+ 
+ int ff_oh_err_to_ff_err(OH_AVErrCode err);
+ 
+-static inline const char *ff_oh_mime(enum AVCodecID codec_id, void *log)
++static inline const char *ff_oh_mime(enum AVCodecID codec_id,
++                                     unsigned int codec_tag, void *log)
+ {
+     switch (codec_id) {
+     case AV_CODEC_ID_H264:
+         return OH_AVCODEC_MIMETYPE_VIDEO_AVC;
+     case AV_CODEC_ID_HEVC:
+         return OH_AVCODEC_MIMETYPE_VIDEO_HEVC;
++    case AV_CODEC_ID_MPEG1VIDEO:
++        return "video/mpeg";
++    case AV_CODEC_ID_MPEG2VIDEO:
++        return "video/mpeg2";
++    case AV_CODEC_ID_MPEG4:
++        return "video/mp4v-es";
++    case AV_CODEC_ID_H263:
++        return "video/h263";
++    case AV_CODEC_ID_VVC:
++        return "video/vvc";
++    case AV_CODEC_ID_AV1:
++        return "video/av1";
++    case AV_CODEC_ID_VP8:
++        return "video/vp8";
++    case AV_CODEC_ID_VP9:
++        return "video/vp9";
++    case AV_CODEC_ID_RV30:
++        return "video/rv30";
++    case AV_CODEC_ID_RV40:
++        return "video/rv40";
++    case AV_CODEC_ID_VC1:
++        return codec_tag == MKTAG('W', 'V', 'C', '1') ? "video/wvc1" :
++                                                        "video/vc1";
++    case AV_CODEC_ID_WMV3:
++        return "video/wmv3";
++    case AV_CODEC_ID_DVVIDEO:
++        return "video/dvvideo";
++    case AV_CODEC_ID_RAWVIDEO:
++        return "video/rawvideo";
++    case AV_CODEC_ID_MSVIDEO1:
++        return "video/msvideo1";
++    case AV_CODEC_ID_MJPEG:
++        return "video/mjpeg";
++    case AV_CODEC_ID_CINEPAK:
++        return "video/cinepak";
+     default:
+         av_log(log, AV_LOG_ERROR, "Unsupported codec %s\n",
+                avcodec_get_name(codec_id));
+diff --git a/libavcodec/ohdec.c b/libavcodec/ohdec.c
+index 30d693a..0179125 100644
+--- a/libavcodec/ohdec.c
++++ b/libavcodec/ohdec.c
+@@ -259,7 +259,7 @@ static int oh_decode_create(OHCodecDecContext *s, AVCodecContext *avctx)
+     const char *name = s->name;
+ 
+     if (!name) {
+-        const char *mime = ff_oh_mime(avctx->codec_id, avctx);
++        const char *mime = ff_oh_mime(avctx->codec_id, avctx->codec_tag, avctx);
+         if (!mime)
+             return AVERROR_BUG;
+         OH_AVCapability *cap = OH_AVCodec_GetCapabilityByCategory(mime, false, HARDWARE);
+@@ -1099,3 +1099,71 @@ DECLARE_OHCODEC_VDEC(h264, "H.264", AV_CODEC_ID_H264, "h264_mp4toannexb")
+ #if CONFIG_HEVC_OH_DECODER
+ DECLARE_OHCODEC_VDEC(hevc, "H.265", AV_CODEC_ID_HEVC, "hevc_mp4toannexb")
+ #endif
++
++#if CONFIG_H263_OH_DECODER
++DECLARE_OHCODEC_VDEC(h263, "H.263", AV_CODEC_ID_H263, NULL)
++#endif
++
++#if CONFIG_MPEG1VIDEO_OH_DECODER
++DECLARE_OHCODEC_VDEC(mpeg1video, "MPEG-1 video", AV_CODEC_ID_MPEG1VIDEO, NULL)
++#endif
++
++#if CONFIG_MPEG2VIDEO_OH_DECODER
++DECLARE_OHCODEC_VDEC(mpeg2video, "MPEG-2 video", AV_CODEC_ID_MPEG2VIDEO, NULL)
++#endif
++
++#if CONFIG_MPEG4_OH_DECODER
++DECLARE_OHCODEC_VDEC(mpeg4, "MPEG-4 Part 2", AV_CODEC_ID_MPEG4, NULL)
++#endif
++
++#if CONFIG_VVC_OH_DECODER
++DECLARE_OHCODEC_VDEC(vvc, "H.266/VVC", AV_CODEC_ID_VVC, "vvc_mp4toannexb")
++#endif
++
++#if CONFIG_AV1_OH_DECODER
++DECLARE_OHCODEC_VDEC(av1, "AV1", AV_CODEC_ID_AV1, NULL)
++#endif
++
++#if CONFIG_VP8_OH_DECODER
++DECLARE_OHCODEC_VDEC(vp8, "VP8", AV_CODEC_ID_VP8, NULL)
++#endif
++
++#if CONFIG_VP9_OH_DECODER
++DECLARE_OHCODEC_VDEC(vp9, "VP9", AV_CODEC_ID_VP9, NULL)
++#endif
++
++#if CONFIG_RV30_OH_DECODER
++DECLARE_OHCODEC_VDEC(rv30, "RealVideo 3.0", AV_CODEC_ID_RV30, NULL)
++#endif
++
++#if CONFIG_RV40_OH_DECODER
++DECLARE_OHCODEC_VDEC(rv40, "RealVideo 4.0", AV_CODEC_ID_RV40, NULL)
++#endif
++
++#if CONFIG_VC1_OH_DECODER
++DECLARE_OHCODEC_VDEC(vc1, "SMPTE VC-1", AV_CODEC_ID_VC1, NULL)
++#endif
++
++#if CONFIG_WMV3_OH_DECODER
++DECLARE_OHCODEC_VDEC(wmv3, "Windows Media Video 9", AV_CODEC_ID_WMV3, NULL)
++#endif
++
++#if CONFIG_DVVIDEO_OH_DECODER
++DECLARE_OHCODEC_VDEC(dvvideo, "DV video", AV_CODEC_ID_DVVIDEO, NULL)
++#endif
++
++#if CONFIG_RAWVIDEO_OH_DECODER
++DECLARE_OHCODEC_VDEC(rawvideo, "raw video", AV_CODEC_ID_RAWVIDEO, NULL)
++#endif
++
++#if CONFIG_MSVIDEO1_OH_DECODER
++DECLARE_OHCODEC_VDEC(msvideo1, "Microsoft Video 1", AV_CODEC_ID_MSVIDEO1, NULL)
++#endif
++
++#if CONFIG_MJPEG_OH_DECODER
++DECLARE_OHCODEC_VDEC(mjpeg, "Motion JPEG", AV_CODEC_ID_MJPEG, NULL)
++#endif
++
++#if CONFIG_CINEPAK_OH_DECODER
++DECLARE_OHCODEC_VDEC(cinepak, "Cinepak", AV_CODEC_ID_CINEPAK, NULL)
++#endif
+diff --git a/libavcodec/ohenc.c b/libavcodec/ohenc.c
+index 76bddd4..a967734 100644
+--- a/libavcodec/ohenc.c
++++ b/libavcodec/ohenc.c
+@@ -78,7 +78,7 @@ static int oh_encode_create(OHCodecEncContext *s, AVCodecContext *avctx)
+     const char *name = s->name;
+ 
+     if (!name) {
+-        const char *mime = ff_oh_mime(avctx->codec_id, avctx);
++        const char *mime = ff_oh_mime(avctx->codec_id, avctx->codec_tag, avctx);
+         if (!mime)
+             return AVERROR_BUG;
+         OH_AVCapability *cap = OH_AVCodec_GetCapabilityByCategory(mime, true, HARDWARE);

@@ -1,16 +1,22 @@
+From 9d7a88006ba76fe1fa07e0974916493f4666c27a Mon Sep 17 00:00:00 2001
+From: Codex <codex@local>
+Date: Sun, 2 Aug 2026 18:18:07 +0800
+Subject: [PATCH 3/4] ffmpeg: tune OHCodec decoder frame rate
+
+
 diff --git a/libavcodec/ohdec.c b/libavcodec/ohdec.c
-index f745b7d..1ad6794 100644
+index 69e60ad..30d693a 100644
 --- a/libavcodec/ohdec.c
 +++ b/libavcodec/ohdec.c
-@@ -110,6 +110,7 @@ typedef struct OHCodecDecContext {
- 
+@@ -108,6 +108,7 @@ typedef struct OHCodecDecContext {
      char *name;
      int allow_sw;
+     unsigned mutex_cond_cnt;
 +    double configured_frame_rate;
  } OHCodecDecContext;
  
- struct AVOHCodecBuffer {
-@@ -366,6 +367,18 @@ static int oh_decode_set_format(OHCodecDecContext *s, AVCodecContext *avctx)
+ #define OFFSET(x) offsetof(OHCodecDecContext, x)
+@@ -369,6 +370,18 @@ static int oh_decode_set_format(OHCodecDecContext *s, AVCodecContext *avctx)
      else
          OH_AVFormat_SetIntValue(format, OH_MD_KEY_PIXEL_FORMAT,
                                  AV_PIXEL_FORMAT_SURFACE_FORMAT);
@@ -29,7 +35,8 @@ index f745b7d..1ad6794 100644
      OH_AVErrCode err = OH_VideoDecoder_Configure(s->dec, format);
      OH_AVFormat_Destroy(format);
      if (err != AV_ERR_OK) {
-@@ -1024,5 +1037,8 @@ static const AVOption ohcodec_vdec_options[] = {
+@@ -1044,6 +1057,9 @@ static const AVOption ohcodec_vdec_options[] = {
+          OFFSET(name), AV_OPT_TYPE_STRING, .flags = VD},
      {"allow_sw", "Allow software decoding",
           OFFSET(allow_sw), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, VD},
 +    {"ohcodec_frame_rate", "Set OHCodec decoder frame-rate hint",

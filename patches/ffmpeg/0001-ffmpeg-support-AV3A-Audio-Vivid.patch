@@ -1,8 +1,14 @@
+From 8e32e2f05cd88ab22a6b3b55fb744ce7179ec33c Mon Sep 17 00:00:00 2001
+From: Codex <codex@local>
+Date: Sun, 2 Aug 2026 18:18:07 +0800
+Subject: [PATCH 1/4] ffmpeg: support AV3A Audio Vivid
+
+
 diff --git a/configure b/configure
-index 732de59..884ac08 100755
+index 1759694..2def3da 100755
 --- a/configure
 +++ b/configure
-@@ -3450,6 +3450,7 @@ hevc_mf_encoder_deps="mediafoundation"
+@@ -3609,6 +3609,7 @@ hevc_mf_encoder_deps="mediafoundation"
  hevc_nvenc_encoder_deps="nvenc"
  hevc_nvenc_encoder_select="atsc_a53"
  hevc_oh_decoder_deps="ohcodec"
@@ -10,7 +16,7 @@ index 732de59..884ac08 100755
  hevc_oh_decoder_select="hevc_mp4toannexb_bsf"
  hevc_oh_encoder_deps="ohcodec"
  hevc_qsv_decoder_select="hevc_mp4toannexb_bsf qsvdec"
-@@ -7226,9 +7227,9 @@ enabled mmal              && { check_lib mmal interface/mmal/mmal.h mmal_port_co
+@@ -7457,9 +7458,9 @@ enabled mmal              && { check_lib mmal interface/mmal/mmal.h mmal_port_co
                                   check_lib mmal interface/mmal/mmal.h mmal_port_connect -lmmal_core -lmmal_util -lmmal_vc_client -lbcm_host; } ||
                                 die "ERROR: mmal not found" &&
                                 check_func_headers interface/mmal/mmal.h "MMAL_PARAMETER_VIDEO_MAX_NUM_CALLBACKS"; }
@@ -24,10 +30,10 @@ index 732de59..884ac08 100755
  enabled openal            && { check_pkg_config openal "openal >= 1.1" "AL/al.h" alGetError ||
                                 { for al_extralibs in "${OPENAL_LIBS}" "-lopenal" "-lOpenAL32"; do
 diff --git a/libavcodec/Makefile b/libavcodec/Makefile
-index fb22541..796db2b 100644
+index 1410bd8..84965da 100644
 --- a/libavcodec/Makefile
 +++ b/libavcodec/Makefile
-@@ -463,6 +463,7 @@ OBJS-$(CONFIG_HEVC_MEDIACODEC_ENCODER) += mediacodecenc.o
+@@ -472,6 +472,7 @@ OBJS-$(CONFIG_HEVC_MEDIACODEC_ENCODER) += mediacodecenc.o
  OBJS-$(CONFIG_HEVC_MF_ENCODER)         += mfenc.o mf_utils.o
  OBJS-$(CONFIG_HEVC_NVENC_ENCODER)      += nvenc_hevc.o nvenc.o
  OBJS-$(CONFIG_HEVC_OH_DECODER)         += ohcodec.o ohdec.o
@@ -35,7 +41,7 @@ index fb22541..796db2b 100644
  OBJS-$(CONFIG_HEVC_OH_ENCODER)         += ohcodec.o ohenc.o
  OBJS-$(CONFIG_HEVC_QSV_DECODER)        += qsvdec.o
  OBJS-$(CONFIG_HEVC_QSV_ENCODER)        += qsvenc_hevc.o hevc/ps_enc.o
-@@ -1219,6 +1220,7 @@ OBJS-$(CONFIG_APV_PARSER)              += apv_parser.o
+@@ -1246,6 +1247,7 @@ OBJS-$(CONFIG_APV_PARSER)              += apv_parser.o
  OBJS-$(CONFIG_AV1_PARSER)              += av1_parser.o av1_parse.o
  OBJS-$(CONFIG_AVS2_PARSER)             += avs2.o avs2_parser.o
  OBJS-$(CONFIG_AVS3_PARSER)             += avs3_parser.o
@@ -44,10 +50,10 @@ index fb22541..796db2b 100644
  OBJS-$(CONFIG_CAVSVIDEO_PARSER)        += cavs_parser.o
  OBJS-$(CONFIG_COOK_PARSER)             += cook_parser.o
 diff --git a/libavcodec/allcodecs.c b/libavcodec/allcodecs.c
-index f5ec2e0..00b8463 100644
+index 695214f..aca5887 100644
 --- a/libavcodec/allcodecs.c
 +++ b/libavcodec/allcodecs.c
-@@ -863,6 +863,7 @@ extern const FFCodec ff_h264_cuvid_decoder;
+@@ -882,6 +882,7 @@ extern const FFCodec ff_h264_d3d12va_encoder;
  extern const FFCodec ff_h264_mf_encoder;
  extern const FFCodec ff_h264_nvenc_encoder;
  extern const FFCodec ff_h264_oh_decoder;
@@ -381,7 +387,7 @@ index 0000000..01a3682
 +#endif /* AVCODEC_AV3A_H */
 diff --git a/libavcodec/av3a_parser.c b/libavcodec/av3a_parser.c
 new file mode 100644
-index 0000000..708ce8d
+index 0000000..8425453
 --- /dev/null
 +++ b/libavcodec/av3a_parser.c
 @@ -0,0 +1,234 @@
@@ -614,17 +620,17 @@ index 0000000..708ce8d
 +    return ff_av3a_header_parse(buf, buf_size, hdf);
 +}
 +
-+const AVCodecParser ff_av3a_parser = {
-+    .codec_ids = { AV_CODEC_ID_AVS3DA },
++const FFCodecParser ff_av3a_parser = {
++    PARSER_CODEC_LIST(AV_CODEC_ID_AVS3DA),
 +    .priv_data_size = sizeof(Av3aParseContext),
-+    .parser_parse = raw_av3a_parse,
++    .parse = raw_av3a_parse,
 +};
 diff --git a/libavcodec/codec_desc.c b/libavcodec/codec_desc.c
-index a065556..a45d870 100644
+index a9f21f8..ae101db 100644
 --- a/libavcodec/codec_desc.c
 +++ b/libavcodec/codec_desc.c
-@@ -3495,6 +3495,13 @@ static const AVCodecDescriptor codec_descriptors[] = {
-         .long_name = NULL_IF_CONFIG_SMALL("G.728"),
+@@ -3567,6 +3567,13 @@ static const AVCodecDescriptor codec_descriptors[] = {
+         .long_name = NULL_IF_CONFIG_SMALL("CRI AHX"),
          .props     = AV_CODEC_PROP_INTRA_ONLY | AV_CODEC_PROP_LOSSY,
      },
 +    {
@@ -638,13 +644,13 @@ index a065556..a45d870 100644
      /* subtitle codecs */
      {
 diff --git a/libavcodec/codec_id.h b/libavcodec/codec_id.h
-index c4842e6..bf3158b 100644
+index 6529f0a..4ca40d8 100644
 --- a/libavcodec/codec_id.h
 +++ b/libavcodec/codec_id.h
-@@ -556,6 +556,7 @@ enum AVCodecID {
-     AV_CODEC_ID_QOA,
+@@ -566,6 +566,7 @@ enum AVCodecID {
      AV_CODEC_ID_LC3,
      AV_CODEC_ID_G728,
+     AV_CODEC_ID_AHX,
 +    AV_CODEC_ID_AVS3DA,
  
      /* subtitle codecs */
@@ -1137,22 +1143,22 @@ index 0000000..9b4ed58
 +    .p.wrapper_name = "ohcodec",
 +};
 diff --git a/libavcodec/parsers.c b/libavcodec/parsers.c
-index b12c48f..f303ecc 100644
+index 162b96c..415c842 100644
 --- a/libavcodec/parsers.c
 +++ b/libavcodec/parsers.c
-@@ -29,6 +29,7 @@ extern const AVCodecParser ff_apv_parser;
- extern const AVCodecParser ff_av1_parser;
- extern const AVCodecParser ff_avs2_parser;
- extern const AVCodecParser ff_avs3_parser;
-+extern const AVCodecParser ff_av3a_parser;
- extern const AVCodecParser ff_bmp_parser;
- extern const AVCodecParser ff_cavsvideo_parser;
- extern const AVCodecParser ff_cook_parser;
+@@ -47,6 +47,7 @@ extern const FFCodecParser ff_apv_parser;
+ extern const FFCodecParser ff_av1_parser;
+ extern const FFCodecParser ff_avs2_parser;
+ extern const FFCodecParser ff_avs3_parser;
++extern const FFCodecParser ff_av3a_parser;
+ extern const FFCodecParser ff_bmp_parser;
+ extern const FFCodecParser ff_cavsvideo_parser;
+ extern const FFCodecParser ff_cook_parser;
 diff --git a/libavcodec/utils.c b/libavcodec/utils.c
-index cfa35d0..8d7cf6f 100644
+index 615d60c..46f2123 100644
 --- a/libavcodec/utils.c
 +++ b/libavcodec/utils.c
-@@ -601,6 +601,7 @@ static int get_audio_frame_duration(enum AVCodecID id, int sr, int ch, int ba,
+@@ -603,6 +603,7 @@ static int get_audio_frame_duration(enum AVCodecID id, int sr, int ch, int ba,
      case AV_CODEC_ID_MP2:
      case AV_CODEC_ID_MUSEPACK7:    return 1152;
      case AV_CODEC_ID_AC3:          return 1536;
@@ -1161,10 +1167,10 @@ index cfa35d0..8d7cf6f 100644
      }
  
 diff --git a/libavformat/Makefile b/libavformat/Makefile
-index ab5551a..4d98659 100644
+index 4786a93..1d42474 100644
 --- a/libavformat/Makefile
 +++ b/libavformat/Makefile
-@@ -144,6 +144,7 @@ OBJS-$(CONFIG_AVI_DEMUXER)               += avidec.o
+@@ -149,6 +149,7 @@ OBJS-$(CONFIG_AVI_DEMUXER)               += avidec.o
  OBJS-$(CONFIG_AVI_MUXER)                 += avienc.o mpegtsenc.o avlanguage.o rawutils.o
  OBJS-$(CONFIG_AVM2_MUXER)                += swfenc.o swf.o
  OBJS-$(CONFIG_AVR_DEMUXER)               += avr.o pcm.o
@@ -1173,7 +1179,7 @@ index ab5551a..4d98659 100644
  OBJS-$(CONFIG_AVS2_DEMUXER)              += avs2dec.o rawdec.o
  OBJS-$(CONFIG_AVS2_MUXER)                += rawenc.o
 diff --git a/libavformat/allformats.c b/libavformat/allformats.c
-index e39eab8..8c7a0ec 100644
+index 6ec361f..03cf473 100644
 --- a/libavformat/allformats.c
 +++ b/libavformat/allformats.c
 @@ -91,6 +91,7 @@ extern const FFOutputFormat ff_asf_stream_muxer;
@@ -1672,10 +1678,10 @@ index 0000000..de483b2
 +    .p.mime_type      = "audio/av3a",
 +};
 diff --git a/libavformat/isom_tags.c b/libavformat/isom_tags.c
-index 151c42e..3b816c8 100644
+index 1cd655b..058540a 100644
 --- a/libavformat/isom_tags.c
 +++ b/libavformat/isom_tags.c
-@@ -366,6 +366,7 @@ const AVCodecTag ff_codec_movaudio_tags[] = {
+@@ -368,6 +368,7 @@ const AVCodecTag ff_codec_movaudio_tags[] = {
      { AV_CODEC_ID_TRUEHD,          MKTAG('m', 'l', 'p', 'a') }, /* mp4ra.org */
      { AV_CODEC_ID_OPUS,            MKTAG('O', 'p', 'u', 's') }, /* mp4ra.org */
      { AV_CODEC_ID_MPEGH_3D_AUDIO,  MKTAG('m', 'h', 'm', '1') }, /* MPEG-H 3D Audio bitstream */
@@ -1684,10 +1690,10 @@ index 151c42e..3b816c8 100644
  };
  
 diff --git a/libavformat/mov.c b/libavformat/mov.c
-index b29c41a..6c6615a 100644
+index 386d2f0..201dc43 100644
 --- a/libavformat/mov.c
 +++ b/libavformat/mov.c
-@@ -66,6 +66,7 @@
+@@ -67,6 +67,7 @@
  #include "riff.h"
  #include "isom.h"
  #include "libavcodec/get_bits.h"
@@ -1695,7 +1701,7 @@ index b29c41a..6c6615a 100644
  #include "id3v1.h"
  #include "mov_chan.h"
  #include "replaygain.h"
-@@ -9325,6 +9326,117 @@ fail:
+@@ -9525,6 +9526,117 @@ fail:
      return ret;
  }
  
@@ -1813,7 +1819,7 @@ index b29c41a..6c6615a 100644
  static const MOVParseTableEntry mov_default_parse_table[] = {
  { MKTAG('A','C','L','R'), mov_read_aclr },
  { MKTAG('A','P','R','G'), mov_read_avid },
-@@ -9339,6 +9451,7 @@ static const MOVParseTableEntry mov_default_parse_table[] = {
+@@ -9539,6 +9651,7 @@ static const MOVParseTableEntry mov_default_parse_table[] = {
  { MKTAG('d','i','n','f'), mov_read_default },
  { MKTAG('D','p','x','E'), mov_read_dpxe },
  { MKTAG('d','r','e','f'), mov_read_dref },
@@ -1822,10 +1828,10 @@ index b29c41a..6c6615a 100644
  { MKTAG('e','l','s','t'), mov_read_elst },
  { MKTAG('e','n','d','a'), mov_read_enda },
 diff --git a/libavformat/mpegts.c b/libavformat/mpegts.c
-index 981dd8c..9300fc5 100644
+index 427bb88..814a384 100644
 --- a/libavformat/mpegts.c
 +++ b/libavformat/mpegts.c
-@@ -820,6 +820,7 @@ static const StreamType ISO_types[] = {
+@@ -834,6 +834,7 @@ static const StreamType ISO_types[] = {
      { STREAM_TYPE_VIDEO_DIRAC,    AVMEDIA_TYPE_VIDEO, AV_CODEC_ID_DIRAC      },
      { STREAM_TYPE_VIDEO_AVS2,     AVMEDIA_TYPE_VIDEO, AV_CODEC_ID_AVS2       },
      { STREAM_TYPE_VIDEO_AVS3,     AVMEDIA_TYPE_VIDEO, AV_CODEC_ID_AVS3       },
