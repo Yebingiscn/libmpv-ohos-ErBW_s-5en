@@ -42,6 +42,15 @@ if grep -Eq "NEEDED.*lib(dvd|bluray|archive)" <<< "$dynamic_section"; then
   exit 1
 fi
 
+# FreeType is built before HarfBuzz so its optional auto-hinter integration
+# must stay disabled.  Otherwise FreeType emits a runtime dlopen probe for
+# libharfbuzz.so.0 on every shaping operation, even though libass links the
+# later HarfBuzz build statically.
+if "$STRINGS" "$LIBMPV" | grep -Fxq "libharfbuzz.so.0"; then
+  echo "FreeType runtime HarfBuzz probing is still enabled" >&2
+  exit 1
+fi
+
 echo "$features"
 echo "$configuration"
 grep -E "NEEDED|SONAME" <<< "$dynamic_section"
