@@ -12,6 +12,39 @@ index 1e9c7c4579b51d199988c12ac3bac55b1249086c..dbc74f969df638536e25bc868ddbc900
  endif
  
  uwp_opt = get_option('uwp').require(
+diff --git a/video/out/opengl/context_ohos.c b/video/out/opengl/context_ohos.c
+index 45aa145adc..3651696bea 100644
+--- a/video/out/opengl/context_ohos.c
++++ b/video/out/opengl/context_ohos.c
+@@ -82,2 +82,21 @@ static bool ohos_init(struct ra_ctx *ctx)
+     OHNativeWindow *native_window = vo_ohos_native_window(ctx->vo);
++    EGLint native_visual_id = 0;
++    if (!eglGetConfigAttrib(p->egl_display, config, EGL_NATIVE_VISUAL_ID,
++                            &native_visual_id)) {
++        MP_FATAL(ctx, "Could not query EGL native visual (error=0x%x)!\n",
++                 eglGetError());
++        goto fail;
++    }
++
++    // HarmonyOS requires the producer NativeWindow format to match the
++    // EGLConfig before eglCreateWindowSurface(). Some devices accept the
++    // XComponent default by accident, while others reject it with EGL_BAD_MATCH.
++    int format_ret = OH_NativeWindow_NativeWindowHandleOpt(
++        native_window, SET_FORMAT, native_visual_id);
++    if (format_ret != 0) {
++        MP_FATAL(ctx, "Could not set NativeWindow format %d: %d\n",
++                 native_visual_id, format_ret);
++        goto fail;
++    }
++
+     p->egl_surface = eglCreateWindowSurface(p->egl_display, config,
+@@ -86,3 +105,5 @@ static bool ohos_init(struct ra_ctx *ctx)
+     if (p->egl_surface == EGL_NO_SURFACE) {
+-        MP_FATAL(ctx, "Could not create EGL surface!\n");
++        MP_FATAL(ctx,
++                 "Could not create EGL surface (error=0x%x, format=%d)!\n",
++                 eglGetError(), native_visual_id);
+         goto fail;
 diff --git a/video/out/vo.c b/video/out/vo.c
 index c9cde3047838c84e80a6a875e5b8e21dd971539e..78837cd197c402885ee729027325ef5bfed1dc3e 100644
 --- a/video/out/vo.c
@@ -39,7 +72,7 @@ new file mode 100644
 index 0000000000000000000000000000000000000000..d1391d862cadafb2b969a301f337832bd0ea721c
 --- /dev/null
 +++ b/video/out/vo_ohcodec.c
-@@ -0,0 +1,641 @@
+@@ -0,0 +1,666 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -245,6 +278,30 @@ index 0000000000000000000000000000000000000000..d1391d862cadafb2b969a301f337832b
 +    return true;
 +}
 +
++static void update_video_scaling_mode(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    if (!p->hwctx.av_device_ref)
++        return;
++
++    AVHWDeviceContext *ctx = (void *)p->hwctx.av_device_ref->data;
++    AVOHCodecDeviceContext *hwctx = ctx->hwctx;
++    OHNativeWindow *window = hwctx->native_window;
++    if (!window)
++        return;
++
++    OHScalingModeV2 mode = vo->opts->keepaspect
++        ? OH_SCALING_MODE_SCALE_FIT_V2
++        : OH_SCALING_MODE_SCALE_TO_WINDOW_V2;
++    int ret = OH_NativeWindow_NativeWindowSetScalingModeV2(window, mode);
++    if (ret != 0) {
++        MP_WARN(vo, "Failed to update video Surface scaling mode: %d\n", ret);
++    } else {
++        MP_VERBOSE(vo, "Video Surface scaling mode: %s\n",
++                   vo->opts->keepaspect ? "fit" : "stretch");
++    }
++}
++
 +static void resize(struct vo *vo)
 +{
 +    int width = 0;
@@ -253,6 +310,7 @@ index 0000000000000000000000000000000000000000..d1391d862cadafb2b969a301f337832b
 +        vo->dwidth = width;
 +        vo->dheight = height;
 +    }
++    update_video_scaling_mode(vo);
 +    update_osd_resolution(vo);
 +    vo->want_redraw = true;
 +}
