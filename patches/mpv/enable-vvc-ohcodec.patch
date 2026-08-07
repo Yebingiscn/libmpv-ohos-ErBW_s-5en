@@ -1,0 +1,11 @@
+diff --git a/video/decode/vd_lavc.c b/video/decode/vd_lavc.c
+index a419b87b5..e08469f77 100644
+--- a/video/decode/vd_lavc.c
++++ b/video/decode/vd_lavc.c
+@@ -165,5 +165,5 @@ const struct m_sub_options hwdec_conf = {
+         .software_fallback = 3,
+         .hwdec_api = (char *[]){"no", NULL,},
+-        .hwdec_codecs = "h264,vc1,hevc,vp8,vp9,av1,prores,prores_raw,ffv1,dpx",
++        .hwdec_codecs = "h264,vc1,hevc,vp8,vp9,av1,prores,prores_raw,ffv1,dpx,vvc",
+         // Maximum number of surfaces the player wants to buffer. This number
+         // might require adjustment depending on whatever the player does;
