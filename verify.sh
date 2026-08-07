@@ -51,7 +51,7 @@ if "$STRINGS" "$LIBMPV" | grep -Fxq "libharfbuzz.so.0"; then
   exit 1
 fi
 
-for marker in vvc_oh video/vvc vvc_mp4toannexb; do
+for marker in vvc_ohcodec video/vvc vvc_mp4toannexb; do
   if ! "$STRINGS" "$LIBMPV" | grep -Fx "$marker" >/dev/null; then
     echo "Missing VVC OHCodec marker: $marker" >&2
     exit 1
