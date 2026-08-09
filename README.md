@@ -29,6 +29,18 @@ mode. `ohcodec-osd` is the direct Surface mode: it avoids a video-frame copy,
 but mpv GPU shaders such as Anime4K do not run on the direct video plane.
 Subtitles and normal mpv OSD remain available through the separate OSD plane.
 
+## Automatic OHCodec playback policy
+
+Both OHCodec output paths automatically pass the source frame rate to the
+decoder and request decoder-side variable refresh rate support. Playback-speed
+changes are forwarded internally to OHCodec: on systems exposing the API 26
+smart-fluency keys, speeds above 1x use adaptive frame retention and returning
+to 1x restores full retention.
+
+The optional metadata-key symbols are resolved with `dlsym` and are never
+hard-linked. Older HarmonyOS releases therefore keep the normal playback path
+without requiring an application target-SDK change or user-facing settings.
+
 The build also adds:
 
 - DVD navigation and CSS support (`libdvdnav`, `libdvdread`, `libdvdcss`)

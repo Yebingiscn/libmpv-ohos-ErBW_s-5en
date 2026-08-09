@@ -58,6 +58,26 @@ for marker in vvc_ohcodec video/vvc vvc_mp4toannexb; do
   fi
 done
 
+# API 26 smart-fluency metadata keys are resolved with dlsym at runtime so
+# the same libmpv remains loadable on older HarmonyOS releases.
+undefined_symbols=$("$NM" -D --undefined-only "$LIBMPV")
+for symbol in OH_MD_KEY_VIDEO_DECODER_FRAME_RETENTION_MODE \
+              OH_MD_KEY_VIDEO_DECODER_SPEED; do
+  if grep -Eq "[[:space:]]$symbol$" <<< "$undefined_symbols"; then
+    echo "OHCodec optional key must not be hard-linked: $symbol" >&2
+    exit 1
+  fi
+done
+
+for marker in OH_MD_KEY_VIDEO_DECODER_OUTPUT_ENABLE_VRR \
+              OH_MD_KEY_VIDEO_DECODER_FRAME_RETENTION_MODE \
+              OH_MD_KEY_VIDEO_DECODER_SPEED; do
+  if ! "$STRINGS" "$LIBMPV" | grep -Fx "$marker" >/dev/null; then
+    echo "Missing OHCodec runtime key marker: $marker" >&2
+    exit 1
+  fi
+done
+
 echo "$features"
 echo "$configuration"
 grep -E "NEEDED|SONAME" <<< "$dynamic_section"

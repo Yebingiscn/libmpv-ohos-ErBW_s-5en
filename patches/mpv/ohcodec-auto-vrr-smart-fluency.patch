@@ -1,0 +1,109 @@
+diff --git a/filters/f_decoder_wrapper.c b/filters/f_decoder_wrapper.c
+index 5e2e8d74c0..e2a7485821 100644
+--- a/filters/f_decoder_wrapper.c
++++ b/filters/f_decoder_wrapper.c
+@@ -212,6 +212,8 @@ struct priv {
+     int coverart_returned; // 0: no, 1: coverart frame itself, 2: EOF returned
+ 
+     int play_dir;
++    double playback_speed;
++    bool playback_speed_set;
+ 
+     // --- The following fields can be accessed only from the mp_decoder_wrapper
+     //     user thread.
+@@ -350,6 +352,10 @@ int mp_decoder_wrapper_control(struct mp_decoder_wrapper *d,
+     struct priv *p = d->f->priv;
+     int res = CONTROL_UNKNOWN;
+     thread_lock(p);
++    if (cmd == VDCTRL_SET_PLAYBACK_SPEED) {
++        p->playback_speed = *(double *)arg;
++        p->playback_speed_set = true;
++    }
+     if (cmd == VDCTRL_GET_HWDEC) {
+         res = update_cached_values(p);
+         mp_mutex_lock(&p->cache_lock);
+@@ -455,6 +461,10 @@ static bool reinit_decoder(struct priv *p)
+ 
+         p->decoder = driver->create(p->decf, p->codec, sel->decoder);
+         if (p->decoder) {
++            if (p->playback_speed_set && p->decoder->control)
++                p->decoder->control(p->decoder->f,
++                                    VDCTRL_SET_PLAYBACK_SPEED,
++                                    &p->playback_speed);
+             p->codec->decoder = talloc_strdup(p, sel->decoder);
+             p->codec->decoder_desc = talloc_strdup(p, sel->desc && sel->desc[0] ? sel->desc : NULL);
+             MP_VERBOSE(p, "Selected decoder: %s", sel->decoder);
+diff --git a/filters/f_decoder_wrapper.h b/filters/f_decoder_wrapper.h
+index a352dc0c4d..d0a79a1b47 100644
+--- a/filters/f_decoder_wrapper.h
++++ b/filters/f_decoder_wrapper.h
+@@ -75,6 +75,7 @@ enum dec_ctrl {
+     // framedrop mode: 0=none, 1=standard, 2=hrseek
+     VDCTRL_SET_FRAMEDROP,
+     VDCTRL_CHECK_FORCED_EOF,
++    VDCTRL_SET_PLAYBACK_SPEED,
+ };
+ 
+ int mp_decoder_wrapper_control(struct mp_decoder_wrapper *d,
+diff --git a/player/audio.c b/player/audio.c
+index b3e975dd2e..9f90460d0e 100644
+--- a/player/audio.c
++++ b/player/audio.c
+@@ -199,6 +199,13 @@ void update_playback_speed(struct MPContext *mpctx)
+     mpctx->audio_speed = mpctx->opts->playback_speed * mpctx->speed_factor_a;
+     mpctx->video_speed = mpctx->opts->playback_speed * mpctx->speed_factor_v;
+ 
++    if (mpctx->vo_chain && mpctx->vo_chain->track &&
++        mpctx->vo_chain->track->dec) {
++        mp_decoder_wrapper_control(mpctx->vo_chain->track->dec,
++                                   VDCTRL_SET_PLAYBACK_SPEED,
++                                   &mpctx->opts->playback_speed);
++    }
++
+     update_speed_filters(mpctx);
+ }
+ 
+diff --git a/player/video.c b/player/video.c
+index 0e1ac290d2..5f802f71e9 100644
+--- a/player/video.c
++++ b/player/video.c
+@@ -191,6 +191,9 @@ int init_video_decoder(struct MPContext *mpctx, struct track *track)
+     if (!mp_decoder_wrapper_reinit(track->dec))
+         goto err_out;
+ 
++    mp_decoder_wrapper_control(track->dec, VDCTRL_SET_PLAYBACK_SPEED,
++                               &mpctx->opts->playback_speed);
++
+     return 1;
+ 
+ err_out:
+diff --git a/video/decode/vd_lavc.c b/video/decode/vd_lavc.c
+index 224d522e6b..0901923078 100644
+--- a/video/decode/vd_lavc.c
++++ b/video/decode/vd_lavc.c
+@@ -845,6 +845,11 @@ static void init_avctx(struct mp_filter *vd)
+         goto error;
+     }
+ 
++    if (lavc_codec->wrapper_name &&
++        strcmp(lavc_codec->wrapper_name, "ohcodec") == 0 &&
++        c->fps > 0 && isfinite(c->fps))
++        avctx->framerate = av_d2q(c->fps, 1000000);
++
+ #ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+     if (avctx->width > 8192 || avctx->height > 8192) {
+         MP_ERR(vd, "Frame size too big %" PRIu32 "x%" PRIu32 ".\n", avctx->width, avctx->height);
+@@ -1392,6 +1397,13 @@ static int control(struct mp_filter *vd, enum dec_ctrl cmd, void *arg)
+     case VDCTRL_REINIT:
+         reinit(vd);
+         return CONTROL_TRUE;
++    case VDCTRL_SET_PLAYBACK_SPEED: {
++        AVCodecContext *avctx = ctx->avctx;
++        if (!avctx)
++            break;
++        int ret = avcodec_ohcodec_set_playback_speed(avctx, *(double *)arg);
++        return ret >= 0 ? CONTROL_TRUE : CONTROL_FALSE;
++    }
+     }
+     return CONTROL_UNKNOWN;
+ }
