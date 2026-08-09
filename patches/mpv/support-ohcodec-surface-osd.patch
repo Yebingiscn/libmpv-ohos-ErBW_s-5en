@@ -72,7 +72,7 @@ new file mode 100644
 index 0000000000000000000000000000000000000000..d1391d862cadafb2b969a301f337832bd0ea721c
 --- /dev/null
 +++ b/video/out/vo_ohcodec.c
-@@ -0,0 +1,666 @@
+@@ -0,0 +1,667 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -93,6 +93,7 @@ index 0000000000000000000000000000000000000000..d1391d862cadafb2b969a301f337832b
 +#include <errno.h>
 +#include <inttypes.h>
 +#include <poll.h>
++#include <stdbool.h>
 +#include <stdint.h>
 +#include <string.h>
 +#include <time.h>
@@ -739,3 +740,11 @@ index 0000000000000000000000000000000000000000..d1391d862cadafb2b969a301f337832b
 +    .uninit = uninit,
 +    .priv_size = sizeof(struct priv),
 +};
+diff --git a/video/out/hwdec/hwdec_ohcodec_pl.c b/video/out/hwdec/hwdec_ohcodec_pl.c
+--- a/video/out/hwdec/hwdec_ohcodec_pl.c
++++ b/video/out/hwdec/hwdec_ohcodec_pl.c
+@@ -3,3 +3,4 @@
+ #include <inttypes.h>
++#include <stdbool.h>
+ #include <string.h>
+ #include <unistd.h>
