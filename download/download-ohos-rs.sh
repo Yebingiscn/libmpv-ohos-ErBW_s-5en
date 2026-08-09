@@ -10,4 +10,7 @@ else
 fi
 
 rustup target add aarch64-unknown-linux-ohos
-cargo install cargo-c --features=vendored-openssl
+# cargo-c is a host tool. Do not let the OHOS target compiler environment
+# leak into its vendored C dependencies.
+env -u CC -u CXX -u CFLAGS -u CXXFLAGS -u AR -u RANLIB \
+  cargo install cargo-c --features=vendored-openssl

@@ -9,8 +9,12 @@ if [ "$(uname -s)" = "Linux" ]; then
     echo "Downloading OpenHarmony SDK..."
     ./download/download-sdk.sh
   fi
-  . ./env.sh
-  sed "s|@OHOS_NDK_HOME@|$OHOS_NDK_HOME|g" \
+  if [ -d /sdk/ohos-sdk/linux ]; then
+    NDK_ROOT=/sdk/ohos-sdk/linux
+  else
+    NDK_ROOT=/sdk/linux
+  fi
+  sed "s|@OHOS_NDK_HOME@|$NDK_ROOT|g" \
     ./crossfiles/arm64-crossfile-linux.ini > ./libmpv/arm64-crossfile.ini
 elif [ "$(uname -s)" = "Darwin" ]; then
   echo "Using DevEco Studio for macOS, please make sure DevEco Studio is installed."
