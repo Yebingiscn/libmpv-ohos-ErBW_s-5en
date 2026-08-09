@@ -1,5 +1,5 @@
 diff --git a/libavcodec/avcodec.h b/libavcodec/avcodec.h
-index 6824bfc..c8d2aad 100644
+index 6824bfc9a646a5dbc6647fc1b017eb12887feeea..c8d2aad3112c98563214277da19dc71951fd28b0 100644
 --- a/libavcodec/avcodec.h
 +++ b/libavcodec/avcodec.h
 @@ -2912,6 +2912,18 @@ int avcodec_default_execute(AVCodecContext *c, int (*func)(AVCodecContext *c2, v
@@ -22,7 +22,7 @@ index 6824bfc..c8d2aad 100644
   * Fill AVFrame audio data and linesize pointers.
   *
 diff --git a/libavcodec/ohdec.c b/libavcodec/ohdec.c
-index 0179125..94a8d08 100644
+index 017912535fd7cd38797db1ecd4695759d2c74791..cb1a3718128594790567004ca9840a8e3e45252e 100644
 --- a/libavcodec/ohdec.c
 +++ b/libavcodec/ohdec.c
 @@ -20,11 +20,15 @@
@@ -69,7 +69,7 @@ index 0179125..94a8d08 100644
  } OHCodecDecContext;
  
  #define OFFSET(x) offsetof(OHCodecDecContext, x)
-@@ -134,6 +150,38 @@ static uint64_t oh_decode_generation(const OHCodecDecContext *s)
+@@ -134,6 +150,42 @@ static uint64_t oh_decode_generation(const OHCodecDecContext *s)
                                  memory_order_acquire);
  }
  
@@ -92,10 +92,14 @@ index 0179125..94a8d08 100644
 +
 +    if (!s->keys.frame_rate)
 +        av_log(avctx, AV_LOG_WARNING,
-+               "OHCodec frame-rate key is unavailable; VRR is disabled\n");
++               "[OHCodecPolicy] vrr=unavailable reason=frame-rate-key\n");
++    else if (!s->keys.enable_vrr)
++        av_log(avctx, AV_LOG_WARNING,
++               "[OHCodecPolicy] vrr=unavailable reason=vrr-key\n");
 +    if (!s->keys.retention_mode || !s->keys.decoder_speed)
-+        av_log(avctx, AV_LOG_VERBOSE,
-+               "OHCodec smart fluency decoding is unavailable at runtime\n");
++        av_log(avctx, AV_LOG_WARNING,
++               "[OHCodecPolicy] smart-fluency=unavailable "
++               "reason=runtime-keys\n");
 +}
 +
 +static bool oh_decode_supports_smart_fluency(const AVCodecContext *avctx)
@@ -108,7 +112,7 @@ index 0179125..94a8d08 100644
  static void oh_decode_invalidate_outputs(OHCodecDecContext *s)
  {
      atomic_fetch_add_explicit(&oh_decode_ref(s)->generation, 1,
-@@ -370,17 +418,27 @@ static int oh_decode_set_format(OHCodecDecContext *s, AVCodecContext *avctx)
+@@ -370,17 +422,33 @@ static int oh_decode_set_format(OHCodecDecContext *s, AVCodecContext *avctx)
      else
          OH_AVFormat_SetIntValue(format, OH_MD_KEY_PIXEL_FORMAT,
                                  AV_PIXEL_FORMAT_SURFACE_FORMAT);
@@ -124,30 +128,50 @@ index 0179125..94a8d08 100644
 -        av_log(avctx, AV_LOG_INFO, "Set OHCodec configured frame rate to %.3f\n",
 -               s->configured_frame_rate);
 +    bool frame_rate_set = false;
++    bool vrr_requested = false;
 +    if (s->source_frame_rate > 0.0 && s->keys.frame_rate) {
 +        frame_rate_set = OH_AVFormat_SetDoubleValue(format,
 +                                                    s->keys.frame_rate,
 +                                                    s->source_frame_rate);
 +        if (!frame_rate_set)
 +            av_log(avctx, AV_LOG_WARNING,
-+                   "Failed to set OHCodec source frame rate %.3f\n",
-+                   s->source_frame_rate);
-+        else
-+            av_log(avctx, AV_LOG_INFO,
-+                   "Set OHCodec source frame rate to %.3f\n",
++                   "[OHCodecPolicy] vrr=request-failed mode=%s fps=%.3f "
++                   "reason=frame-rate-format\n",
++                   s->output_to_window ? "surface" : "buffer",
 +                   s->source_frame_rate);
 +    }
-+    if (s->output_to_window && frame_rate_set && s->keys.enable_vrr) {
-+        if (!OH_AVFormat_SetIntValue(format, s->keys.enable_vrr, 1))
++    if (frame_rate_set && s->keys.enable_vrr) {
++        vrr_requested = OH_AVFormat_SetIntValue(format,
++                                                s->keys.enable_vrr, 1);
++        if (!vrr_requested)
 +            av_log(avctx, AV_LOG_WARNING,
-+                   "Failed to request OHCodec variable refresh rate\n");
-+        else
-+            av_log(avctx, AV_LOG_INFO,
-+                   "Requested OHCodec variable refresh rate\n");
++                   "[OHCodecPolicy] vrr=request-failed mode=%s fps=%.3f "
++                   "reason=vrr-format\n",
++                   s->output_to_window ? "surface" : "buffer",
++                   s->source_frame_rate);
++    } else if (s->source_frame_rate <= 0.0) {
++        av_log(avctx, AV_LOG_WARNING,
++               "[OHCodecPolicy] vrr=unavailable mode=%s "
++               "reason=source-frame-rate\n",
++               s->output_to_window ? "surface" : "buffer");
      }
      OH_AVErrCode err = OH_VideoDecoder_Configure(s->dec, format);
      OH_AVFormat_Destroy(format);
-@@ -617,6 +675,12 @@ static av_cold int oh_decode_init(AVCodecContext *avctx)
+@@ -401,6 +469,13 @@ static int oh_decode_set_format(OHCodecDecContext *s, AVCodecContext *avctx)
+         }
+     }
+ 
++    if (vrr_requested)
++        av_log(avctx, AV_LOG_WARNING,
++               "[OHCodecPolicy] vrr=requested mode=%s fps=%.3f "
++               "configure=ok\n",
++               s->output_to_window ? "surface" : "buffer",
++               s->source_frame_rate);
++
+     return 0;
+ }
+ 
+@@ -617,6 +692,12 @@ static av_cold int oh_decode_init(AVCodecContext *avctx)
      OHCodecDecContext *s = avctx->priv_data;
  
      atomic_init(&s->accepting_callbacks, false);
@@ -160,7 +184,7 @@ index 0179125..94a8d08 100644
      s->dovi_ctx.logctx = avctx;
      if (avctx->codec_id == AV_CODEC_ID_HEVC) {
          const AVPacketSideData *sd =
-@@ -924,6 +988,78 @@ static int oh_decode_send_pkt(AVCodecContext *avctx,
+@@ -924,6 +1005,87 @@ static int oh_decode_send_pkt(AVCodecContext *avctx,
      return 0;
  }
  
@@ -180,6 +204,13 @@ index 0179125..94a8d08 100644
 +        s->keys.retention_mode && s->keys.decoder_speed &&
 +        oh_decode_supports_smart_fluency(avctx) &&
 +        (enable_smart_fluency || s->smart_fluency_active);
++
++    if (enable_smart_fluency && s->keys.retention_mode &&
++        s->keys.decoder_speed && !oh_decode_supports_smart_fluency(avctx))
++        av_log(avctx, AV_LOG_WARNING,
++               "[OHCodecPolicy] smart-fluency=unavailable speed=%.3f "
++               "reason=codec codec=%s\n",
++               speed, avcodec_get_name(avctx->codec_id));
 +
 +    if (!update_smart_fluency && effective_frame_rate > 0.0 &&
 +        s->keys.frame_rate) {
@@ -226,20 +257,22 @@ index 0179125..94a8d08 100644
 +    if (err != AV_ERR_OK) {
 +        s->smart_fluency_failed = true;
 +        av_log(avctx, AV_LOG_WARNING,
-+               "OHCodec smart fluency decoding is unsupported: %d\n", err);
++               "[OHCodecPolicy] smart-fluency=request-failed speed=%.3f "
++               "error=%d\n", speed, err);
 +        return;
 +    }
 +
 +    s->smart_fluency_active = enable_smart_fluency;
-+    av_log(avctx, AV_LOG_INFO,
-+           "OHCodec smart fluency mode=%s speed=%.3f\n",
++    av_log(avctx, AV_LOG_WARNING,
++           "[OHCodecPolicy] smart-fluency=%s speed=%.3f "
++           "set-parameter=ok\n",
 +           enable_smart_fluency ? "adaptive" : "full", speed);
 +}
 +
  static int oh_decode_cond_wait(AVCond *cond, AVMutex *mutex)
  {
      struct timespec deadline;
-@@ -941,6 +1077,8 @@ static int oh_decode_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+@@ -941,6 +1103,8 @@ static int oh_decode_receive_frame(AVCodecContext *avctx, AVFrame *frame)
  {
      OHCodecDecContext *s = avctx->priv_data;
  
@@ -248,7 +281,7 @@ index 0179125..94a8d08 100644
      while (1) {
          OHCodecDecQueueItem buffer = {0};
          int ret;
-@@ -1026,6 +1164,7 @@ static void oh_decode_flush(AVCodecContext *avctx)
+@@ -1026,6 +1190,7 @@ static void oh_decode_flush(AVCodecContext *avctx)
      av_fifo_reset2(s->output_queue);
      s->decode_status = 0;
      s->eof_sent = false;
@@ -256,7 +289,7 @@ index 0179125..94a8d08 100644
      av_packet_unref(&s->pkt);
      oh_decode_clear_dovi(s);
      ff_dovi_ctx_flush(&s->dovi_ctx);
-@@ -1038,6 +1177,24 @@ static void oh_decode_flush(AVCodecContext *avctx)
+@@ -1038,6 +1203,24 @@ static void oh_decode_flush(AVCodecContext *avctx)
                                memory_order_release);
  }
  
@@ -281,7 +314,7 @@ index 0179125..94a8d08 100644
  static const AVCodecHWConfigInternal *const oh_hw_configs[] = {
      &(const AVCodecHWConfigInternal) {
          .public = {
-@@ -1057,9 +1214,6 @@ static const AVOption ohcodec_vdec_options[] = {
+@@ -1057,9 +1240,6 @@ static const AVOption ohcodec_vdec_options[] = {
           OFFSET(name), AV_OPT_TYPE_STRING, .flags = VD},
      {"allow_sw", "Allow software decoding",
           OFFSET(allow_sw), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, VD},

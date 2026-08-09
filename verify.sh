@@ -79,6 +79,11 @@ for marker in OH_MD_KEY_VIDEO_DECODER_OUTPUT_ENABLE_VRR \
   fi
 done
 
+if ! "$STRINGS" "$LIBMPV" | grep -F "[OHCodecPolicy]" >/dev/null; then
+  echo "Missing OHCodec playback-policy diagnostic marker" >&2
+  exit 1
+fi
+
 echo "$features"
 echo "$configuration"
 grep -E "NEEDED|SONAME" <<< "$dynamic_section"

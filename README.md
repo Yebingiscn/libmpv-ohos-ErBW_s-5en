@@ -38,6 +38,13 @@ changes are forwarded internally to OHCodec: on systems exposing the API 26
 smart-fluency keys, speeds above 1x use adaptive frame retention and returning
 to 1x restores full retention.
 
+Policy results are emitted automatically with the `[OHCodecPolicy]` prefix at
+warning level so hosts using the default mpv warning log level can diagnose the
+feature without a user-facing setting. A successful decoder request reports
+`vrr=requested ... configure=ok` for either `mode=surface` or `mode=buffer`;
+smart fluency reports `smart-fluency=adaptive ... set-parameter=ok` and reports
+`smart-fluency=full` when playback returns to 1x.
+
 The API 26 SDK declarations and official `OH_FrameRetentionMode` values are
 used at compile time, while optional metadata-key symbols are resolved with
 `dlsym` and are never hard-linked. Older HarmonyOS releases therefore keep the
