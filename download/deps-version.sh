@@ -2,8 +2,9 @@
 
 set -eu
 
-# OpenHarmony SDK version
-V_SDK=6.0-Release
+# HarmonyOS SDK version. API 26 is provided by the 7.0 Beta1 public NDK.
+V_SDK=7.0-Beta1
+V_SDK_REPOSITORY=harmonyos
 
 # FFmpeg TLS/AV1 dependencies. Keep Mbed TLS on the supported 3.6 LTS ABI;
 # moving to the 4.x ABI needs a separate FFmpeg adapter validation.

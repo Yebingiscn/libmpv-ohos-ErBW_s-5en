@@ -1,6 +1,7 @@
 # libmpv-ohos-build
 
 Build scripts of [libmpv](https://github.com/mpv-player/mpv) for ohos-arm64 (API 15+).
+The native dependencies are compiled with the HarmonyOS 7.0 Beta1 API 26 NDK.
 
 Scripts are compatible with macOS, Linux and WSL, Windows is not supported.
 
@@ -37,9 +38,11 @@ changes are forwarded internally to OHCodec: on systems exposing the API 26
 smart-fluency keys, speeds above 1x use adaptive frame retention and returning
 to 1x restores full retention.
 
-The optional metadata-key symbols are resolved with `dlsym` and are never
-hard-linked. Older HarmonyOS releases therefore keep the normal playback path
-without requiring an application target-SDK change or user-facing settings.
+The API 26 SDK declarations and official `OH_FrameRetentionMode` values are
+used at compile time, while optional metadata-key symbols are resolved with
+`dlsym` and are never hard-linked. Older HarmonyOS releases therefore keep the
+normal playback path without requiring an application target-SDK change or
+user-facing settings.
 
 The build also adds:
 

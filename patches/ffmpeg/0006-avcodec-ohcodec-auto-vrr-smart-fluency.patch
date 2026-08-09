@@ -22,10 +22,10 @@ index 6824bfc..c8d2aad 100644
   * Fill AVFrame audio data and linesize pointers.
   *
 diff --git a/libavcodec/ohdec.c b/libavcodec/ohdec.c
-index 0179125..ede9b5e 100644
+index 0179125..94a8d08 100644
 --- a/libavcodec/ohdec.c
 +++ b/libavcodec/ohdec.c
-@@ -20,9 +20,12 @@
+@@ -20,11 +20,15 @@
  
  #include "config_components.h"
  
@@ -37,8 +37,11 @@ index 0179125..ede9b5e 100644
 +#include <string.h>
  #include <time.h>
  #include <multimedia/player_framework/native_avcapability.h>
++#include <multimedia/player_framework/native_avcodec_base.h>
  #include <multimedia/player_framework/native_avcodec_videodecoder.h>
-@@ -68,6 +71,13 @@ typedef struct OHCodecDecRef {
+ #include <native_buffer/native_buffer.h>
+ 
+@@ -68,6 +72,13 @@ typedef struct OHCodecDecRef {
      atomic_uint_fast64_t generation;
  } OHCodecDecRef;
  
@@ -52,7 +55,7 @@ index 0179125..ede9b5e 100644
  typedef struct OHCodecDecContext {
      AVClass *avclass;
      OH_AVCodec *dec;
-@@ -108,7 +118,12 @@ typedef struct OHCodecDecContext {
+@@ -108,7 +119,12 @@ typedef struct OHCodecDecContext {
      char *name;
      int allow_sw;
      unsigned mutex_cond_cnt;
@@ -66,7 +69,7 @@ index 0179125..ede9b5e 100644
  } OHCodecDecContext;
  
  #define OFFSET(x) offsetof(OHCodecDecContext, x)
-@@ -134,6 +149,38 @@ static uint64_t oh_decode_generation(const OHCodecDecContext *s)
+@@ -134,6 +150,38 @@ static uint64_t oh_decode_generation(const OHCodecDecContext *s)
                                  memory_order_acquire);
  }
  
@@ -105,7 +108,7 @@ index 0179125..ede9b5e 100644
  static void oh_decode_invalidate_outputs(OHCodecDecContext *s)
  {
      atomic_fetch_add_explicit(&oh_decode_ref(s)->generation, 1,
-@@ -370,17 +417,27 @@ static int oh_decode_set_format(OHCodecDecContext *s, AVCodecContext *avctx)
+@@ -370,17 +418,27 @@ static int oh_decode_set_format(OHCodecDecContext *s, AVCodecContext *avctx)
      else
          OH_AVFormat_SetIntValue(format, OH_MD_KEY_PIXEL_FORMAT,
                                  AV_PIXEL_FORMAT_SURFACE_FORMAT);
@@ -144,7 +147,7 @@ index 0179125..ede9b5e 100644
      }
      OH_AVErrCode err = OH_VideoDecoder_Configure(s->dec, format);
      OH_AVFormat_Destroy(format);
-@@ -617,6 +674,12 @@ static av_cold int oh_decode_init(AVCodecContext *avctx)
+@@ -617,6 +675,12 @@ static av_cold int oh_decode_init(AVCodecContext *avctx)
      OHCodecDecContext *s = avctx->priv_data;
  
      atomic_init(&s->accepting_callbacks, false);
@@ -157,7 +160,7 @@ index 0179125..ede9b5e 100644
      s->dovi_ctx.logctx = avctx;
      if (avctx->codec_id == AV_CODEC_ID_HEVC) {
          const AVPacketSideData *sd =
-@@ -924,6 +987,79 @@ static int oh_decode_send_pkt(AVCodecContext *avctx,
+@@ -924,6 +988,78 @@ static int oh_decode_send_pkt(AVCodecContext *avctx,
      return 0;
  }
  
@@ -202,16 +205,15 @@ index 0179125..ede9b5e 100644
 +    if (!format)
 +        return;
 +
-+    /* OH_FrameRetentionMode values are part of the API 26 ABI. Keep the
-+     * constants local so older NDKs do not introduce symbol references. */
-+    const int32_t retention_mode = enable_smart_fluency
-+        ? 1 /* ADAPTIVE */ : 0 /* FULL */;
++    const OH_FrameRetentionMode retention_mode = enable_smart_fluency
++        ? OH_FRAME_RETENTION_MODE_ADAPTIVE
++        : OH_FRAME_RETENTION_MODE_FULL;
 +    bool valid = true;
 +    if (effective_frame_rate > 0.0 && s->keys.frame_rate)
 +        valid = OH_AVFormat_SetDoubleValue(format, s->keys.frame_rate,
 +                                           effective_frame_rate);
 +    valid = valid && OH_AVFormat_SetIntValue(format, s->keys.retention_mode,
-+                                             retention_mode);
++                                             (int32_t)retention_mode);
 +    if (enable_smart_fluency)
 +        valid = valid && OH_AVFormat_SetDoubleValue(format,
 +                                                    s->keys.decoder_speed,
