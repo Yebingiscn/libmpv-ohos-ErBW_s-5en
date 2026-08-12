@@ -1,0 +1,154 @@
+diff --git a/video/out/hwdec/hwdec_ohcodec.c b/video/out/hwdec/hwdec_ohcodec.c
+index bddf69994f..379d1602de 100644
+--- a/video/out/hwdec/hwdec_ohcodec.c
++++ b/video/out/hwdec/hwdec_ohcodec.c
+@@ -11,11 +11,11 @@
+ #include "video/out/gpu/hwdec.h"
+ 
+ static const ohcodec_interop_init interop_inits[] = {
+-#if HAVE_VULKAN
+-    ohcodec_interop_pl_init,
+-#endif
+ #if HAVE_GL
+     ohcodec_interop_gl_init,
++#endif
++#if HAVE_VULKAN
++    ohcodec_interop_pl_init,
+ #endif
+     NULL,
+ };
+@@ -25,7 +25,7 @@ static void on_frame_available(void *opaque)
+     struct ohcodec_surface *surface = opaque;
+     // NativeImage APIs are deliberately not called from this callback.
+     mp_mutex_lock(&surface->lock);
+-    surface->pending++;
++    surface->callback_sequence++;
+     mp_cond_signal(&surface->cond);
+     mp_mutex_unlock(&surface->lock);
+ }
+@@ -75,21 +75,30 @@ void ohcodec_surface_destroy(struct ohcodec_surface *surface)
+     surface->window = NULL;
+ }
+ 
+-bool ohcodec_surface_wait(struct ohcodec_surface *surface,
+-                          struct mp_log *log, int64_t *wait_ns)
++uint64_t ohcodec_surface_get_sequence(struct ohcodec_surface *surface)
++{
++    mp_mutex_lock(&surface->lock);
++    uint64_t sequence = surface->callback_sequence;
++    mp_mutex_unlock(&surface->lock);
++    return sequence;
++}
++
++bool ohcodec_surface_wait_after(struct ohcodec_surface *surface,
++                                uint64_t *sequence, int64_t deadline_ns,
++                                struct mp_log *log, int64_t *wait_ns)
+ {
+     int64_t start = mp_time_ns();
+     bool ready;
+ 
+     mp_mutex_lock(&surface->lock);
+-    while (!surface->pending) {
+-        if (mp_cond_timedwait(&surface->cond, &surface->lock,
+-                              MP_TIME_MS_TO_NS(250)))
++    while (surface->callback_sequence == *sequence) {
++        if (mp_cond_timedwait_until(&surface->cond, &surface->lock,
++                                    deadline_ns))
+             break;
+     }
+-    ready = surface->pending != 0;
++    ready = surface->callback_sequence != *sequence;
+     if (ready)
+-        surface->pending--;
++        *sequence = surface->callback_sequence;
+     mp_mutex_unlock(&surface->lock);
+ 
+     *wait_ns = mp_time_ns() - start;
+@@ -194,6 +203,10 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
+         return 0;
+     }
+ 
++    // Capture the callback generation before rendering. This prevents delayed
++    // notifications from older frames from being mistaken for this token.
++    uint64_t callback_sequence =
++        ohcodec_surface_get_sequence(owner->surface);
+     int render_ret = av_ohcodec_release_buffer(token, 1);
+     if (render_ret < 0) {
+         // Flush/EOF can invalidate a frame after it entered libplacebo's
+@@ -212,14 +225,16 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
+         return -1;
+     }
+ 
+-    int map_ret = NATIVE_ERROR_NO_BUFFER;
+-    for (int attempts = 0; attempts < 32 && map_ret == NATIVE_ERROR_NO_BUFFER;
+-         attempts++) {
++    int map_ret = owner->interop->map(mapper);
++    int64_t deadline_ns = mp_time_ns() + MP_TIME_MS_TO_NS(250);
++    while (map_ret == NATIVE_ERROR_NO_BUFFER) {
+         int64_t current_wait = 0;
+         // NativeImage consumption is only valid after its frame-available
+         // callback. If a delayed callback no longer has a matching buffer,
+         // discard that notification and wait for the current rendered frame.
+-        if (!ohcodec_surface_wait(owner->surface, mapper->log, &current_wait))
++        if (!ohcodec_surface_wait_after(owner->surface, &callback_sequence,
++                                        deadline_ns, mapper->log,
++                                        &current_wait))
+             break;
+         wait_ns += current_wait;
+         map_ret = owner->interop->map(mapper);
+diff --git a/video/out/hwdec/hwdec_ohcodec.h b/video/out/hwdec/hwdec_ohcodec.h
+index 4168eb377c..975ffaf289 100644
+--- a/video/out/hwdec/hwdec_ohcodec.h
++++ b/video/out/hwdec/hwdec_ohcodec.h
+@@ -2,6 +2,7 @@
+ #pragma once
+ 
+ #include <stdbool.h>
++#include <stdint.h>
+ 
+ #include <libavcodec/ohcodec_buffer.h>
+ #include <native_image/native_image.h>
+@@ -14,7 +15,7 @@ struct ohcodec_surface {
+     OHNativeWindow *window;
+     mp_mutex lock;
+     mp_cond cond;
+-    unsigned pending;
++    uint64_t callback_sequence;
+     bool initialized;
+ };
+ 
+@@ -46,8 +47,10 @@ typedef bool (*ohcodec_interop_init)(struct ra_hwdec *hw);
+ bool ohcodec_surface_init(struct ohcodec_surface *surface,
+                           OH_NativeImage *image);
+ void ohcodec_surface_destroy(struct ohcodec_surface *surface);
+-bool ohcodec_surface_wait(struct ohcodec_surface *surface,
+-                          struct mp_log *log, int64_t *wait_ns);
++uint64_t ohcodec_surface_get_sequence(struct ohcodec_surface *surface);
++bool ohcodec_surface_wait_after(struct ohcodec_surface *surface,
++                                uint64_t *sequence, int64_t deadline_ns,
++                                struct mp_log *log, int64_t *wait_ns);
+ 
+ bool ohcodec_interop_gl_init(struct ra_hwdec *hw);
+ bool ohcodec_interop_pl_init(struct ra_hwdec *hw);
+diff --git a/video/out/hwdec/hwdec_ohcodec_pl.c b/video/out/hwdec/hwdec_ohcodec_pl.c
+index 6627ead2a9..c92432cacf 100644
+--- a/video/out/hwdec/hwdec_ohcodec_pl.c
++++ b/video/out/hwdec/hwdec_ohcodec_pl.c
+@@ -403,7 +403,6 @@ static void release_acquired_buffer(struct ra_hwdec_mapper *mapper,
+     if (!buffer)
+         return;
+ 
+-    OH_NativeWindow_NativeObjectUnreference(buffer);
+     int ret = OH_NativeImage_ReleaseNativeWindowBuffer(owner->surface->image,
+                                                         buffer, fence_fd);
+     if (ret != NATIVE_ERROR_OK) {
+@@ -411,6 +410,9 @@ static void release_acquired_buffer(struct ra_hwdec_mapper *mapper,
+             close(fence_fd);
+         MP_ERR(mapper, "ReleaseNativeWindowBuffer failed: %d\n", ret);
+     }
++    // Keep our explicit reference alive until NativeImage has finished using
++    // the wrapper to return the buffer to the consumer queue.
++    OH_NativeWindow_NativeObjectUnreference(buffer);
+ }
+ 
+ static void release_window_buffer(struct ra_hwdec_mapper *mapper, int fence_fd)
