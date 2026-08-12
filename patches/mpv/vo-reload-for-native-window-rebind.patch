@@ -1,0 +1,50 @@
+diff --git a/DOCS/man/input.rst b/DOCS/man/input.rst
+index 24f9d7a5cf..87f1ce214d 100644
+--- a/DOCS/man/input.rst
++++ b/DOCS/man/input.rst
+@@ -1695,6 +1695,11 @@ Miscellaneous Commands
+ 
+ Undocumented commands: ``ao-reload`` (experimental/internal).
+ 
++``vo-reload``
++    Recreate the active video output and video decoder chain. This is intended
++    for embedding applications which replaced a native window while playback
++    remains active.
++
+ List of events
+ --------------
+ 
+diff --git a/player/command.c b/player/command.c
+index 1efb810696..1f6253f476 100644
+--- a/player/command.c
++++ b/player/command.c
+@@ -6704,6 +6704,21 @@ static void cmd_ao_reload(void *p)
+     reload_audio_output(mpctx);
+ }
+ 
++static void cmd_vo_reload(void *p)
++{
++    struct mp_cmd_ctx *cmd = p;
++    struct MPContext *mpctx = cmd->mpctx;
++    struct track *track = mpctx->current_track[0][STREAM_VIDEO];
++
++    if (mpctx->video_out)
++        uninit_video_out(mpctx);
++    handle_force_window(mpctx, true);
++    reinit_video_chain(mpctx);
++    if (track)
++        queue_seek(mpctx, MPSEEK_RELATIVE, 0.0, MPSEEK_EXACT, 0);
++    mp_wakeup_core(mpctx);
++}
++
+ static void cmd_filter(void *p)
+ {
+     struct mp_cmd_ctx *cmd = p;
+@@ -7540,6 +7555,7 @@ const struct mp_cmd_def mp_cmds[] = {
+         .priv = &(const int){STREAM_VIDEO} },
+ 
+     { "ao-reload", cmd_ao_reload },
++    { "vo-reload", cmd_vo_reload },
+ 
+     { "script-binding", cmd_script_binding,
+         {

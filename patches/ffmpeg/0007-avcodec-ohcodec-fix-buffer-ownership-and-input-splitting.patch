@@ -1,0 +1,132 @@
+diff --git a/libavcodec/ohdec.c b/libavcodec/ohdec.c
+index cb1a371..4d50f56 100644
+--- a/libavcodec/ohdec.c
++++ b/libavcodec/ohdec.c
+@@ -843,7 +843,8 @@ static int oh_decode_wrap_hw_buffer(AVCodecContext *avctx, AVFrame *frame,
+                                      oh_buffer_release,
+                                      buffer, AV_BUFFER_FLAG_READONLY);
+     if (!frame->buf[0]) {
+-        oh_buffer_release(buffer, NULL);
++        av_refstruct_unref(&buffer->dec_ref);
++        av_free(buffer);
+         return AVERROR(ENOMEM);
+     }
+     frame->hw_frames_ctx = av_buffer_ref(avctx->hw_frames_ctx);
+@@ -892,15 +893,21 @@ static int oh_decode_wrap_sw_buffer(AVCodecContext *avctx, AVFrame *frame,
+     av_image_copy2(frame->data, frame->linesize, src, src_linesizes,
+                    frame->format, frame->width, frame->height);
+ 
++    return 0;
++}
++
++static int oh_decode_free_output_buffer(AVCodecContext *avctx,
++                                        OHCodecDecQueueItem *output)
++{
++    OHCodecDecContext *s = avctx->priv_data;
+     OH_AVErrCode err = OH_VideoDecoder_FreeOutputBuffer(s->dec, output->index);
+-    if (err != AV_ERR_OK) {
+-        ret = ff_oh_err_to_ff_err(err);
+-        av_log(avctx, AV_LOG_ERROR, "FreeOutputBuffer failed, %d, %s\n", err,
+-               av_err2str(ret));
+-        return ret;
+-    }
++    if (err == AV_ERR_OK)
++        return 0;
+ 
+-    return 0;
++    int ret = ff_oh_err_to_ff_err(err);
++    av_log(avctx, AV_LOG_ERROR, "FreeOutputBuffer failed, %d, %s\n", err,
++           av_err2str(ret));
++    return ret;
+ }
+ 
+ static int oh_decode_output_frame(AVCodecContext *avctx, AVFrame *frame,
+@@ -908,15 +915,25 @@ static int oh_decode_output_frame(AVCodecContext *avctx, AVFrame *frame,
+ {
+     OHCodecDecContext *s = avctx->priv_data;
+     OH_AVCodecBufferAttr attr;
++    bool hw_output_owned = false;
++    int ret;
+ 
+     OH_AVErrCode err = OH_AVBuffer_GetBufferAttr(output->buffer, &attr);
+-    if (err != AV_ERR_OK)
+-        return ff_oh_err_to_ff_err(err);
++    if (err != AV_ERR_OK) {
++        ret = ff_oh_err_to_ff_err(err);
++        goto fail;
++    }
+ 
+     if (attr.flags & AVCODEC_BUFFER_FLAGS_EOS) {
+         av_log(avctx, AV_LOG_DEBUG, "Buffer flag eos\n");
+-        OH_VideoDecoder_FreeOutputBuffer(s->dec, output->index);
+-        return AVERROR_EOF;
++        ret = AVERROR_EOF;
++        goto fail;
++    }
++
++    if (attr.flags & AVCODEC_BUFFER_FLAGS_DISCARD) {
++        av_log(avctx, AV_LOG_DEBUG, "Discarding decoder output buffer\n");
++        ret = AVERROR(EAGAIN);
++        goto fail;
+     }
+ 
+     if (!s->got_stream_info) {
+@@ -927,18 +944,43 @@ static int oh_decode_output_frame(AVCodecContext *avctx, AVFrame *frame,
+         OH_AVFormat *format = OH_VideoDecoder_GetOutputDescription(s->dec);
+         if (!format) {
+             av_log(avctx, AV_LOG_ERROR, "GetOutputDescription failed\n");
+-            return AVERROR_EXTERNAL;
++            ret = AVERROR_EXTERNAL;
++            goto fail;
+         }
+ 
+         oh_decode_on_stream_changed(s->dec, format, avctx);
+         OH_AVFormat_Destroy(format);
+-        if (!s->got_stream_info)
+-            return AVERROR_EXTERNAL;
++        if (!s->got_stream_info) {
++            ret = AVERROR_EXTERNAL;
++            goto fail;
++        }
+     }
+ 
+-    if (s->output_to_window)
+-        return oh_decode_wrap_hw_buffer(avctx, frame, output, &attr);
+-    return oh_decode_wrap_sw_buffer(avctx, frame, output, &attr);
++    if (s->output_to_window) {
++        ret = oh_decode_wrap_hw_buffer(avctx, frame, output, &attr);
++        hw_output_owned = frame->buf[0] != NULL;
++        if (ret < 0)
++            goto fail;
++        return 0;
++    }
++
++    ret = oh_decode_wrap_sw_buffer(avctx, frame, output, &attr);
++    if (ret < 0)
++        goto fail;
++
++    ret = oh_decode_free_output_buffer(avctx, output);
++    if (ret < 0)
++        av_frame_unref(frame);
++    return ret;
++
++fail:
++    av_frame_unref(frame);
++    if (!hw_output_owned) {
++        int free_ret = oh_decode_free_output_buffer(avctx, output);
++        if (free_ret < 0 && ret >= 0)
++            ret = free_ret;
++    }
++    return ret;
+ }
+ 
+ static int oh_decode_send_pkt(AVCodecContext *avctx,
+@@ -981,6 +1023,8 @@ static int oh_decode_send_pkt(AVCodecContext *avctx,
+             .flags = (s->pkt.flags & AV_PKT_FLAG_KEY)
+                      ? AVCODEC_BUFFER_FLAGS_SYNC_FRAME : 0,
+     };
++    if (n < s->pkt.size)
++        attr.flags |= AVCODEC_BUFFER_FLAGS_INCOMPLETE_FRAME;
+ 
+     err = OH_AVBuffer_SetBufferAttr(input->buffer, &attr);
+     if (err != AV_ERR_OK) {
