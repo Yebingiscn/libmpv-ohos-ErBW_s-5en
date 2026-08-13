@@ -66,6 +66,22 @@ if ! "$STRINGS" "$LIBMPV" | grep -F "AVS1-P16, Guangdian profile" >/dev/null; th
   exit 1
 fi
 
+# libcavs' arithmetic decoder decrements bits_to_go below zero to refill its
+# byte buffer.  On AArch64, plain char is unsigned; leaving this state as char
+# makes the decrement wrap to 255 and lets optimization remove the decoder
+# initializer entirely.  Its exported symbol then aliases the next function,
+# which crashes as soon as AVS+ AEC decoding starts.
+cavs_start_addr=$(awk '$3 == "cavs_cabac_start_decoding" { print $1; exit }' <<< "$symbols")
+cavs_stuffing_addr=$(awk '$3 == "cavs_biari_decode_stuffing_bit" { print $1; exit }' <<< "$symbols")
+if [ -z "$cavs_start_addr" ] || [ -z "$cavs_stuffing_addr" ]; then
+  echo "Missing AVS+ arithmetic decoder symbols" >&2
+  exit 1
+fi
+if [ "$cavs_start_addr" = "$cavs_stuffing_addr" ]; then
+  echo "AVS+ arithmetic decoder initializer was optimized to zero length" >&2
+  exit 1
+fi
+
 # Optional OHCodec metadata keys are resolved with dlsym at runtime so the
 # same libmpv remains loadable on older HarmonyOS releases.
 undefined_symbols=$("$NM" -D --undefined-only "$LIBMPV")

@@ -30,6 +30,16 @@ sed -i 's/\r$//' \
   ./libmpv/ffmpeg/libavcodec/libcavs.h \
   ./libmpv/ffmpeg/libavcodec/libcavsdec.c
 
+# libcavs decrements this state below zero when refilling its arithmetic
+# decoder.  Plain char is unsigned on AArch64, which makes the decrement wrap
+# and allows optimized builds to eliminate cavs_cabac_start_decoding.
+if ! grep -Fq 'char bits_to_go;' ./libmpv/ffmpeg/libavcodec/libcavs.c; then
+  echo "Missing expected libcavs bits_to_go declaration" >&2
+  exit 1
+fi
+sed -i 's/char bits_to_go;/int8_t bits_to_go;/' \
+  ./libmpv/ffmpeg/libavcodec/libcavs.c
+
 for dep_path in "${PATCHES[@]}"; do
   if [ -d "$dep_path" ]; then
     patches=($dep_path/*)
