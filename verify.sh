@@ -58,6 +58,14 @@ for marker in vvc_ohcodec video/vvc vvc_mp4toannexb; do
   fi
 done
 
+# mpv discovers FFmpeg decoders at runtime, so this decoder description is a
+# direct check that the AVS1-P16 capable libcavs implementation reached the
+# final statically linked libmpv rather than FFmpeg's AVS1-P2-only decoder.
+if ! "$STRINGS" "$LIBMPV" | grep -F "AVS1-P16, Guangdian profile" >/dev/null; then
+  echo "Missing AVS+ (AVS1-P16) software decoder" >&2
+  exit 1
+fi
+
 # Optional OHCodec metadata keys are resolved with dlsym at runtime so the
 # same libmpv remains loadable on older HarmonyOS releases.
 undefined_symbols=$("$NM" -D --undefined-only "$LIBMPV")

@@ -1,0 +1,102 @@
+diff --git a/configure b/configure
+index 3b11c40623..0ed8737d01 100755
+--- a/configure
++++ b/configure
+@@ -3105,6 +3105,6 @@ bink_decoder_select="blockdsp hpeldsp"
+ binkaudio_dct_decoder_select="wma_freqs"
+ binkaudio_rdft_decoder_select="wma_freqs"
+-cavs_decoder_select="blockdsp golomb h264chroma idctdsp qpeldsp videodsp"
++cavs_decoder_select="libcavsdec"
+ clearvideo_decoder_select="idctdsp"
+ cllc_decoder_select="bswapdsp"
+ comfortnoise_encoder_select="lpc"
+diff --git a/libavcodec/Makefile b/libavcodec/Makefile
+index dbd4d36298..e84da1dac4 100644
+--- a/libavcodec/Makefile
++++ b/libavcodec/Makefile
+@@ -304,7 +304,6 @@ OBJS-$(CONFIG_BONK_DECODER)            += bonk.o
+ OBJS-$(CONFIG_BRENDER_PIX_DECODER)     += brenderpix.o
+ OBJS-$(CONFIG_C93_DECODER)             += c93.o
+-OBJS-$(CONFIG_CAVS_DECODER)            += cavs.o cavsdec.o cavsdsp.o \
+-                                          cavsdata.o
++OBJS-$(CONFIG_CAVS_DECODER)            += libcavsdec.o libcavs.o
+ OBJS-$(CONFIG_CBD2_DPCM_DECODER)       += dpcm.o
+ OBJS-$(CONFIG_CCAPTION_DECODER)        += ccaption_dec.o ass.o
+ OBJS-$(CONFIG_CDGRAPHICS_DECODER)      += cdgraphics.o
+diff --git a/libavcodec/libcavs.c b/libavcodec/libcavs.c
+index b96a2ec213..543b8e1b0b 100644
+--- a/libavcodec/libcavs.c
++++ b/libavcodec/libcavs.c
+@@ -3,9 +3,12 @@
+ #ifdef _WIN32
+ #define SYS_WINDOWS 1
+ #define SYS_LINUX 0
++#elif defined(__linux__)
++#define SYS_WINDOWS 0
++#define SYS_LINUX 1
+ #else
+ #define SYS_WINDOWS 0
+-#define SYS_LINUX 1
++#define SYS_LINUX 0
+ #endif
+ 
+ #include "libcavs.h"
+@@ -29,5 +32,6 @@
+ #include <locale.h>
+ #include <pthread.h>
++#include "libavutil/cpu.h"
+ 
+ int cavs_cpu_num_processors (void);
+ 
+@@ -3828,21 +3832,6 @@ int
+ cavs_cpu_num_processors (void)
+ {
+-#if SYS_WINDOWS
+-  return pthread_num_processors_np ();
+-
+-#elif SYS_LINUX
+-  unsigned int bit;
+-  int np;
+-  cpu_set_t p_aff;
+-  memset (&p_aff, 0, sizeof (p_aff));
+-  sched_getaffinity (0, sizeof (p_aff), &p_aff);
+-  for (np = 0, bit = 0; bit < sizeof (p_aff); bit++)
+-    np += (((unsigned char *) & p_aff)[bit / 8] >> (bit % 8)) & 1;
+-  return np;
+-
+-#else
+-  return 1;
+-#endif
++  return FFMAX(av_cpu_count(), 1);
+ }
+ 
+ ////////////////////////////////////////////////////////////////////////////////
+@@ -7576,6 +7579,6 @@
+ #endif
+ 
+-void init_crop_table()
++static void init_crop_table()
+ {
+     int i;
+     
+diff --git a/libavcodec/libcavsdec.c b/libavcodec/libcavsdec.c
+index fd52c3ba58..b205c09a8e 100644
+--- a/libavcodec/libcavsdec.c
++++ b/libavcodec/libcavsdec.c
+@@ -24,6 +24,8 @@
+ 
+ 
+ #include "libavutil/avassert.h"
++#include "libavutil/attributes.h"
++#include "libavutil/internal.h"
+ #include "libavutil/common.h"
+ #include "libavutil/imgutils.h"
+ #include "avcodec.h"
+@@ -797,6 +799,5 @@ const FFCodec ff_cavs_decoder = {
+     .p.capabilities   = AV_CODEC_CAP_DELAY | AV_CODEC_CAP_OTHER_THREADS,
+     .caps_internal  = FF_CODEC_CAP_AUTO_THREADS,
+-    .p.pix_fmts     = (const enum AVPixelFormat[]) { AV_PIX_FMT_YUV420P,
+-                                                     AV_PIX_FMT_NONE },
++    CODEC_PIXFMTS(AV_PIX_FMT_YUV420P),
+     .flush          = cavs_flush,
+ };

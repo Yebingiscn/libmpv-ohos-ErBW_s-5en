@@ -11,6 +11,10 @@ V_SDK_REPOSITORY=harmonyos
 V_MBEDTLS=3.6.7
 V_DAV1D=1.5.4
 
+# AVS1-P16 (AVS+) software decoder imported into FFmpeg's CAVS decoder.
+# Keep this pinned because the upstream integration is distributed as a patch.
+V_CAVS_DRA=abae276fed97ce08928f25c8f5e03fd915687f54
+
 # Optical media
 V_LIBDVDCSS=1.6.0
 V_LIBDVDREAD=7.1.1

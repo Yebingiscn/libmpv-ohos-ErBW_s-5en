@@ -44,6 +44,7 @@ cd .build
   --disable-avdevice \
   --disable-muxers \
   --disable-encoders \
+  --enable-decoder=cavs \
   --enable-ohcodec \
   --enable-encoder=png,mjpeg
 make -j$CORES

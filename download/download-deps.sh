@@ -142,6 +142,28 @@ else
   echo "ffmpeg already exists, skipping."
 fi
 
+# AVS+ decoder source. Only the libcavs video files are imported by patch.sh;
+# the unrelated DRA audio decoder in this repository is deliberately omitted.
+if [ ! -d ffmpeg_cavs_dra ]; then
+  echo "Downloading AVS+ decoder source..."
+  git init -q ffmpeg_cavs_dra
+  git -C ffmpeg_cavs_dra remote add origin https://github.com/maliwen2015/ffmpeg_cavs_dra.git
+else
+  echo "AVS+ decoder source already exists, checking pinned revision."
+fi
+
+actual_cavs_dra_commit=$(git -C ffmpeg_cavs_dra rev-parse HEAD 2>/dev/null || true)
+if [ "$actual_cavs_dra_commit" != "$V_CAVS_DRA" ]; then
+  git -C ffmpeg_cavs_dra fetch -q --depth 1 origin "$V_CAVS_DRA"
+  git -C ffmpeg_cavs_dra -c advice.detachedHead=false checkout -q "$V_CAVS_DRA"
+fi
+
+actual_cavs_dra_commit=$(git -C ffmpeg_cavs_dra rev-parse HEAD)
+if [ "$actual_cavs_dra_commit" != "$V_CAVS_DRA" ]; then
+  echo "Unexpected AVS+ source commit: $actual_cavs_dra_commit (expected $V_CAVS_DRA)" >&2
+  exit 1
+fi
+
 # libass
 if [ ! -d libass ]; then
   echo "Downloading libass..."

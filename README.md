@@ -53,6 +53,7 @@ user-facing settings.
 
 The build also adds:
 
+- AVS+ / AVS1-P16 software decoding through FFmpeg's `cavs` decoder
 - DVD navigation and CSS support (`libdvdnav`, `libdvdread`, `libdvdcss`)
 - Blu-ray support (`libbluray`)
 - archive/ISO9660 support (`libarchive`)
@@ -61,6 +62,13 @@ The build also adds:
 
 The optical-media dependencies are linked statically into `libmpv.so`.
 Enabling libdvdnav and libdvdcss changes the resulting combined work to GPL.
+
+AVS+ support is based on the public
+[`ffmpeg_cavs_dra`](https://github.com/maliwen2015/ffmpeg_cavs_dra)
+implementation pinned in `download/deps-version.sh`. The build imports only
+its `libcavs` video decoder files into FFmpeg 8.1.2; the DRA audio decoder is
+not included. mpv selects the resulting `cavs` decoder automatically for CAVS
+streams, including AVS1-P16 broadcast TS files, with no player-side option.
 
 The output follows the current `mpv-arkts` native ABI. It does not restore the
 old SweetVideo buffer-overlay renderer; the new OSD plane uses mpv's current
