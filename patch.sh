@@ -22,6 +22,14 @@ git -C ./libmpv/ffmpeg apply -p2 --recount \
   --include=libavcodec/libcavsdec.c \
   "$CAVS_PATCH"
 
+# The upstream patch stores these added files with CRLF line endings. Normalize
+# them before applying our LF-based FFmpeg 8.1/OpenHarmony compatibility patch;
+# otherwise git apply fails on Linux runners even though the source is intact.
+sed -i 's/\r$//' \
+  ./libmpv/ffmpeg/libavcodec/libcavs.c \
+  ./libmpv/ffmpeg/libavcodec/libcavs.h \
+  ./libmpv/ffmpeg/libavcodec/libcavsdec.c
+
 for dep_path in "${PATCHES[@]}"; do
   if [ -d "$dep_path" ]; then
     patches=($dep_path/*)
