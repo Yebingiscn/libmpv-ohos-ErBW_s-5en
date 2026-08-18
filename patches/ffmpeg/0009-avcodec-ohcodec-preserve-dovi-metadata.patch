@@ -1,0 +1,143 @@
+From 6f991e034e47508f56bf82c8dfaa94750aa91e56 Mon Sep 17 00:00:00 2001
+From: Yebingiscn <Yebingiscn@users.noreply.github.com>
+Date: Tue, 18 Aug 2026 17:30:00 +0800
+Subject: [PATCH] avcodec/ohcodec: preserve Dolby Vision metadata continuity
+
+Keep a reference to the last complete Dolby Vision metadata snapshot and
+attach it to output frames whose access units have no RPU or contain an RPU
+that the FFmpeg parser cannot handle. This matches the software HEVC
+decoder's current-metadata behavior and prevents Profile 5 base-layer frames
+from being displayed without the required color mapping.
+
+Also preserve the complete DOVI parser state across a rejected RPU. Some
+parser error paths reset the context, which otherwise breaks subsequent
+delta metadata as well as the current frame.
+---
+ libavcodec/ohdec.c | 72 ++++++++++++++++++++++++++++++++++------------
+ 1 file changed, 53 insertions(+), 19 deletions(-)
+
+diff --git a/libavcodec/ohdec.c b/libavcodec/ohdec.c
+index ede9b5e..1773c99 100644
+--- a/libavcodec/ohdec.c
++++ b/libavcodec/ohdec.c
+@@ -101,6 +101,7 @@ typedef struct OHCodecDecContext {
+     H2645Packet dovi_pkt;
+     OHDoviFrame dovi_frames[OH_DOVI_QUEUE_SIZE];
+     int nb_dovi_frames;
++    AVBufferRef *last_dovi_metadata;
+ 
+     int decode_status;
+     bool eof_sent;
+@@ -194,6 +195,26 @@ static void oh_decode_clear_dovi(OHCodecDecContext *s)
+         av_buffer_unref(&s->dovi_frames[i].metadata);
+     }
+     s->nb_dovi_frames = 0;
++    av_buffer_unref(&s->last_dovi_metadata);
++}
++
++static void oh_decode_queue_dovi(OHCodecDecContext *s, AVCodecContext *avctx,
++                                 const AVPacket *pkt, AVBufferRef *rpu,
++                                 AVBufferRef *metadata)
++{
++    if (s->nb_dovi_frames == OH_DOVI_QUEUE_SIZE) {
++        av_buffer_unref(&s->dovi_frames[0].rpu);
++        av_buffer_unref(&s->dovi_frames[0].metadata);
++        memmove(&s->dovi_frames[0], &s->dovi_frames[1],
++                sizeof(s->dovi_frames[0]) * (OH_DOVI_QUEUE_SIZE - 1));
++        s->nb_dovi_frames--;
++    }
++    s->dovi_frames[s->nb_dovi_frames++] = (OHDoviFrame) {
++        .pts = pkt->pts == AV_NOPTS_VALUE ? AV_NOPTS_VALUE :
++               av_rescale_q(pkt->pts, avctx->pkt_timebase, AV_TIME_BASE_Q),
++        .rpu = rpu,
++        .metadata = metadata,
++    };
+ }
+ 
+ static int oh_decode_parse_dovi(AVCodecContext *avctx, const AVPacket *pkt)
+@@ -202,8 +223,9 @@ static int oh_decode_parse_dovi(AVCodecContext *avctx, const AVPacket *pkt)
+     size_t sd_size;
+     const uint8_t *sd;
+     H2645NAL *rpu_nal = NULL;
+-    AVBufferRef *rpu = NULL, *metadata = NULL;
++    AVBufferRef *rpu = NULL, *metadata = NULL, *last = NULL;
+     AVDOVIMetadata *dovi = NULL;
++    DOVIContext previous = { 0 };
+     int ret;
+ 
+     if (avctx->codec_id != AV_CODEC_ID_HEVC || !pkt->size)
+@@ -214,7 +236,7 @@ static int oh_decode_parse_dovi(AVCodecContext *avctx, const AVPacket *pkt)
+     ret = ff_h2645_packet_split(&s->dovi_pkt, pkt->data, pkt->size, avctx, 0,
+                                 AV_CODEC_ID_HEVC, H2645_FLAG_SMALL_PADDING);
+     if (ret < 0)
+-        return 0;
++        goto reuse_metadata;
+     for (int i = s->dovi_pkt.nb_nals - 1; i >= 0; i--) {
+         H2645NAL *nal = &s->dovi_pkt.nals[i];
+         if (nal->type == HEVC_NAL_UNSPEC62 && nal->size > 2 &&
+@@ -224,17 +246,23 @@ static int oh_decode_parse_dovi(AVCodecContext *avctx, const AVPacket *pkt)
+         }
+     }
+     if (!rpu_nal)
+-        return 0;
++        goto reuse_metadata;
+     rpu = av_buffer_alloc(rpu_nal->raw_size - 2);
+     if (!rpu)
+         return AVERROR(ENOMEM);
+     memcpy(rpu->data, rpu_nal->raw_data + 2, rpu_nal->raw_size - 2);
++    ff_dovi_ctx_replace(&previous, &s->dovi_ctx);
+     ret = ff_dovi_rpu_parse(&s->dovi_ctx, rpu_nal->data + 2,
+                             rpu_nal->size - 2, avctx->err_recognition);
+     if (ret < 0) {
+         av_buffer_unref(&rpu);
+-        return 0;
++        /* Keep the last complete parser state when an invalid RPU resets it.
++         * Profile 5 has no independently displayable base-layer colors. */
++        ff_dovi_ctx_replace(&s->dovi_ctx, &previous);
++        ff_dovi_ctx_unref(&previous);
++        goto reuse_metadata;
+     }
++    ff_dovi_ctx_unref(&previous);
+     ret = ff_dovi_get_metadata(&s->dovi_ctx, &dovi);
+     if (ret < 0) {
+         av_buffer_unref(&rpu);
+@@ -247,19 +275,26 @@ static int oh_decode_parse_dovi(AVCodecContext *avctx, const AVPacket *pkt)
+             av_buffer_unref(&rpu);
+             return AVERROR(ENOMEM);
+         }
++        last = av_buffer_ref(metadata);
++        if (!last) {
++            av_buffer_unref(&metadata);
++            av_buffer_unref(&rpu);
++            return AVERROR(ENOMEM);
++        }
++        av_buffer_unref(&s->last_dovi_metadata);
++        s->last_dovi_metadata = last;
+     }
+-    if (s->nb_dovi_frames == OH_DOVI_QUEUE_SIZE) {
+-        av_buffer_unref(&s->dovi_frames[0].rpu);
+-        av_buffer_unref(&s->dovi_frames[0].metadata);
+-        memmove(&s->dovi_frames[0], &s->dovi_frames[1],
+-                sizeof(s->dovi_frames[0]) * (OH_DOVI_QUEUE_SIZE - 1));
+-        s->nb_dovi_frames--;
++
++reuse_metadata:
++    if (!metadata && s->last_dovi_metadata) {
++        metadata = av_buffer_ref(s->last_dovi_metadata);
++        if (!metadata) {
++            av_buffer_unref(&rpu);
++            return AVERROR(ENOMEM);
++        }
+     }
+-    s->dovi_frames[s->nb_dovi_frames++] = (OHDoviFrame) {
+-        .pts = pkt->pts == AV_NOPTS_VALUE ? AV_NOPTS_VALUE :
+-               av_rescale_q(pkt->pts, avctx->pkt_timebase, AV_TIME_BASE_Q),
+-        .rpu = rpu, .metadata = metadata,
+-    };
++    if (rpu || metadata)
++        oh_decode_queue_dovi(s, avctx, pkt, rpu, metadata);
+     return 0;
+ }
+ 
+-- 
+2.50.1.windows.1
