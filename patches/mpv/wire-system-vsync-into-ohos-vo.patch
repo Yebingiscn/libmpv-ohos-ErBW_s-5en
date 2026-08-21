@@ -1,0 +1,416 @@
+diff --git a/video/out/ohos_common.h b/video/out/ohos_common.h
+index ed04f88bd5..5fb65b637f 100644
+--- a/video/out/ohos_common.h
++++ b/video/out/ohos_common.h
+@@ -24,6 +24,7 @@
+ #include "common/common.h"
+
+ struct vo;
++struct vo_vsync_info;
+ struct mp_image_params;
+
+ bool vo_ohos_init(struct vo *vo);
+@@ -33,3 +34,7 @@ bool vo_ohos_surface_size(struct vo *vo, int *w, int *h);
+ struct pl_color_space vo_ohos_preferred_csp(struct vo *vo);
+ bool vo_ohos_set_color(struct vo *vo, struct mp_image_params *params);
+ void vo_ohos_invalidate_color(struct vo *vo);
++void vo_ohos_vsync_attach(struct vo *vo);
++void vo_ohos_vsync_detach(struct vo *vo);
++double vo_ohos_get_display_fps(struct vo *vo);
++bool vo_ohos_get_vsync(struct vo *vo, struct vo_vsync_info *info);
+diff --git a/video/out/ohos_common.c b/video/out/ohos_common.c
+index 59f62c51f9..1eb709da29 100644
+--- a/video/out/ohos_common.c
++++ b/video/out/ohos_common.c
+@@ -16,10 +16,228 @@
+  */
+
+ #include "ohos_common.h"
++#include <mpv/client.h>
++
+ #include "common/msg.h"
++#include "osdep/threads.h"
++#include "osdep/timer.h"
+ #include "video/mp_image.h"
+ #include "vo.h"
+
++#define VSYNC_HISTORY_SIZE 9
++#define VSYNC_MIN_INTERVAL_NS MP_TIME_MS_TO_NS(4)
++#define VSYNC_MAX_INTERVAL_NS MP_TIME_MS_TO_NS(50)
++#define VSYNC_STALE_NS MP_TIME_S_TO_NS(1)
++
++struct vo_ohos_vsync_state {
++    mp_static_mutex lock;
++    uint64_t surface_id;
++    uint64_t active_surface_id;
++    struct vo *active_vo;
++    int64_t callback_time_ns;
++    int64_t clock_offset_ns;
++    uint64_t last_timestamp_ns;
++    uint64_t target_timestamp_ns;
++    int64_t intervals[VSYNC_HISTORY_SIZE];
++    int num_intervals;
++    int next_interval;
++    int64_t interval_ns;
++};
++
++static struct vo_ohos_vsync_state global_vsync = {
++    .lock = MP_STATIC_MUTEX_INITIALIZER,
++};
++
++static uint64_t surface_id_from_vo(struct vo *vo)
++{
++    uint64_t surface_id = 0;
++    memcpy(&surface_id, &vo->opts->WinID, sizeof(vo->opts->WinID));
++    return surface_id;
++}
++
++static void clear_vsync_samples(struct vo_ohos_vsync_state *state)
++{
++    state->callback_time_ns = 0;
++    state->clock_offset_ns = 0;
++    state->last_timestamp_ns = 0;
++    state->target_timestamp_ns = 0;
++    state->num_intervals = 0;
++    state->next_interval = 0;
++    state->interval_ns = 0;
++}
++
++static int64_t median_interval(struct vo_ohos_vsync_state *state)
++{
++    int64_t sorted[VSYNC_HISTORY_SIZE];
++    memcpy(sorted, state->intervals,
++           state->num_intervals * sizeof(sorted[0]));
++
++    for (int i = 1; i < state->num_intervals; i++) {
++        int64_t value = sorted[i];
++        int j = i;
++        while (j > 0 && sorted[j - 1] > value) {
++            sorted[j] = sorted[j - 1];
++            j--;
++        }
++        sorted[j] = value;
++    }
++    return sorted[state->num_intervals / 2];
++}
++
++MPV_EXPORT void mpv_ohos_report_vsync(uint64_t surface_id,
++                                      uint64_t timestamp_ns,
++                                      uint64_t target_timestamp_ns)
++{
++    if (!surface_id || !timestamp_ns)
++        return;
++
++    mp_time_init();
++    int64_t now = mp_time_ns();
++    struct vo *notify_vo = NULL;
++
++    mp_mutex_lock(&global_vsync.lock);
++    bool was_stale = global_vsync.callback_time_ns <= 0 ||
++        now - global_vsync.callback_time_ns > VSYNC_STALE_NS;
++    if (global_vsync.surface_id != surface_id) {
++        clear_vsync_samples(&global_vsync);
++        global_vsync.surface_id = surface_id;
++    }
++
++    int64_t old_interval = global_vsync.interval_ns;
++    if (global_vsync.last_timestamp_ns &&
++        timestamp_ns > global_vsync.last_timestamp_ns) {
++        uint64_t delta = timestamp_ns - global_vsync.last_timestamp_ns;
++        if (delta >= VSYNC_MIN_INTERVAL_NS &&
++            delta <= VSYNC_MAX_INTERVAL_NS) {
++            global_vsync.intervals[global_vsync.next_interval] = delta;
++            global_vsync.next_interval =
++                (global_vsync.next_interval + 1) % VSYNC_HISTORY_SIZE;
++            global_vsync.num_intervals = MPMIN(
++                global_vsync.num_intervals + 1, VSYNC_HISTORY_SIZE);
++            if (global_vsync.num_intervals >= 3)
++                global_vsync.interval_ns = median_interval(&global_vsync);
++        }
++    } else if (global_vsync.last_timestamp_ns) {
++        clear_vsync_samples(&global_vsync);
++    }
++
++    int64_t offset_sample = now - (int64_t)timestamp_ns;
++    if (!global_vsync.callback_time_ns) {
++        global_vsync.clock_offset_ns = offset_sample;
++    } else {
++        global_vsync.clock_offset_ns +=
++            (offset_sample - global_vsync.clock_offset_ns) / 8;
++    }
++    global_vsync.callback_time_ns = now;
++    global_vsync.last_timestamp_ns = timestamp_ns;
++    global_vsync.target_timestamp_ns = target_timestamp_ns >= timestamp_ns
++        ? target_timestamp_ns : timestamp_ns;
++
++    int64_t new_interval = global_vsync.interval_ns;
++    bool interval_changed = new_interval > 0 &&
++        (was_stale || old_interval <= 0 || llabs(new_interval - old_interval) >
++                                           MPMAX(old_interval / 200, 1));
++    if (interval_changed && global_vsync.active_vo &&
++        global_vsync.active_surface_id == surface_id)
++        notify_vo = global_vsync.active_vo;
++
++    // Keep the pointer protected until vo_event() has completed. Detach takes
++    // the same lock before the VO can be destroyed.
++    if (notify_vo)
++        vo_event(notify_vo, VO_EVENT_WIN_STATE);
++    mp_mutex_unlock(&global_vsync.lock);
++}
++
++MPV_EXPORT void mpv_ohos_reset_vsync(uint64_t surface_id)
++{
++    mp_mutex_lock(&global_vsync.lock);
++    struct vo *notify_vo = NULL;
++    if (!surface_id || global_vsync.surface_id == surface_id) {
++        clear_vsync_samples(&global_vsync);
++        global_vsync.surface_id = 0;
++        if (global_vsync.active_vo &&
++            (!surface_id || global_vsync.active_surface_id == surface_id))
++            notify_vo = global_vsync.active_vo;
++    }
++    if (notify_vo)
++        vo_event(notify_vo, VO_EVENT_WIN_STATE);
++    mp_mutex_unlock(&global_vsync.lock);
++}
++
++void vo_ohos_vsync_attach(struct vo *vo)
++{
++    uint64_t surface_id = surface_id_from_vo(vo);
++
++    mp_mutex_lock(&global_vsync.lock);
++    global_vsync.active_vo = vo;
++    global_vsync.active_surface_id = surface_id;
++    bool ready = global_vsync.surface_id == surface_id &&
++                 global_vsync.interval_ns > 0;
++    mp_mutex_unlock(&global_vsync.lock);
++
++    if (ready)
++        vo_event(vo, VO_EVENT_WIN_STATE);
++}
++
++void vo_ohos_vsync_detach(struct vo *vo)
++{
++    mp_mutex_lock(&global_vsync.lock);
++    if (global_vsync.active_vo == vo) {
++        global_vsync.active_vo = NULL;
++        global_vsync.active_surface_id = 0;
++    }
++    mp_mutex_unlock(&global_vsync.lock);
++}
++
++double vo_ohos_get_display_fps(struct vo *vo)
++{
++    uint64_t surface_id = surface_id_from_vo(vo);
++    int64_t now = mp_time_ns();
++    int64_t interval = 0;
++
++    mp_mutex_lock(&global_vsync.lock);
++    if (global_vsync.surface_id == surface_id &&
++        now - global_vsync.callback_time_ns <= VSYNC_STALE_NS)
++        interval = global_vsync.interval_ns;
++    mp_mutex_unlock(&global_vsync.lock);
++
++    return interval > 0 ? 1e9 / interval : 0;
++}
++
++bool vo_ohos_get_vsync(struct vo *vo, struct vo_vsync_info *info)
++{
++    uint64_t surface_id = surface_id_from_vo(vo);
++    int64_t now = mp_time_ns();
++    int64_t interval = 0;
++    int64_t target = 0;
++
++    mp_mutex_lock(&global_vsync.lock);
++    if (global_vsync.surface_id == surface_id &&
++        global_vsync.callback_time_ns > 0 &&
++        now - global_vsync.callback_time_ns <= VSYNC_STALE_NS) {
++        interval = global_vsync.interval_ns;
++        target = (int64_t)global_vsync.target_timestamp_ns +
++                 global_vsync.clock_offset_ns;
++    }
++    mp_mutex_unlock(&global_vsync.lock);
++
++    if (!target)
++        return false;
++
++    if (interval > 0 && target <= now) {
++        int64_t elapsed = now - target;
++        target += (elapsed / interval + 1) * interval;
++    }
++
++    info->last_queue_display_time = target > now ? target : -1;
++    info->vsync_duration = interval;
++    info->skipped_vsyncs = -1;
++    if (interval > 0)
++        MP_STATS(vo, "value %f ohos-vsync-interval",
++                 MP_TIME_NS_TO_S(interval));
++    return true;
++}
++
+ struct vo_ohos_state {
+     struct mp_log *log;
+     OHNativeWindow *native_window;
+@@ -167,6 +385,8 @@ bool vo_ohos_init(struct vo *vo)
+         goto fail;
+     }
+
++    vo_ohos_vsync_attach(vo);
++
+     return true;
+ fail:
+     talloc_free(ctx);
+@@ -180,6 +400,8 @@ void vo_ohos_uninit(struct vo *vo)
+     if (!ctx)
+         return;
+
++    vo_ohos_vsync_detach(vo);
++
+     if (ctx->native_window)
+         OH_NativeWindow_DestroyNativeWindow(ctx->native_window);
+
+diff --git a/video/out/opengl/context_ohos.c b/video/out/opengl/context_ohos.c
+index 3651696bea..a0e1c16626 100644
+--- a/video/out/opengl/context_ohos.c
++++ b/video/out/opengl/context_ohos.c
+@@ -40,6 +40,11 @@ static void ohos_set_color(struct ra_ctx *ctx, struct mp_image_params *params)
+     vo_ohos_set_color(ctx->vo, params);
+ }
+
++static void ohos_get_vsync(struct ra_ctx *ctx, struct vo_vsync_info *info)
++{
++    vo_ohos_get_vsync(ctx->vo, info);
++}
++
+ static void ohos_swap_buffers(struct ra_ctx *ctx)
+ {
+     struct priv *p = ctx->priv;
+@@ -115,11 +120,15 @@ static bool ohos_init(struct ra_ctx *ctx)
+         goto fail;
+     }
+
++    if (!eglSwapInterval(p->egl_display, 1))
++        MP_WARN(ctx, "Could not enable EGL vsync (error=0x%x).\n", eglGetError());
++
+     mpegl_load_functions(&p->gl, ctx->log);
+
+     struct ra_ctx_params params = {
+         .preferred_csp = ohos_preferred_csp,
+         .set_color = ohos_set_color,
++        .get_vsync = ohos_get_vsync,
+         .swap_buffers = ohos_swap_buffers,
+     };
+
+@@ -147,6 +156,13 @@ static bool ohos_reconfig(struct ra_ctx *ctx)
+
+ static int ohos_control(struct ra_ctx *ctx, int *events, int request, void *arg)
+ {
++    if (request == VOCTRL_GET_DISPLAY_FPS) {
++        double fps = vo_ohos_get_display_fps(ctx->vo);
++        if (fps <= 0)
++            return VO_NOTIMPL;
++        *(double *)arg = fps;
++        return VO_TRUE;
++    }
+     return VO_NOTIMPL;
+ }
+
+diff --git a/video/out/vulkan/context_ohos.c b/video/out/vulkan/context_ohos.c
+index 6b063f6780..0cbaaadf3d 100644
+--- a/video/out/vulkan/context_ohos.c
++++ b/video/out/vulkan/context_ohos.c
+@@ -37,6 +37,11 @@ static void ohos_set_color(struct ra_ctx *ctx, struct mp_image_params *params)
+     vo_ohos_set_color(ctx->vo, params);
+ }
+
++static void ohos_get_vsync(struct ra_ctx *ctx, struct vo_vsync_info *info)
++{
++    vo_ohos_get_vsync(ctx->vo, info);
++}
++
+ static void ohos_uninit(struct ra_ctx *ctx)
+ {
+     struct priv *p = ctx->priv;
+@@ -66,6 +71,7 @@ static bool ohos_init(struct ra_ctx *ctx)
+     struct ra_ctx_params params = {
+         .preferred_csp = ohos_preferred_csp,
+         .set_color = ohos_set_color,
++        .get_vsync = ohos_get_vsync,
+     };
+
+     VkInstance inst = vk->vkinst->instance;
+@@ -97,6 +103,13 @@ static bool ohos_reconfig(struct ra_ctx *ctx)
+
+ static int ohos_control(struct ra_ctx *ctx, int *events, int request, void *arg)
+ {
++    if (request == VOCTRL_GET_DISPLAY_FPS) {
++        double fps = vo_ohos_get_display_fps(ctx->vo);
++        if (fps <= 0)
++            return VO_NOTIMPL;
++        *(double *)arg = fps;
++        return VO_TRUE;
++    }
+     return VO_NOTIMPL;
+ }
+
+diff --git a/video/out/vo_ohcodec.c b/video/out/vo_ohcodec.c
+index 18709b79e6..3f14d062a7 100644
+--- a/video/out/vo_ohcodec.c
++++ b/video/out/vo_ohcodec.c
+@@ -38,6 +38,7 @@
+ #include "sub/osd.h"
+ #include "video/hwdec.h"
+ #include "video/mp_image.h"
++#include "ohos_common.h"
+ #include "vo.h"
+
+ /*
+@@ -554,6 +555,7 @@ static int preinit(struct vo *vo)
+     mp_mutex_unlock(&global_osd.lock);
+
+     sync_osd_window(vo);
++    vo_ohos_vsync_attach(vo);
+     return 0;
+ }
+
+@@ -610,11 +612,23 @@ static void flip_page(struct vo *vo)
+     mp_image_unrefp(&p->next_image);
+ }
+
++static void get_vsync(struct vo *vo, struct vo_vsync_info *info)
++{
++    vo_ohos_get_vsync(vo, info);
++}
++
+ static int control(struct vo *vo, uint32_t request, void *data)
+ {
+     struct priv *p = vo->priv;
+
+     switch (request) {
++    case VOCTRL_GET_DISPLAY_FPS: {
++        double fps = vo_ohos_get_display_fps(vo);
++        if (fps <= 0)
++            return VO_NOTIMPL;
++        *(double *)data = fps;
++        return VO_TRUE;
++    }
+     case VOCTRL_SET_PANSCAN:
+     case VOCTRL_VO_OPTS_CHANGED:
+         resize(vo);
+@@ -634,6 +648,8 @@ static void uninit(struct vo *vo)
+ {
+     struct priv *p = vo->priv;
+
++    vo_ohos_vsync_detach(vo);
++
+     mp_mutex_lock(&global_osd.lock);
+     if (global_osd.active_vo == vo)
+         global_osd.active_vo = NULL;
+@@ -660,6 +676,7 @@ const struct vo_driver video_out_ohcodec = {
+     .control = control,
+     .draw_frame = draw_frame,
+     .flip_page = flip_page,
++    .get_vsync = get_vsync,
+     .reconfig = reconfig,
+     .uninit = uninit,
+     .priv_size = sizeof(struct priv),

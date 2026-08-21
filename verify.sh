@@ -29,7 +29,7 @@ if ! grep -q -- "-Dgpl=true" <<< "$configuration"; then
 fi
 
 symbols=$("$NM" -D --defined-only "$LIBMPV")
-for symbol in mpv_create; do
+for symbol in mpv_create mpv_ohos_report_vsync mpv_ohos_reset_vsync; do
   if ! grep -Eq "[[:space:]]$symbol$" <<< "$symbols"; then
     echo "Missing required dynamic symbol: $symbol" >&2
     exit 1
