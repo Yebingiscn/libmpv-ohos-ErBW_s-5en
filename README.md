@@ -30,6 +30,12 @@ mode. `ohcodec-osd` is the direct Surface mode: it avoids a video-frame copy,
 but mpv GPU shaders such as Anime4K do not run on the direct video plane.
 Subtitles and normal mpv OSD remain available through the separate OSD plane.
 
+The OHCodec buffer path treats NativeImage as a single mutable external image.
+It therefore disables temporal frame mixing and requests one decoder frame at
+a time. This keeps the zero-copy path short and prevents playback-speed changes
+from exhausting the decoder output pool. Spatial GPU shaders remain available;
+software-decoded video is unaffected and may still use temporal interpolation.
+
 ## Automatic OHCodec playback policy
 
 Both OHCodec output paths automatically pass the source frame rate to the

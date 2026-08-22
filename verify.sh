@@ -108,6 +108,13 @@ if ! "$STRINGS" "$LIBMPV" | grep -F "[OHCodecPolicy]" >/dev/null; then
   exit 1
 fi
 
+if ! "$STRINGS" "$LIBMPV" | grep -F \
+    "OHCodec single-image interop: temporal mixing disabled, decoder queue depth=1" \
+    >/dev/null; then
+  echo "Missing OHCodec single-frame queue policy" >&2
+  exit 1
+fi
+
 echo "$features"
 echo "$configuration"
 grep -E "NEEDED|SONAME" <<< "$dynamic_section"
