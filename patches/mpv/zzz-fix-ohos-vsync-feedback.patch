@@ -1,0 +1,85 @@
+diff --git a/video/out/ohos_common.c b/video/out/ohos_common.c
+index bb76730948..cc3f098db9 100644
+--- a/video/out/ohos_common.c
++++ b/video/out/ohos_common.c
+@@ -35,9 +35,7 @@ struct vo_ohos_vsync_state {
+     uint64_t active_surface_id;
+     struct vo *active_vo;
+     int64_t callback_time_ns;
+-    int64_t clock_offset_ns;
+     uint64_t last_timestamp_ns;
+-    uint64_t target_timestamp_ns;
+     int64_t intervals[VSYNC_HISTORY_SIZE];
+     int num_intervals;
+     int next_interval;
+@@ -58,9 +56,7 @@ static uint64_t surface_id_from_vo(struct vo *vo)
+ static void clear_vsync_samples(struct vo_ohos_vsync_state *state)
+ {
+     state->callback_time_ns = 0;
+-    state->clock_offset_ns = 0;
+     state->last_timestamp_ns = 0;
+-    state->target_timestamp_ns = 0;
+     state->num_intervals = 0;
+     state->next_interval = 0;
+     state->interval_ns = 0;
+@@ -121,17 +117,9 @@ MPV_EXPORT void mpv_ohos_report_vsync(uint64_t surface_id,
+         clear_vsync_samples(&global_vsync);
+     }
+ 
+-    int64_t offset_sample = now - (int64_t)timestamp_ns;
+-    if (!global_vsync.callback_time_ns) {
+-        global_vsync.clock_offset_ns = offset_sample;
+-    } else {
+-        global_vsync.clock_offset_ns +=
+-            (offset_sample - global_vsync.clock_offset_ns) / 8;
+-    }
+     global_vsync.callback_time_ns = now;
+     global_vsync.last_timestamp_ns = timestamp_ns;
+-    global_vsync.target_timestamp_ns = target_timestamp_ns >= timestamp_ns
+-        ? target_timestamp_ns : timestamp_ns;
++    (void)target_timestamp_ns;
+ 
+     int64_t new_interval = global_vsync.interval_ns;
+     bool interval_changed = new_interval > 0 &&
+@@ -209,32 +197,26 @@ bool vo_ohos_get_vsync(struct vo *vo, struct vo_vsync_info *info)
+     uint64_t surface_id = surface_id_from_vo(vo);
+     int64_t now = mp_time_ns();
+     int64_t interval = 0;
+-    int64_t target = 0;
+ 
+     mp_mutex_lock(&global_vsync.lock);
+     if (global_vsync.surface_id == surface_id &&
+         global_vsync.callback_time_ns > 0 &&
+-        now - global_vsync.callback_time_ns <= VSYNC_STALE_NS) {
++        now - global_vsync.callback_time_ns <= VSYNC_STALE_NS)
+         interval = global_vsync.interval_ns;
+-        target = (int64_t)global_vsync.target_timestamp_ns +
+-                 global_vsync.clock_offset_ns;
+-    }
+     mp_mutex_unlock(&global_vsync.lock);
+ 
+-    if (!target)
++    if (interval <= 0)
+         return false;
+ 
+-    if (interval > 0 && target <= now) {
+-        int64_t elapsed = now - target;
+-        target += (elapsed / interval + 1) * interval;
+-    }
+-
+-    info->last_queue_display_time = target > now ? target : -1;
++    // The XComponent target is the next free-running display callback, not
++    // presentation feedback for the buffer just submitted by swap/present.
++    // Leave this unset so mpv timestamps the completed swap itself instead of
++    // treating an unrelated future VSYNC as output latency.
++    info->last_queue_display_time = -1;
+     info->vsync_duration = interval;
+     info->skipped_vsyncs = -1;
+-    if (interval > 0)
+-        MP_STATS(vo, "value %f ohos-vsync-interval",
+-                 MP_TIME_NS_TO_S(interval));
++    MP_STATS(vo, "value %f ohos-vsync-interval",
++             MP_TIME_NS_TO_S(interval));
+     return true;
+ }
+ 
