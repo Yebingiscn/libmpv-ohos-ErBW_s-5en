@@ -23,24 +23,28 @@ index cfa74c74e7..9a03fde3f3 100644
                             !frame->still && frame->num_frames > 1;
      double pts_offset = can_interpolate ? frame->ideal_frame_vsync : 0;
      params.info_callback = info_callback;
-@@ -1534,6 +1539,16 @@ static void resize(struct vo *vo)
+@@ -1534,6 +1539,20 @@ static void resize(struct vo *vo)
  static int reconfig(struct vo *vo, struct mp_image_params *params)
  {
      struct priv *p = vo->priv;
-+    bool single_image_hwdec = params->imgfmt == IMGFMT_OHCODEC;
-+    if (single_image_hwdec != p->single_image_hwdec) {
-+        p->single_image_hwdec = single_image_hwdec;
-+        p->want_reset = true;
-+        update_render_options(vo);
-+        if (single_image_hwdec) {
-+            MP_INFO(vo, "OHCodec single-image interop: temporal mixing "
-+                    "disabled, decoder queue depth=1\n");
++    // External window resizes intentionally call reconfig(vo, NULL). Only a
++    // real video reconfiguration carries image parameters.
++    if (params) {
++        bool single_image_hwdec = params->imgfmt == IMGFMT_OHCODEC;
++        if (single_image_hwdec != p->single_image_hwdec) {
++            p->single_image_hwdec = single_image_hwdec;
++            p->want_reset = true;
++            update_render_options(vo);
++            if (single_image_hwdec) {
++                MP_INFO(vo, "OHCodec single-image interop: temporal mixing "
++                        "disabled, decoder queue depth=1\n");
++            }
 +        }
 +    }
      if (!p->ra_ctx->fns->reconfig(p->ra_ctx))
          return -1;
  
-@@ -2548,13 +2563,14 @@ static void update_render_options(struct vo *vo)
+@@ -2548,13 +2567,14 @@ static void update_render_options(struct vo *vo)
      pars->params.upscaler = map_scaler(p, SCALER_SCALE);
      pars->params.downscaler = map_scaler(p, SCALER_DSCALE);
      pars->params.plane_upscaler = map_scaler(p, SCALER_CSCALE);

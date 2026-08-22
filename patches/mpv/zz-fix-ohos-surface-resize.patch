@@ -1,0 +1,68 @@
+diff --git a/video/out/ohos_common.c b/video/out/ohos_common.c
+index 0392b1e57a..49d8c32685 100644
+--- a/video/out/ohos_common.c
++++ b/video/out/ohos_common.c
+@@ -432,6 +432,23 @@ bool vo_ohos_surface_size(struct vo *vo, int *out_w, int *out_h)
+     return true;
+ }
+ 
++bool vo_ohos_set_surface_size(struct vo *vo, int w, int h)
++{
++    struct vo_ohos_state *ctx = vo->ohos;
++    if (!ctx || !ctx->native_window || w <= 0 || h <= 0)
++        return false;
++
++    int ret = OH_NativeWindow_NativeWindowHandleOpt(
++        ctx->native_window, SET_BUFFER_GEOMETRY, w, h);
++    if (ret != 0) {
++        MP_ERR(ctx, "Failed to resize NativeWindow buffers to %dx%d: %d\n",
++               w, h, ret);
++        return false;
++    }
++
++    return true;
++}
++
+ struct pl_color_space vo_ohos_preferred_csp(struct vo *vo)
+ {
+     const struct pl_color_space color = vo_get_current_params(vo).color;
+diff --git a/video/out/ohos_common.h b/video/out/ohos_common.h
+index 3beec94679..fa2dd404de 100644
+--- a/video/out/ohos_common.h
++++ b/video/out/ohos_common.h
+@@ -31,6 +31,7 @@ bool vo_ohos_init(struct vo *vo);
+ void vo_ohos_uninit(struct vo *vo);
+ OHNativeWindow *vo_ohos_native_window(struct vo *vo);
+ bool vo_ohos_surface_size(struct vo *vo, int *w, int *h);
++bool vo_ohos_set_surface_size(struct vo *vo, int w, int h);
+ struct pl_color_space vo_ohos_preferred_csp(struct vo *vo);
+ bool vo_ohos_set_color(struct vo *vo, struct mp_image_params *params);
+ void vo_ohos_invalidate_color(struct vo *vo);
+diff --git a/video/out/opengl/context_ohos.c b/video/out/opengl/context_ohos.c
+index a0e1c16626..424b93a219 100644
+--- a/video/out/opengl/context_ohos.c
++++ b/video/out/opengl/context_ohos.c
+@@ -147,6 +147,9 @@ static bool ohos_reconfig(struct ra_ctx *ctx)
+     if (!vo_ohos_surface_size(ctx->vo, &w, &h))
+         return false;
+ 
++    if (!vo_ohos_set_surface_size(ctx->vo, w, h))
++        return false;
++
+     ctx->vo->dwidth = w;
+     ctx->vo->dheight = h;
+     ra_gl_ctx_resize(ctx->swapchain, w, h, 0);
+diff --git a/video/out/vulkan/context_ohos.c b/video/out/vulkan/context_ohos.c
+index 0cbaaadf3d..31d38faf26 100644
+--- a/video/out/vulkan/context_ohos.c
++++ b/video/out/vulkan/context_ohos.c
+@@ -96,6 +96,9 @@ static bool ohos_reconfig(struct ra_ctx *ctx)
+     if (!vo_ohos_surface_size(ctx->vo, &w, &h))
+         return false;
+ 
++    if (!vo_ohos_set_surface_size(ctx->vo, w, h))
++        return false;
++
+     bool ok = ra_vk_ctx_resize(ctx, w, h);
+     vo_ohos_invalidate_color(ctx->vo);
+     return ok;

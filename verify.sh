@@ -115,6 +115,12 @@ if ! "$STRINGS" "$LIBMPV" | grep -F \
   exit 1
 fi
 
+if ! "$STRINGS" "$LIBMPV" | grep -F \
+    "Failed to resize NativeWindow buffers" >/dev/null; then
+  echo "Missing OHOS NativeWindow resize synchronization" >&2
+  exit 1
+fi
+
 echo "$features"
 echo "$configuration"
 grep -E "NEEDED|SONAME" <<< "$dynamic_section"
