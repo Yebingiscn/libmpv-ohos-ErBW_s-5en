@@ -1,0 +1,127 @@
+From b70c0eb1d7de28d49ef8a58ae6c94d845e2e1445 Mon Sep 17 00:00:00 2001
+From: Yebingiscn <Yebingiscn@users.noreply.github.com>
+Date: Sun, 23 Aug 2026 10:30:00 +0800
+Subject: [PATCH] avcodec/ohcodec: gate Dolby Vision packet parsing
+
+Avoid splitting every HEVC access unit when the stream does not carry Dolby
+Vision metadata. Mark direct application Surface devices explicitly because
+they do not consume FFmpeg's per-frame DOVI side data. NativeImage Buffer
+output keeps the metadata path and only parses continuously after a DOVI
+configuration record or RPU has been found.
+
+Probe a bounded number of packets for raw streams without container DOVI
+configuration, so such streams retain metadata support without imposing the
+parser cost on the complete lifetime of ordinary HEVC playback.
+---
+ libavcodec/ohdec.c       | 27 ++++++++++++++++++++++++---
+ libavutil/hwcontext_oh.h |  7 +++++++
+ 2 files changed, 31 insertions(+), 3 deletions(-)
+
+diff --git a/libavcodec/ohdec.c b/libavcodec/ohdec.c
+--- a/libavcodec/ohdec.c
++++ b/libavcodec/ohdec.c
+@@ -54,6 +54,7 @@
+ #include "pthread_internal.h"
+ 
+ #define OH_DOVI_QUEUE_SIZE 64
++#define OH_DOVI_PROBE_PACKETS 16
+ 
+ typedef struct OHCodecDecQueueItem {
+     uint32_t index;
+@@ -103,12 +104,15 @@ typedef struct OHCodecDecContext {
+     OHDoviFrame dovi_frames[OH_DOVI_QUEUE_SIZE];
+     int nb_dovi_frames;
+     AVBufferRef *last_dovi_metadata;
++    int dovi_probe_packets;
++    bool dovi_metadata_enabled;
+ 
+     int decode_status;
+     bool eof_sent;
+     atomic_bool accepting_callbacks;
+ 
+     bool output_to_window;
++    bool direct_surface_output;
+     bool got_stream_info;
+     int width;
+     int height;
+@@ -233,11 +236,20 @@ static int oh_decode_parse_dovi(AVCodecContext *avctx, const AVPacket *pkt)
+     DOVIContext previous = { 0 };
+     int ret;
+ 
+-    if (avctx->codec_id != AV_CODEC_ID_HEVC || !pkt->size)
++    if (avctx->codec_id != AV_CODEC_ID_HEVC || !pkt->size ||
++        s->direct_surface_output)
+         return 0;
+     sd = av_packet_get_side_data(pkt, AV_PKT_DATA_DOVI_CONF, &sd_size);
+-    if (sd && sd_size >= sizeof(s->dovi_ctx.cfg))
++    if (sd && sd_size >= sizeof(s->dovi_ctx.cfg)) {
+         s->dovi_ctx.cfg = *(const AVDOVIDecoderConfigurationRecord *)sd;
++        s->dovi_metadata_enabled = true;
++        s->dovi_probe_packets = 0;
++    }
++    if (!s->dovi_metadata_enabled) {
++        if (s->dovi_probe_packets <= 0)
++            return 0;
++        s->dovi_probe_packets--;
++    }
+     ret = ff_h2645_packet_split(&s->dovi_pkt, pkt->data, pkt->size, avctx, 0,
+                                 AV_CODEC_ID_HEVC, H2645_FLAG_SMALL_PADDING);
+     if (ret < 0)
+@@ -252,6 +265,8 @@ static int oh_decode_parse_dovi(AVCodecContext *avctx, const AVPacket *pkt)
+     }
+     if (!rpu_nal)
+         goto reuse_metadata;
++    s->dovi_metadata_enabled = true;
++    s->dovi_probe_packets = 0;
+     rpu = av_buffer_alloc(rpu_nal->raw_size - 2);
+     if (!rpu)
+         return AVERROR(ENOMEM);
+@@ -427,6 +442,8 @@ static int oh_decode_set_format(OHCodecDecContext *s, AVCodecContext *avctx)
+             AVOHCodecDeviceContext *dev = device_ctx->hwctx;
+             window = dev->native_window;
+             s->output_to_window = window != NULL;
++            s->direct_surface_output = s->output_to_window &&
++                                       dev->direct_surface;
+             if (!s->output_to_window) {
+                 av_log(avctx, AV_LOG_ERROR,
+                        "OHCodec hardware decoding requires a NativeWindow\n");
+@@ -733,15 +750,19 @@ static av_cold int oh_decode_init(AVCodecContext *avctx)
+         s->source_frame_rate = 0.0;
+     s->requested_playback_speed = 1.0;
+     s->playback_policy_pending = true;
++    s->dovi_probe_packets = OH_DOVI_PROBE_PACKETS;
+     s->dovi_ctx.logctx = avctx;
+     if (avctx->codec_id == AV_CODEC_ID_HEVC) {
+         const AVPacketSideData *sd =
+             av_packet_side_data_get(avctx->coded_side_data,
+                                     avctx->nb_coded_side_data,
+                                     AV_PKT_DATA_DOVI_CONF);
+-        if (sd && sd->size >= sizeof(s->dovi_ctx.cfg))
++        if (sd && sd->size >= sizeof(s->dovi_ctx.cfg)) {
+             s->dovi_ctx.cfg =
+                 *(const AVDOVIDecoderConfigurationRecord *)sd->data;
++            s->dovi_metadata_enabled = true;
++            s->dovi_probe_packets = 0;
++        }
+     }
+ 
+     // Initialize these fields first, so oh_decode_close can destroy them safely
+diff --git a/libavutil/hwcontext_oh.h b/libavutil/hwcontext_oh.h
+--- a/libavutil/hwcontext_oh.h
++++ b/libavutil/hwcontext_oh.h
+@@ -29,6 +29,13 @@ typedef struct AVOHCodecDeviceContext {
+      * Pointer to OHNativeWindow
+      */
+     void *native_window;
++
++    /**
++     * Non-zero when the decoder renders directly to the application's video
++     * Surface. NativeImage GPU interop leaves this zero because it consumes
++     * per-frame metadata in FFmpeg.
++     */
++    int direct_surface;
+ } AVOHCodecDeviceContext;
+ 
+ #endif /* AVUTIL_HWCONTEXT_OH_H */
+-- 
+2.50.1.windows.1

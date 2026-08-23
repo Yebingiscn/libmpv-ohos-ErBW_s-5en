@@ -1,0 +1,410 @@
+From 6d2b8e401f25ca7d1f956c51d87373e45af76750 Mon Sep 17 00:00:00 2001
+From: Yebingiscn <Yebingiscn@users.noreply.github.com>
+Date: Sun, 23 Aug 2026 11:00:00 +0800
+Subject: [PATCH] video/out: reduce OHOS playback hot-path overhead
+
+Wait for NativeImage callbacks before attempting to acquire Buffer-mode
+frames and remove per-frame timing/logging from that path.
+
+Avoid redundant EGL context switches and surface queries for Surface-mode
+OSD. Use an atomic generation fast path for unchanged OSD surfaces and keep
+reusable GLES textures for libass masks and BGRA OSD bitmaps.
+
+Avoid measuring the OSD renderer when debug logging is disabled. Finally, add
+meaningful hysteresis to VSYNC interval notifications so display jitter does
+not continuously wake mpv's playloop.
+---
+ sub/osd.c                          | 14 +++--
+ video/out/hwdec/hwdec_ohcodec.c | 23 +++--------
+ video/out/hwdec/hwdec_ohcodec.h |  3 +-
+ video/out/ohos_common.c          | 19 ++++++---
+ video/out/vo_ohcodec.c           | 116 +++++++++++++++++++------------
+ 5 files changed, 98 insertions(+), 77 deletions(-)
+
+diff --git a/sub/osd.c b/sub/osd.c
+--- a/sub/osd.c
++++ b/sub/osd.c
+@@ -364,7 +364,8 @@ struct sub_bitmap_list *osd_render(struct osd_state *osd, struct mp_osd_res res,
+ {
+     mp_mutex_lock(&osd->lock);
+ 
+-    int64_t start_time = mp_time_ns();
++    bool measure_render_time = mp_msg_test(osd->log, MSGL_DEBUG);
++    int64_t start_time = measure_render_time ? mp_time_ns() : 0;
+ 
+     struct sub_bitmap_list *list = talloc_zero(NULL, struct sub_bitmap_list);
+     list->change_id = 1;
+@@ -414,10 +415,13 @@ struct sub_bitmap_list *osd_render(struct osd_state *osd, struct mp_osd_res res,
+         talloc_free(imgs);
+     }
+ 
+-    double elapsed = MP_TIME_NS_TO_MS(mp_time_ns() - start_time);
+-    bool slow = elapsed > 5;
+-    mp_msg(osd->log, slow ? MSGL_DEBUG : MSGL_TRACE, "Spent %.3f ms in %s%s\n",
+-           elapsed, __func__, slow ? " (slow!)" : "");
++    if (measure_render_time) {
++        double elapsed = MP_TIME_NS_TO_MS(mp_time_ns() - start_time);
++        bool slow = elapsed > 5;
++        mp_msg(osd->log, slow ? MSGL_DEBUG : MSGL_TRACE,
++               "Spent %.3f ms in %s%s\n", elapsed, __func__,
++               slow ? " (slow!)" : "");
++    }
+ 
+     mp_mutex_unlock(&osd->lock);
+     return list;
+diff --git a/video/out/hwdec/hwdec_ohcodec.c b/video/out/hwdec/hwdec_ohcodec.c
+--- a/video/out/hwdec/hwdec_ohcodec.c
++++ b/video/out/hwdec/hwdec_ohcodec.c
+@@ -84,10 +84,8 @@ uint64_t ohcodec_surface_get_sequence(struct ohcodec_surface *surface)
+ }
+ 
+ bool ohcodec_surface_wait_after(struct ohcodec_surface *surface,
+-                                uint64_t *sequence, int64_t deadline_ns,
+-                                struct mp_log *log, int64_t *wait_ns)
++                                uint64_t *sequence, int64_t deadline_ns)
+ {
+-    int64_t start = mp_time_ns();
+     bool ready;
+ 
+     mp_mutex_lock(&surface->lock);
+@@ -100,13 +98,6 @@ bool ohcodec_surface_wait_after(struct ohcodec_surface *surface,
+     if (ready)
+         *sequence = surface->callback_sequence;
+     mp_mutex_unlock(&surface->lock);
+-
+-    *wait_ns = mp_time_ns() - start;
+-    if (!ready)
+-        mp_msg(log, MSGL_TRACE, "OHCodec Surface frame callback timed out\n");
+-    else
+-        mp_msg(log, MSGL_TRACE, "OHCodec render->callback wait %.3f ms\n",
+-               *wait_ns / 1e6);
+     return ready;
+ }
+ 
+@@ -182,7 +173,6 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
+     AVOHCodecBuffer *token = mapper->src && mapper->src->imgfmt == IMGFMT_OHCODEC
+                            ? (AVOHCodecBuffer *)mapper->src->planes[3] : NULL;
+     struct ohcodec_mapper_priv *p = mapper->priv;
+-    int64_t begin = mp_time_ns(), wait_ns = 0;
+ 
+     if (!token) {
+         MP_ERR(mapper, "Missing OHCodec output token\n");
+@@ -225,21 +215,16 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
+         return -1;
+     }
+ 
+-    int map_ret = owner->interop->map(mapper);
+     int64_t deadline_ns = mp_time_ns() + MP_TIME_MS_TO_NS(250);
++    int map_ret = NATIVE_ERROR_NO_BUFFER;
+     while (map_ret == NATIVE_ERROR_NO_BUFFER) {
+-        int64_t current_wait = 0;
+         // NativeImage consumption is only valid after its frame-available
+         // callback. If a delayed callback no longer has a matching buffer,
+         // discard that notification and wait for the current rendered frame.
+         if (!ohcodec_surface_wait_after(owner->surface, &callback_sequence,
+-                                        deadline_ns, mapper->log,
+-                                        &current_wait))
++                                        deadline_ns))
+             break;
+-        wait_ns += current_wait;
+         map_ret = owner->interop->map(mapper);
+-        if (map_ret == NATIVE_ERROR_NO_BUFFER)
+-            MP_TRACE(mapper, "Ignoring stale OHCodec Surface callback\n");
+     }
+     if (map_ret != NATIVE_ERROR_OK) {
+         if (map_ret == NATIVE_ERROR_NO_BUFFER)
+@@ -255,8 +240,6 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
+     p->last_token = token;
+     p->last_src = mapper->src;
+     mapper->src = NULL;
+-    MP_TRACE(mapper, "OHCodec hwdec-map %.3f ms (wait %.3f ms)\n",
+-             (mp_time_ns() - begin) / 1e6, wait_ns / 1e6);
+     return 0;
+ }
+ 
+diff --git a/video/out/hwdec/hwdec_ohcodec.h b/video/out/hwdec/hwdec_ohcodec.h
+--- a/video/out/hwdec/hwdec_ohcodec.h
++++ b/video/out/hwdec/hwdec_ohcodec.h
+@@ -49,8 +49,7 @@ bool ohcodec_surface_init(struct ohcodec_surface *surface,
+ void ohcodec_surface_destroy(struct ohcodec_surface *surface);
+ uint64_t ohcodec_surface_get_sequence(struct ohcodec_surface *surface);
+ bool ohcodec_surface_wait_after(struct ohcodec_surface *surface,
+-                                uint64_t *sequence, int64_t deadline_ns,
+-                                struct mp_log *log, int64_t *wait_ns);
++                                uint64_t *sequence, int64_t deadline_ns);
+ 
+ bool ohcodec_interop_gl_init(struct ra_hwdec *hw);
+ bool ohcodec_interop_pl_init(struct ra_hwdec *hw);
+diff --git a/video/out/ohos_common.c b/video/out/ohos_common.c
+--- a/video/out/ohos_common.c
++++ b/video/out/ohos_common.c
+@@ -40,6 +40,7 @@ struct vo_ohos_vsync_state {
+     int num_intervals;
+     int next_interval;
+     int64_t interval_ns;
++    int64_t notified_interval_ns;
+ };
+ 
+ static struct vo_ohos_vsync_state global_vsync = {
+@@ -60,6 +61,7 @@ static void clear_vsync_samples(struct vo_ohos_vsync_state *state)
+     state->num_intervals = 0;
+     state->next_interval = 0;
+     state->interval_ns = 0;
++    state->notified_interval_ns = 0;
+ }
+ 
+ static int64_t median_interval(struct vo_ohos_vsync_state *state)
+@@ -99,7 +101,6 @@ MPV_EXPORT void mpv_ohos_report_vsync(uint64_t surface_id,
+         global_vsync.surface_id = surface_id;
+     }
+ 
+-    int64_t old_interval = global_vsync.interval_ns;
+     if (global_vsync.last_timestamp_ns &&
+         timestamp_ns > global_vsync.last_timestamp_ns) {
+         uint64_t delta = timestamp_ns - global_vsync.last_timestamp_ns;
+@@ -122,12 +123,18 @@ MPV_EXPORT void mpv_ohos_report_vsync(uint64_t surface_id,
+     (void)target_timestamp_ns;
+ 
+     int64_t new_interval = global_vsync.interval_ns;
++    int64_t notify_threshold = MPMAX(
++        global_vsync.notified_interval_ns / 50, MP_TIME_US_TO_NS(100));
+     bool interval_changed = new_interval > 0 &&
+-        (was_stale || old_interval <= 0 || llabs(new_interval - old_interval) >
+-                                           MPMAX(old_interval / 200, 1));
+-    if (interval_changed && global_vsync.active_vo &&
+-        global_vsync.active_surface_id == surface_id)
+-        notify_vo = global_vsync.active_vo;
++        (was_stale || global_vsync.notified_interval_ns <= 0 ||
++         llabs(new_interval - global_vsync.notified_interval_ns) >
++             notify_threshold);
++    if (interval_changed) {
++        global_vsync.notified_interval_ns = new_interval;
++        if (global_vsync.active_vo &&
++            global_vsync.active_surface_id == surface_id)
++            notify_vo = global_vsync.active_vo;
++    }
+ 
+     // Keep the pointer protected until vo_event() has completed. Detach takes
+     // the same lock before the VO can be destroyed.
+diff --git a/video/out/vo_ohcodec.c b/video/out/vo_ohcodec.c
+--- a/video/out/vo_ohcodec.c
++++ b/video/out/vo_ohcodec.c
+@@ -19,6 +19,7 @@
+ #include <GLES2/gl2.h>
+ #include <GLES2/gl2ext.h>
+ #include <inttypes.h>
++#include <stdatomic.h>
+ #include <stdint.h>
+ #include <string.h>
+ #include <time.h>
+@@ -50,7 +51,7 @@
+ struct global_osd_surface {
+     mp_static_mutex lock;
+     uint64_t id;
+-    uint64_t generation;
++    atomic_uint_fast64_t generation;
+     int width;
+     int height;
+     struct vo *active_vo;
+@@ -60,15 +61,27 @@ static struct global_osd_surface global_osd = {
+     .lock = MP_STATIC_MUTEX_INITIALIZER,
+ };
+ 
++struct osd_texture {
++    GLuint id;
++    GLenum format;
++    int width;
++    int height;
++};
++
+ MPV_EXPORT void ohos_osd_set_global_surface(uint64_t surface_id,
+                                             int width, int height)
+ {
+     mp_mutex_lock(&global_osd.lock);
++    uint64_t updating = atomic_fetch_add_explicit(
++        &global_osd.generation, 1, memory_order_acq_rel) + 1;
+     global_osd.id = surface_id;
+-    if (++global_osd.generation == 0)
+-        global_osd.generation = 1;
+     global_osd.width = MPMAX(width, 0);
+     global_osd.height = MPMAX(height, 0);
++    uint64_t committed = updating + 1;
++    if (!committed)
++        committed = 2;
++    atomic_store_explicit(&global_osd.generation, committed,
++                          memory_order_release);
+     if (global_osd.active_vo)
+         vo_redraw(global_osd.active_vo);
+     mp_mutex_unlock(&global_osd.lock);
+@@ -93,7 +106,7 @@ struct priv {
+     EGLContext osd_egl_context;
+     EGLSurface osd_egl_surface;
+     GLuint osd_program;
+-    GLuint osd_texture;
++    struct osd_texture osd_textures[2];
+     GLint osd_position_loc;
+     GLint osd_texcoord_loc;
+     GLint osd_texture_loc;
+@@ -147,6 +160,7 @@ static AVBufferRef *create_ohcodec_device_ref(struct vo *vo)
+ 
+     AVHWDeviceContext *ctx = (void *)device_ref->data;
+     AVOHCodecDeviceContext *hwctx = ctx->hwctx;
++    hwctx->direct_surface = 1;
+     uint64_t surface = 0;
+     memcpy(&surface, &vo->opts->WinID, sizeof(vo->opts->WinID));
+ 
+@@ -311,7 +324,12 @@ static void destroy_osd_renderer(struct vo *vo)
+     p->osd_egl_context = EGL_NO_CONTEXT;
+     p->osd_egl_surface = EGL_NO_SURFACE;
+     p->osd_program = 0;
+-    p->osd_texture = 0;
++    for (int i = 0; i < MP_ARRAY_SIZE(p->osd_textures); i++) {
++        p->osd_textures[i].id = 0;
++        p->osd_textures[i].format = 0;
++        p->osd_textures[i].width = 0;
++        p->osd_textures[i].height = 0;
++    }
+     p->osd_surface_id = 0;
+     p->osd_surface_width = 0;
+     p->osd_surface_height = 0;
+@@ -475,12 +493,14 @@ static bool create_osd_renderer(struct vo *vo, uint64_t id,
+     if (!create_osd_program(vo))
+         return false;
+ 
+-    glGenTextures(1, &p->osd_texture);
+-    glBindTexture(GL_TEXTURE_2D, p->osd_texture);
+-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++    for (int i = 0; i < MP_ARRAY_SIZE(p->osd_textures); i++) {
++        glGenTextures(1, &p->osd_textures[i].id);
++        glBindTexture(GL_TEXTURE_2D, p->osd_textures[i].id);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++    }
+     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+ 
+     const char *extensions = (const char *)glGetString(GL_EXTENSIONS);
+@@ -522,21 +542,23 @@ static bool create_osd_renderer(struct vo *vo, uint64_t id,
+ static bool sync_osd_window(struct vo *vo)
+ {
+     struct priv *p = vo->priv;
++    uint64_t generation = atomic_load_explicit(
++        &global_osd.generation, memory_order_acquire);
++    if (!(generation & 1) && generation == p->osd_surface_generation)
++        return !p->osd_failed && p->osd_egl_surface != EGL_NO_SURFACE;
++
+     uint64_t id;
+-    uint64_t generation;
+     int width;
+     int height;
+ 
+     mp_mutex_lock(&global_osd.lock);
+     id = global_osd.id;
+-    generation = global_osd.generation;
++    generation = atomic_load_explicit(&global_osd.generation,
++                                      memory_order_relaxed);
+     width = global_osd.width;
+     height = global_osd.height;
+     mp_mutex_unlock(&global_osd.lock);
+ 
+-    if (generation == p->osd_surface_generation)
+-        return !p->osd_failed && p->osd_egl_surface != EGL_NO_SURFACE;
+-
+     destroy_osd_renderer(vo);
+     p->osd_surface_generation = generation;
+     p->osd_force_upload = true;
+@@ -613,21 +635,46 @@ static bool draw_osd_bitmap(struct vo *vo, enum sub_bitmap_format format,
+ 
+     GLenum texture_format = format == SUBBITMAP_LIBASS
+         ? GL_LUMINANCE : (p->osd_bgra_supported ? GL_BGRA_EXT : GL_RGBA);
+-    while (glGetError() != GL_NO_ERROR) {}
+-    glTexImage2D(GL_TEXTURE_2D, 0, texture_format, b->w, b->h, 0,
+-                 texture_format, GL_UNSIGNED_BYTE, pixels);
+-    if (glGetError() != GL_NO_ERROR) {
+-        MP_ERR(vo, "Failed to upload OSD GLES bitmap (%dx%d format=%d)\n",
+-               b->w, b->h, format);
+-        return false;
++    int texture_index = format == SUBBITMAP_LIBASS ? 0 : 1;
++    struct osd_texture *texture = &p->osd_textures[texture_index];
++    glBindTexture(GL_TEXTURE_2D, texture->id);
++
++    if (texture->format != texture_format || b->w > texture->width ||
++        b->h > texture->height) {
++        int width = mp_round_next_power_of_2(MPMAX(b->w, 64));
++        int height = mp_round_next_power_of_2(MPMAX(b->h, 64));
++        if (texture->format == texture_format) {
++            width = MPMAX(width, texture->width);
++            height = MPMAX(height, texture->height);
++        }
++        if (width <= 0 || height <= 0)
++            return false;
++
++        while (glGetError() != GL_NO_ERROR) {}
++        glTexImage2D(GL_TEXTURE_2D, 0, texture_format, width, height, 0,
++                     texture_format, GL_UNSIGNED_BYTE, NULL);
++        if (glGetError() != GL_NO_ERROR) {
++            MP_ERR(vo, "Failed to allocate OSD GLES texture (%dx%d format=%d)\n",
++                   width, height, format);
++            return false;
++        }
++        texture->format = texture_format;
++        texture->width = width;
++        texture->height = height;
+     }
++    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, b->w, b->h,
++                    texture_format, GL_UNSIGNED_BYTE, pixels);
+ 
+     float x0 = 2.0f * b->x / p->osd_width - 1.0f;
+     float x1 = 2.0f * (b->x + b->dw) / p->osd_width - 1.0f;
+     float y0 = 1.0f - 2.0f * b->y / p->osd_height;
+     float y1 = 1.0f - 2.0f * (b->y + b->dh) / p->osd_height;
+     const GLfloat positions[] = {x0, y0, x0, y1, x1, y0, x1, y1};
+-    const GLfloat texcoords[] = {0, 0, 0, 1, 1, 0, 1, 1};
++    float texture_x = (float)b->w / texture->width;
++    float texture_y = (float)b->h / texture->height;
++    const GLfloat texcoords[] = {
++        0, 0, 0, texture_y, texture_x, 0, texture_x, texture_y,
++    };
+ 
+     glVertexAttribPointer(p->osd_position_loc, 2, GL_FLOAT, GL_FALSE, 0,
+                           positions);
+@@ -661,25 +708,6 @@ static bool draw_osd(struct vo *vo, double pts)
+     struct priv *p = vo->priv;
+     if (!sync_osd_window(vo))
+         return false;
+-    if (!eglMakeCurrent(p->osd_egl_display, p->osd_egl_surface,
+-                        p->osd_egl_surface, p->osd_egl_context)) {
+-        MP_ERR(vo, "OSD EGL context is no longer current (error=0x%x)\n",
+-               eglGetError());
+-        p->osd_failed = true;
+-        return false;
+-    }
+-
+-    EGLint width = p->osd_width;
+-    EGLint height = p->osd_height;
+-    eglQuerySurface(p->osd_egl_display, p->osd_egl_surface, EGL_WIDTH, &width);
+-    eglQuerySurface(p->osd_egl_display, p->osd_egl_surface, EGL_HEIGHT, &height);
+-    if (width > 0 && height > 0 &&
+-        (width != p->osd_width || height != p->osd_height)) {
+-        p->osd_width = width;
+-        p->osd_height = height;
+-        p->osd_force_upload = true;
+-        update_osd_resolution(vo);
+-    }
+ 
+     struct sub_bitmap_list *sbs = osd_render(
+         vo->osd, p->osd_res, pts, 0, osd_formats);
+@@ -699,7 +727,6 @@ static bool draw_osd(struct vo *vo, double pts)
+     glEnable(GL_BLEND);
+     glUseProgram(p->osd_program);
+     glActiveTexture(GL_TEXTURE0);
+-    glBindTexture(GL_TEXTURE_2D, p->osd_texture);
+     glUniform1i(p->osd_texture_loc, 0);
+     glEnableVertexAttribArray(p->osd_position_loc);
+     glEnableVertexAttribArray(p->osd_texcoord_loc);
+-- 
+2.50.1.windows.1
