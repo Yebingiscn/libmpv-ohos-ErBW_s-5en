@@ -53,3 +53,5 @@ for dep_path in "${PATCHES[@]}"; do
     popd
   fi
 done
+
+"$ROOT/scripts/verify-ohos-osd-source.sh"

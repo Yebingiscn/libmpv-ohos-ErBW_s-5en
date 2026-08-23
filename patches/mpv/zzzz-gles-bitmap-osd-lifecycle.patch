@@ -1,0 +1,811 @@
+diff --git a/meson.build b/meson.build
+index dbc74f969df638536e25bc868ddbc90024b06eb2..dfbe32761d68e7679f4b7cad5b8b8b630289e17d 100644
+--- a/meson.build
++++ b/meson.build
+@@ -485,7 +485,8 @@ if features['ohos']
+                      cc.find_library('native_media_vdec'),
+                      cc.find_library('native_buffer'),
+                      cc.find_library('native_image'),
+-                     cc.find_library('native_window')]
++                     cc.find_library('native_window'),
++                     cc.find_library('GLESv2')]
+     sources += files('audio/out/ao_ohaudio.c',
+                      'video/out/ohos_common.c',
+                      'video/out/hwdec/hwdec_ohcodec.c',
+diff --git a/video/out/vo_ohcodec.c b/video/out/vo_ohcodec.c
+index 6ae498b92300c82a6ea57094bb5217e187c46105..b5ec9cdaa22f8dcf2b419d71a9942b328d4d8df6 100644
+--- a/video/out/vo_ohcodec.c
++++ b/video/out/vo_ohcodec.c
+@@ -15,27 +15,24 @@
+  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
+  */
+ 
+-#include <errno.h>
++#include <EGL/egl.h>
++#include <GLES2/gl2.h>
++#include <GLES2/gl2ext.h>
+ #include <inttypes.h>
+-#include <poll.h>
+-#include <stdbool.h>
+ #include <stdint.h>
+ #include <string.h>
+ #include <time.h>
+-#include <unistd.h>
+ 
+ #include <libavcodec/ohcodec_buffer.h>
+ #include <libavutil/error.h>
+ #include <libavutil/hwcontext.h>
+ #include <libavutil/hwcontext_oh.h>
+ #include <mpv/client.h>
+-#include <native_buffer/native_buffer.h>
+ #include <native_window/external_window.h>
+ 
+ #include "common/common.h"
+ #include "osdep/threads.h"
+ #include "osdep/timer.h"
+-#include "sub/draw_bmp.h"
+ #include "sub/osd.h"
+ #include "video/hwdec.h"
+ #include "video/mp_image.h"
+@@ -53,6 +50,7 @@
+ struct global_osd_surface {
+     mp_static_mutex lock;
+     uint64_t id;
++    uint64_t generation;
+     int width;
+     int height;
+     struct vo *active_vo;
+@@ -67,6 +65,8 @@ MPV_EXPORT void ohos_osd_set_global_surface(uint64_t surface_id,
+ {
+     mp_mutex_lock(&global_osd.lock);
+     global_osd.id = surface_id;
++    if (++global_osd.generation == 0)
++        global_osd.generation = 1;
+     global_osd.width = MPMAX(width, 0);
+     global_osd.height = MPMAX(height, 0);
+     if (global_osd.active_vo)
+@@ -80,14 +80,38 @@ struct priv {
+ 
+     OHNativeWindow *osd_window;
+     uint64_t osd_surface_id;
++    uint64_t osd_surface_generation;
+     int osd_surface_width;
+     int osd_surface_height;
+     int osd_width;
+     int osd_height;
+     bool osd_force_upload;
+     bool warned_missing_osd;
++    bool osd_failed;
++
++    EGLDisplay osd_egl_display;
++    EGLContext osd_egl_context;
++    EGLSurface osd_egl_surface;
++    GLuint osd_program;
++    GLuint osd_texture;
++    GLint osd_position_loc;
++    GLint osd_texcoord_loc;
++    GLint osd_texture_loc;
++    GLint osd_color_loc;
++    GLint osd_mode_loc;
++    bool osd_bgra_supported;
++    uint8_t *osd_upload_scratch;
++    size_t osd_upload_scratch_size;
++    int64_t osd_change_id;
++
++    uint64_t osd_render_count;
++    uint64_t osd_part_count;
++    uint64_t osd_upload_bytes;
++    uint64_t osd_swap_failures;
++    uint64_t osd_rebuild_count;
++    uint64_t osd_unchanged_count;
++    int64_t osd_stats_time_ns;
+ 
+-    struct mp_draw_sub_cache *osd_cache;
+     struct mp_osd_res osd_res;
+     double last_pts;
+     int64_t next_render_time_ns;
+@@ -242,48 +266,256 @@ static void resize(struct vo *vo)
+     vo->want_redraw = true;
+ }
+ 
+-static void destroy_osd_window(struct priv *p)
++static const bool osd_formats[SUBBITMAP_COUNT] = {
++    [SUBBITMAP_LIBASS] = true,
++    [SUBBITMAP_BGRA] = true,
++};
++
++static void log_osd_stats(struct vo *vo, bool final)
++{
++    struct priv *p = vo->priv;
++    int64_t now = mp_time_ns();
++    if (!final && p->osd_stats_time_ns &&
++        now - p->osd_stats_time_ns < MP_TIME_S_TO_NS(5))
++        return;
++    if (!p->osd_render_count && !p->osd_swap_failures && !p->osd_rebuild_count)
++        return;
++
++    MP_INFO(vo, "[OSDGLES] renders=%" PRIu64 " parts=%" PRIu64
++                " upload=%" PRIu64 "KiB unchanged=%" PRIu64
++                " rebuilds=%" PRIu64 " swapFailures=%" PRIu64 "%s\n",
++            p->osd_render_count, p->osd_part_count,
++            p->osd_upload_bytes / 1024, p->osd_unchanged_count,
++            p->osd_rebuild_count, p->osd_swap_failures,
++            final ? " final" : "");
++    p->osd_stats_time_ns = now;
++}
++
++static void destroy_osd_renderer(struct vo *vo)
+ {
++    struct priv *p = vo->priv;
++
++    if (p->osd_egl_display != EGL_NO_DISPLAY) {
++        eglMakeCurrent(p->osd_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
++                       EGL_NO_CONTEXT);
++        if (p->osd_egl_surface != EGL_NO_SURFACE)
++            eglDestroySurface(p->osd_egl_display, p->osd_egl_surface);
++        if (p->osd_egl_context != EGL_NO_CONTEXT)
++            eglDestroyContext(p->osd_egl_display, p->osd_egl_context);
++    }
+     if (p->osd_window)
+         OH_NativeWindow_DestroyNativeWindow(p->osd_window);
++
+     p->osd_window = NULL;
++    p->osd_egl_display = EGL_NO_DISPLAY;
++    p->osd_egl_context = EGL_NO_CONTEXT;
++    p->osd_egl_surface = EGL_NO_SURFACE;
++    p->osd_program = 0;
++    p->osd_texture = 0;
+     p->osd_surface_id = 0;
+     p->osd_surface_width = 0;
+     p->osd_surface_height = 0;
+     p->osd_width = 0;
+     p->osd_height = 0;
++    p->osd_change_id = -1;
+ }
+ 
+-static bool configure_osd_window(struct vo *vo, OHNativeWindow *window,
+-                                 int width, int height)
++static GLuint compile_osd_shader(struct vo *vo, GLenum type, const char *source)
+ {
+-    int ret = OH_NativeWindow_NativeWindowHandleOpt(
+-        window, SET_BUFFER_GEOMETRY, width, height);
+-    if (ret != 0) {
+-        MP_ERR(vo, "Failed to set OSD Surface geometry: %d\n", ret);
++    GLuint shader = glCreateShader(type);
++    if (!shader)
++        return 0;
++    glShaderSource(shader, 1, &source, NULL);
++    glCompileShader(shader);
++
++    GLint ok = GL_FALSE;
++    glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
++    if (!ok) {
++        char message[512] = {0};
++        glGetShaderInfoLog(shader, sizeof(message), NULL, message);
++        MP_ERR(vo, "OSD GLES shader compile failed: %s\n", message);
++        glDeleteShader(shader);
++        return 0;
++    }
++    return shader;
++}
++
++static bool create_osd_program(struct vo *vo)
++{
++    static const char vertex_source[] =
++        "attribute vec2 a_position;\n"
++        "attribute vec2 a_texcoord;\n"
++        "varying vec2 v_texcoord;\n"
++        "void main() {\n"
++        "  gl_Position = vec4(a_position, 0.0, 1.0);\n"
++        "  v_texcoord = a_texcoord;\n"
++        "}\n";
++    static const char fragment_source[] =
++        "precision mediump float;\n"
++        "uniform sampler2D u_texture;\n"
++        "uniform vec4 u_color;\n"
++        "uniform float u_mode;\n"
++        "varying vec2 v_texcoord;\n"
++        "void main() {\n"
++        "  vec4 sample = texture2D(u_texture, v_texcoord);\n"
++        "  gl_FragColor = u_mode < 0.5\n"
++        "      ? vec4(u_color.rgb, u_color.a * sample.r)\n"
++        "      : sample;\n"
++        "}\n";
++
++    struct priv *p = vo->priv;
++    GLuint vertex = compile_osd_shader(vo, GL_VERTEX_SHADER, vertex_source);
++    GLuint fragment = compile_osd_shader(vo, GL_FRAGMENT_SHADER, fragment_source);
++    if (!vertex || !fragment) {
++        if (vertex)
++            glDeleteShader(vertex);
++        if (fragment)
++            glDeleteShader(fragment);
+         return false;
+     }
+ 
+-    ret = OH_NativeWindow_NativeWindowHandleOpt(
+-        window, SET_FORMAT, NATIVEBUFFER_PIXEL_FMT_BGRA_8888);
+-    if (ret != 0) {
+-        MP_ERR(vo, "Failed to set OSD Surface BGRA format: %d\n", ret);
++    p->osd_program = glCreateProgram();
++    glAttachShader(p->osd_program, vertex);
++    glAttachShader(p->osd_program, fragment);
++    glLinkProgram(p->osd_program);
++    glDeleteShader(vertex);
++    glDeleteShader(fragment);
++
++    GLint ok = GL_FALSE;
++    glGetProgramiv(p->osd_program, GL_LINK_STATUS, &ok);
++    if (!ok) {
++        char message[512] = {0};
++        glGetProgramInfoLog(p->osd_program, sizeof(message), NULL, message);
++        MP_ERR(vo, "OSD GLES program link failed: %s\n", message);
+         return false;
+     }
+ 
+-    uint64_t usage = NATIVEBUFFER_USAGE_CPU_WRITE |
+-                     NATIVEBUFFER_USAGE_CPU_READ;
+-    ret = OH_NativeWindow_NativeWindowHandleOpt(window, SET_USAGE, usage);
+-    if (ret != 0) {
+-        MP_ERR(vo, "Failed to set OSD Surface CPU usage: %d\n", ret);
++    p->osd_position_loc = glGetAttribLocation(p->osd_program, "a_position");
++    p->osd_texcoord_loc = glGetAttribLocation(p->osd_program, "a_texcoord");
++    p->osd_texture_loc = glGetUniformLocation(p->osd_program, "u_texture");
++    p->osd_color_loc = glGetUniformLocation(p->osd_program, "u_color");
++    p->osd_mode_loc = glGetUniformLocation(p->osd_program, "u_mode");
++    return p->osd_position_loc >= 0 && p->osd_texcoord_loc >= 0 &&
++           p->osd_texture_loc >= 0 && p->osd_color_loc >= 0 &&
++           p->osd_mode_loc >= 0;
++}
++
++static bool create_osd_renderer(struct vo *vo, uint64_t id,
++                                int width, int height)
++{
++    struct priv *p = vo->priv;
++    EGLConfig config = NULL;
++    EGLint num_configs = 0;
++    EGLint config_attrs[] = {
++        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
++        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
++        EGL_RED_SIZE, 8,
++        EGL_GREEN_SIZE, 8,
++        EGL_BLUE_SIZE, 8,
++        EGL_ALPHA_SIZE, 8,
++        EGL_NONE,
++    };
++    EGLint context_attrs[] = {
++        EGL_CONTEXT_CLIENT_VERSION, 2,
++        EGL_NONE,
++    };
++
++    int ret = OH_NativeWindow_CreateNativeWindowFromSurfaceId(id,
++                                                               &p->osd_window);
++    if (ret != 0 || !p->osd_window) {
++        MP_ERR(vo, "Failed to create OSD NativeWindow: %d\n", ret);
+         return false;
+     }
+ 
++    p->osd_egl_display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
++    if (p->osd_egl_display == EGL_NO_DISPLAY ||
++        !eglInitialize(p->osd_egl_display, NULL, NULL) ||
++        !eglBindAPI(EGL_OPENGL_ES_API) ||
++        !eglChooseConfig(p->osd_egl_display, config_attrs, &config, 1,
++                         &num_configs) || num_configs != 1) {
++        MP_ERR(vo, "Failed to initialize OSD EGL (error=0x%x)\n", eglGetError());
++        return false;
++    }
++
++    EGLint native_visual = 0;
++    if (!eglGetConfigAttrib(p->osd_egl_display, config, EGL_NATIVE_VISUAL_ID,
++                            &native_visual)) {
++        MP_ERR(vo, "Failed to query OSD EGL visual (error=0x%x)\n", eglGetError());
++        return false;
++    }
++    ret = OH_NativeWindow_NativeWindowHandleOpt(
++        p->osd_window, SET_BUFFER_GEOMETRY, width, height);
++    if (ret == 0) {
++        ret = OH_NativeWindow_NativeWindowHandleOpt(
++            p->osd_window, SET_FORMAT, native_visual);
++    }
++    if (ret != 0) {
++        MP_ERR(vo, "Failed to configure OSD NativeWindow: %d\n", ret);
++        return false;
++    }
+     ret = OH_NativeWindow_NativeWindowHandleOpt(
+-        window, SET_SOURCE_TYPE, OH_SURFACE_SOURCE_UI);
++        p->osd_window, SET_SOURCE_TYPE, OH_SURFACE_SOURCE_UI);
+     if (ret != 0)
+         MP_VERBOSE(vo, "Failed to mark OSD Surface source type: %d\n", ret);
+ 
++    p->osd_egl_context = eglCreateContext(
++        p->osd_egl_display, config, EGL_NO_CONTEXT, context_attrs);
++    p->osd_egl_surface = eglCreateWindowSurface(
++        p->osd_egl_display, config, (EGLNativeWindowType)p->osd_window, NULL);
++    if (p->osd_egl_context == EGL_NO_CONTEXT ||
++        p->osd_egl_surface == EGL_NO_SURFACE ||
++        !eglMakeCurrent(p->osd_egl_display, p->osd_egl_surface,
++                        p->osd_egl_surface, p->osd_egl_context)) {
++        MP_ERR(vo, "Failed to create OSD EGL surface/context (error=0x%x)\n",
++               eglGetError());
++        return false;
++    }
++
++    eglSwapInterval(p->osd_egl_display, 0);
++    if (!create_osd_program(vo))
++        return false;
++
++    glGenTextures(1, &p->osd_texture);
++    glBindTexture(GL_TEXTURE_2D, p->osd_texture);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
++
++    const char *extensions = (const char *)glGetString(GL_EXTENSIONS);
++    p->osd_bgra_supported = extensions &&
++        strstr(extensions, "GL_EXT_texture_format_BGRA8888");
++
++    EGLint surface_width = width;
++    EGLint surface_height = height;
++    eglQuerySurface(p->osd_egl_display, p->osd_egl_surface,
++                    EGL_WIDTH, &surface_width);
++    eglQuerySurface(p->osd_egl_display, p->osd_egl_surface,
++                    EGL_HEIGHT, &surface_height);
++    p->osd_surface_id = id;
++    p->osd_surface_width = width;
++    p->osd_surface_height = height;
++    p->osd_width = surface_width > 0 ? surface_width : width;
++    p->osd_height = surface_height > 0 ? surface_height : height;
++    p->osd_change_id = -1;
++    p->osd_force_upload = true;
++
++    glViewport(0, 0, p->osd_width, p->osd_height);
++    glClearColor(0.0, 0.0, 0.0, 0.0);
++    glClear(GL_COLOR_BUFFER_BIT);
++    if (!eglSwapBuffers(p->osd_egl_display, p->osd_egl_surface)) {
++        MP_ERR(vo, "Failed to submit initial transparent OSD frame (error=0x%x)\n",
++               eglGetError());
++        return false;
++    }
++
++    p->osd_rebuild_count++;
++    update_osd_resolution(vo);
++    MP_INFO(vo, "OSD GLES Surface attached: %" PRIu64
++                " requested=%dx%d actual=%dx%d bgra=%s\n",
++            id, width, height, p->osd_width, p->osd_height,
++            p->osd_bgra_supported ? "native" : "swizzle");
+     return true;
+ }
+ 
+@@ -291,21 +523,24 @@ static bool sync_osd_window(struct vo *vo)
+ {
+     struct priv *p = vo->priv;
+     uint64_t id;
++    uint64_t generation;
+     int width;
+     int height;
+ 
+     mp_mutex_lock(&global_osd.lock);
+     id = global_osd.id;
++    generation = global_osd.generation;
+     width = global_osd.width;
+     height = global_osd.height;
+     mp_mutex_unlock(&global_osd.lock);
+ 
+-    if (id == p->osd_surface_id && width == p->osd_surface_width &&
+-        height == p->osd_surface_height)
+-        return p->osd_window != NULL;
++    if (generation == p->osd_surface_generation)
++        return !p->osd_failed && p->osd_egl_surface != EGL_NO_SURFACE;
+ 
+-    destroy_osd_window(p);
++    destroy_osd_renderer(vo);
++    p->osd_surface_generation = generation;
+     p->osd_force_upload = true;
++    p->osd_failed = false;
+ 
+     if (!id || width <= 0 || height <= 0) {
+         if (!p->warned_missing_osd) {
+@@ -316,177 +551,109 @@ static bool sync_osd_window(struct vo *vo)
+         return false;
+     }
+ 
+-    OHNativeWindow *window = NULL;
+-    int ret = OH_NativeWindow_CreateNativeWindowFromSurfaceId(id, &window);
+-    if (ret != 0 || !window) {
+-        MP_ERR(vo, "Failed to create OSD NativeWindow: %d\n", ret);
+-        return false;
+-    }
+-    if (!configure_osd_window(vo, window, width, height)) {
+-        OH_NativeWindow_DestroyNativeWindow(window);
++    if (!create_osd_renderer(vo, id, width, height)) {
++        destroy_osd_renderer(vo);
++        p->osd_surface_generation = generation;
++        p->osd_failed = true;
+         return false;
+     }
+ 
+-    p->osd_window = window;
+-    p->osd_surface_id = id;
+-    p->osd_surface_width = width;
+-    p->osd_surface_height = height;
+-    p->osd_width = width;
+-    p->osd_height = height;
+     p->warned_missing_osd = false;
+-    update_osd_resolution(vo);
+-    MP_INFO(vo, "OSD Surface attached: %" PRIu64 " (%dx%d)\n",
+-            id, width, height);
+     return true;
+ }
+ 
+-static bool wait_and_close_fence(struct vo *vo, int fence_fd)
++static const void *prepare_bitmap_upload(struct priv *p,
++                                         const struct sub_bitmap *b,
++                                         int bytes_per_pixel, bool swizzle_bgra)
+ {
+-    if (fence_fd < 0)
+-        return true;
++    int row_bytes = b->w * bytes_per_pixel;
++    if (!swizzle_bgra && b->stride == row_bytes)
++        return b->bitmap;
++
++    size_t needed = (size_t)row_bytes * b->h;
++    if (needed > p->osd_upload_scratch_size) {
++        uint8_t *scratch = talloc_realloc_size(
++            p, p->osd_upload_scratch, needed);
++        if (!scratch)
++            return NULL;
++        p->osd_upload_scratch = scratch;
++        p->osd_upload_scratch_size = needed;
++    }
+ 
+-    struct pollfd pfd = {
+-        .fd = fence_fd,
+-        .events = POLLIN,
+-    };
+-    int ret;
+-    do {
+-        ret = poll(&pfd, 1, 3000);
+-    } while (ret < 0 && errno == EINTR);
+-    close(fence_fd);
+-
+-    if (ret <= 0) {
+-        MP_ERR(vo, "Timed out waiting for OSD buffer fence\n");
+-        return false;
++    for (int y = 0; y < b->h; y++) {
++        const uint8_t *src = (const uint8_t *)b->bitmap + (size_t)y * b->stride;
++        uint8_t *dst = p->osd_upload_scratch + (size_t)y * row_bytes;
++        if (swizzle_bgra) {
++            for (int x = 0; x < b->w; x++) {
++                dst[x * 4 + 0] = src[x * 4 + 2];
++                dst[x * 4 + 1] = src[x * 4 + 1];
++                dst[x * 4 + 2] = src[x * 4 + 0];
++                dst[x * 4 + 3] = src[x * 4 + 3];
++            }
++        } else {
++            memcpy(dst, src, row_bytes);
++        }
+     }
+-    return true;
++    return p->osd_upload_scratch;
+ }
+ 
+-static bool upload_osd(struct vo *vo, struct mp_image *osd)
++static bool draw_osd_bitmap(struct vo *vo, enum sub_bitmap_format format,
++                            const struct sub_bitmap *b)
+ {
+     struct priv *p = vo->priv;
+-    OHNativeWindowBuffer *window_buffer = NULL;
+-    OH_NativeBuffer *native_buffer = NULL;
+-    int fence_fd = -1;
+-    void *mapped = NULL;
+-    bool buffer_requested = false;
+-    bool buffer_mapped = false;
+-    bool ok = false;
+-
+-    int ret = OH_NativeWindow_NativeWindowRequestBuffer(
+-        p->osd_window, &window_buffer, &fence_fd);
+-    if (ret != 0 || !window_buffer) {
+-        MP_ERR(vo, "Failed to request OSD Surface buffer: %d\n", ret);
+-        goto done;
+-    }
+-    buffer_requested = true;
+-
+-    if (!wait_and_close_fence(vo, fence_fd)) {
+-        fence_fd = -1;
+-        goto done;
+-    }
+-    fence_fd = -1;
+-
+-    ret = OH_NativeBuffer_FromNativeWindowBuffer(window_buffer,
+-                                                  &native_buffer);
+-    if (ret != 0 || !native_buffer) {
+-        MP_ERR(vo, "Failed to access OSD NativeBuffer: %d\n", ret);
+-        goto done;
+-    }
+-
+-    ret = OH_NativeBuffer_Map(native_buffer, &mapped);
+-    if (ret != 0 || !mapped) {
+-        MP_ERR(vo, "Failed to map OSD NativeBuffer: %d\n", ret);
+-        goto done;
+-    }
+-    buffer_mapped = true;
+-
+-    BufferHandle *handle =
+-        OH_NativeWindow_GetBufferHandleFromNative(window_buffer);
+-    if (!handle) {
+-        MP_ERR(vo, "OSD buffer has no BufferHandle\n");
+-        goto done;
+-    }
+-
+-    int dst_stride = handle->stride;
+-    int buffer_width = handle->width;
+-    int buffer_height = handle->height;
+-    if (buffer_width <= 0 || buffer_height <= 0 ||
+-        dst_stride < buffer_width * 4 ||
+-        (handle->size > 0 &&
+-         (int64_t)dst_stride * buffer_height > handle->size))
+-    {
+-        MP_ERR(vo, "Invalid OSD buffer layout: width=%d height=%d "
+-               "stride=%d size=%d\n", buffer_width, buffer_height,
+-               dst_stride, handle->size);
+-        goto done;
+-    }
+-
+-    /*
+-     * An ArkUI XComponent can keep the same Surface id and requested size
+-     * while its producer buffers switch to a new physical size on rotation.
+-     * The BufferHandle is the authoritative layout. Re-render at that size
+-     * before copying, otherwise the old, larger overlay either overflows the
+-     * buffer or remains frozen on screen.
+-     */
+-    if (buffer_width != p->osd_width || buffer_height != p->osd_height) {
+-        MP_INFO(vo, "OSD buffer geometry changed: requested=%dx%d, "
+-                "render=%dx%d -> %dx%d (stride=%d size=%d)\n",
+-                p->osd_surface_width, p->osd_surface_height,
+-                p->osd_width, p->osd_height, buffer_width, buffer_height,
+-                dst_stride, handle->size);
+-        p->osd_width = buffer_width;
+-        p->osd_height = buffer_height;
+-        p->osd_force_upload = true;
+-        update_osd_resolution(vo);
+-        vo->want_redraw = true;
+-        goto done;
+-    }
++    if (!b->bitmap || b->w <= 0 || b->h <= 0 ||
++        b->dw <= 0 || b->dh <= 0)
++        return true;
+ 
+-    memcpy_pic(mapped, osd->planes[0], p->osd_width * 4, p->osd_height,
+-               dst_stride, osd->stride[0]);
+-    if (dst_stride > p->osd_width * 4) {
+-        for (int y = 0; y < p->osd_height; y++) {
+-            memset((uint8_t *)mapped + y * dst_stride + p->osd_width * 4,
+-                   0, dst_stride - p->osd_width * 4);
+-        }
+-    }
++    int bpp = format == SUBBITMAP_LIBASS ? 1 : 4;
++    bool swizzle = format == SUBBITMAP_BGRA && !p->osd_bgra_supported;
++    const void *pixels = prepare_bitmap_upload(p, b, bpp, swizzle);
++    if (!pixels)
++        return false;
+ 
+-    ret = OH_NativeBuffer_Unmap(native_buffer);
+-    buffer_mapped = false;
+-    if (ret != 0) {
+-        MP_ERR(vo, "Failed to unmap OSD NativeBuffer: %d\n", ret);
+-        goto done;
++    GLenum texture_format = format == SUBBITMAP_LIBASS
++        ? GL_LUMINANCE : (p->osd_bgra_supported ? GL_BGRA_EXT : GL_RGBA);
++    while (glGetError() != GL_NO_ERROR) {}
++    glTexImage2D(GL_TEXTURE_2D, 0, texture_format, b->w, b->h, 0,
++                 texture_format, GL_UNSIGNED_BYTE, pixels);
++    if (glGetError() != GL_NO_ERROR) {
++        MP_ERR(vo, "Failed to upload OSD GLES bitmap (%dx%d format=%d)\n",
++               b->w, b->h, format);
++        return false;
+     }
+ 
+-    struct Rect dirty_rect = {
+-        .x = 0,
+-        .y = 0,
+-        .w = p->osd_width,
+-        .h = p->osd_height,
+-    };
+-    Region region = {
+-        .rects = &dirty_rect,
+-        .rectNumber = 1,
+-    };
+-    ret = OH_NativeWindow_NativeWindowFlushBuffer(
+-        p->osd_window, window_buffer, -1, region);
+-    if (ret != 0) {
+-        MP_ERR(vo, "Failed to flush OSD Surface buffer: %d\n", ret);
+-        goto done;
++    float x0 = 2.0f * b->x / p->osd_width - 1.0f;
++    float x1 = 2.0f * (b->x + b->dw) / p->osd_width - 1.0f;
++    float y0 = 1.0f - 2.0f * b->y / p->osd_height;
++    float y1 = 1.0f - 2.0f * (b->y + b->dh) / p->osd_height;
++    const GLfloat positions[] = {x0, y0, x0, y1, x1, y0, x1, y1};
++    const GLfloat texcoords[] = {0, 0, 0, 1, 1, 0, 1, 1};
++
++    glVertexAttribPointer(p->osd_position_loc, 2, GL_FLOAT, GL_FALSE, 0,
++                          positions);
++    glVertexAttribPointer(p->osd_texcoord_loc, 2, GL_FLOAT, GL_FALSE, 0,
++                          texcoords);
++    if (format == SUBBITMAP_LIBASS) {
++        uint32_t c = b->libass.color;
++        glUniform4f(p->osd_color_loc,
++                    (c >> 24) / 255.0f,
++                    ((c >> 16) & 0xff) / 255.0f,
++                    ((c >> 8) & 0xff) / 255.0f,
++                    (255 - (c & 0xff)) / 255.0f);
++        glUniform1f(p->osd_mode_loc, 0.0f);
++        glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
++                            GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
++    } else {
++        glUniform4f(p->osd_color_loc, 1.0f, 1.0f, 1.0f, 1.0f);
++        glUniform1f(p->osd_mode_loc, 1.0f);
++        glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA,
++                            GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+     }
++    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+ 
+-    buffer_requested = false;
+-    ok = true;
+-
+-done:
+-    if (buffer_mapped)
+-        OH_NativeBuffer_Unmap(native_buffer);
+-    if (fence_fd >= 0)
+-        close(fence_fd);
+-    if (buffer_requested)
+-        OH_NativeWindow_NativeWindowAbortBuffer(p->osd_window, window_buffer);
+-    return ok;
++    p->osd_part_count++;
++    p->osd_upload_bytes += (uint64_t)b->w * b->h * bpp;
++    return true;
+ }
+ 
+ static bool draw_osd(struct vo *vo, double pts)
+@@ -494,45 +661,99 @@ static bool draw_osd(struct vo *vo, double pts)
+     struct priv *p = vo->priv;
+     if (!sync_osd_window(vo))
+         return false;
++    if (!eglMakeCurrent(p->osd_egl_display, p->osd_egl_surface,
++                        p->osd_egl_surface, p->osd_egl_context)) {
++        MP_ERR(vo, "OSD EGL context is no longer current (error=0x%x)\n",
++               eglGetError());
++        p->osd_failed = true;
++        return false;
++    }
+ 
+-    if (!p->osd_cache)
+-        p->osd_cache = mp_draw_sub_alloc(p, vo->global);
++    EGLint width = p->osd_width;
++    EGLint height = p->osd_height;
++    eglQuerySurface(p->osd_egl_display, p->osd_egl_surface, EGL_WIDTH, &width);
++    eglQuerySurface(p->osd_egl_display, p->osd_egl_surface, EGL_HEIGHT, &height);
++    if (width > 0 && height > 0 &&
++        (width != p->osd_width || height != p->osd_height)) {
++        p->osd_width = width;
++        p->osd_height = height;
++        p->osd_force_upload = true;
++        update_osd_resolution(vo);
++    }
+ 
+     struct sub_bitmap_list *sbs = osd_render(
+-        vo->osd, p->osd_res, pts, 0, mp_draw_sub_formats);
++        vo->osd, p->osd_res, pts, 0, osd_formats);
+     if (!sbs)
+         return false;
++    if (sbs->change_id == p->osd_change_id && !p->osd_force_upload) {
++        p->osd_unchanged_count++;
++        talloc_free(sbs);
++        log_osd_stats(vo, false);
++        return true;
++    }
+ 
+-    struct mp_rect act_rect[1];
+-    struct mp_rect mod_rect[64];
+-    int num_act_rect = 0;
+-    int num_mod_rect = 0;
+-    struct mp_image *osd = mp_draw_sub_overlay(
+-        p->osd_cache, sbs,
+-        act_rect, MP_ARRAY_SIZE(act_rect), &num_act_rect,
+-        mod_rect, MP_ARRAY_SIZE(mod_rect), &num_mod_rect);
+-    talloc_free(sbs);
++    glViewport(0, 0, p->osd_width, p->osd_height);
++    glDisable(GL_SCISSOR_TEST);
++    glDisable(GL_DEPTH_TEST);
++    glClearColor(0.0, 0.0, 0.0, 0.0);
++    glClear(GL_COLOR_BUFFER_BIT);
++    glEnable(GL_BLEND);
++    glUseProgram(p->osd_program);
++    glActiveTexture(GL_TEXTURE0);
++    glBindTexture(GL_TEXTURE_2D, p->osd_texture);
++    glUniform1i(p->osd_texture_loc, 0);
++    glEnableVertexAttribArray(p->osd_position_loc);
++    glEnableVertexAttribArray(p->osd_texcoord_loc);
++
++    bool ok = true;
++    for (int n = 0; n < sbs->num_items && ok; n++) {
++        const struct sub_bitmaps *item = sbs->items[n];
++        for (int i = 0; i < item->num_parts; i++) {
++            if (!draw_osd_bitmap(vo, item->format, &item->parts[i])) {
++                ok = false;
++                break;
++            }
++        }
++    }
++    glDisableVertexAttribArray(p->osd_position_loc);
++    glDisableVertexAttribArray(p->osd_texcoord_loc);
+ 
+-    if (!osd)
++    int64_t change_id = sbs->change_id;
++    talloc_free(sbs);
++    if (!ok) {
++        p->osd_force_upload = true;
+         return false;
+-    if (!num_mod_rect && !p->osd_force_upload)
+-        return true;
+-    if (osd->w != p->osd_width || osd->h != p->osd_height) {
+-        MP_ERR(vo, "OSD renderer size mismatch: %dx%d, Surface %dx%d\n",
+-               osd->w, osd->h, p->osd_width, p->osd_height);
++    }
++
++    if (!eglSwapBuffers(p->osd_egl_display, p->osd_egl_surface)) {
++        EGLint error = eglGetError();
++        uint64_t failed_generation = p->osd_surface_generation;
++        p->osd_swap_failures++;
++        MP_ERR(vo, "OSD EGL swap failed (generation=%" PRIu64
++                   " error=0x%x); waiting for a new Surface generation\n",
++               failed_generation, error);
++        destroy_osd_renderer(vo);
++        p->osd_surface_generation = failed_generation;
++        p->osd_failed = true;
+         return false;
+     }
+ 
+-    bool ok = upload_osd(vo, osd);
+-    if (ok)
+-        p->osd_force_upload = false;
+-    return ok;
++    p->osd_change_id = change_id;
++    p->osd_force_upload = false;
++    p->osd_render_count++;
++    log_osd_stats(vo, false);
++    return true;
+ }
+ 
+ static int preinit(struct vo *vo)
+ {
+     struct priv *p = vo->priv;
+ 
++    p->osd_egl_display = EGL_NO_DISPLAY;
++    p->osd_egl_context = EGL_NO_CONTEXT;
++    p->osd_egl_surface = EGL_NO_SURFACE;
++    p->osd_change_id = -1;
++
+     vo->hwdec_devs = hwdec_devices_create();
+     p->hwctx = (struct mp_hwdec_ctx){
+         .driver_name = "ohcodec",
+@@ -657,7 +878,8 @@ static void uninit(struct vo *vo)
+     mp_mutex_unlock(&global_osd.lock);
+ 
+     mp_image_unrefp(&p->next_image);
+-    destroy_osd_window(p);
++    log_osd_stats(vo, true);
++    destroy_osd_renderer(vo);
+ 
+     if (vo->hwdec_devs)
+         hwdec_devices_remove(vo->hwdec_devs, &p->hwctx);
+@@ -669,7 +891,7 @@ static void uninit(struct vo *vo)
+ }
+ 
+ const struct vo_driver video_out_ohcodec = {
+-    .description = "HarmonyOS OHCodec Surface with transparent OSD",
++    .description = "HarmonyOS OHCodec Surface with GLES bitmap OSD",
+     .name = "ohcodec-osd",
+     .caps = VO_CAP_NORETAIN,
+     .preinit = preinit,

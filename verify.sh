@@ -29,7 +29,8 @@ if ! grep -q -- "-Dgpl=true" <<< "$configuration"; then
 fi
 
 symbols=$("$NM" -D --defined-only "$LIBMPV")
-for symbol in mpv_create mpv_ohos_report_vsync mpv_ohos_reset_vsync; do
+for symbol in mpv_create mpv_ohos_report_vsync mpv_ohos_reset_vsync \
+              ohos_osd_set_global_surface; do
   if ! grep -Eq "[[:space:]]$symbol$" <<< "$symbols"; then
     echo "Missing required dynamic symbol: $symbol" >&2
     exit 1
@@ -37,6 +38,10 @@ for symbol in mpv_create mpv_ohos_report_vsync mpv_ohos_reset_vsync; do
 done
 
 dynamic_section=$("$READELF" -d "$LIBMPV")
+if ! grep -Eq "NEEDED.*libGLESv2\.so" <<< "$dynamic_section"; then
+  echo "Direct OSD renderer is not linked to GLESv2" >&2
+  exit 1
+fi
 if grep -Eq "NEEDED.*lib(dvd|bluray|archive)" <<< "$dynamic_section"; then
   echo "Optical-media dependencies must be linked statically" >&2
   exit 1
@@ -85,6 +90,11 @@ fi
 # Optional OHCodec metadata keys are resolved with dlsym at runtime so the
 # same libmpv remains loadable on older HarmonyOS releases.
 undefined_symbols=$("$NM" -D --undefined-only "$LIBMPV")
+if grep -Eq "[[:space:]]OH_NativeWindow_NativeWindowAbortBuffer$" \
+    <<< "$undefined_symbols"; then
+  echo "Legacy OSD NativeWindow AbortBuffer path is still linked" >&2
+  exit 1
+fi
 for symbol in OH_MD_KEY_VIDEO_DECODER_OUTPUT_ENABLE_VRR \
               OH_MD_KEY_VIDEO_DECODER_FRAME_RETENTION_MODE \
               OH_MD_KEY_VIDEO_DECODER_SPEED; do
@@ -120,6 +130,14 @@ if ! "$STRINGS" "$LIBMPV" | grep -F \
   echo "Missing OHOS NativeWindow resize synchronization" >&2
   exit 1
 fi
+
+for marker in "[OSDGLES]" "OSD GLES Surface attached" \
+              "waiting for a new Surface generation"; do
+  if ! "$STRINGS" "$LIBMPV" | grep -F "$marker" >/dev/null; then
+    echo "Missing direct GLES OSD lifecycle marker: $marker" >&2
+    exit 1
+  fi
+done
 
 echo "$features"
 echo "$configuration"
