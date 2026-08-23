@@ -1,0 +1,20 @@
+diff --git a/video/out/vo_ohcodec.c b/video/out/vo_ohcodec.c
+index b5ec9cdaa2..05c894bf79 100644
+--- a/video/out/vo_ohcodec.c
++++ b/video/out/vo_ohcodec.c
+@@ -690,7 +690,6 @@ static bool draw_osd(struct vo *vo, double pts)
+     if (sbs->change_id == p->osd_change_id && !p->osd_force_upload) {
+         p->osd_unchanged_count++;
+         talloc_free(sbs);
+-        log_osd_stats(vo, false);
+         return true;
+     }
+ 
+@@ -741,7 +740,6 @@ static bool draw_osd(struct vo *vo, double pts)
+     p->osd_change_id = change_id;
+     p->osd_force_upload = false;
+     p->osd_render_count++;
+-    log_osd_stats(vo, false);
+     return true;
+ }
+ 
