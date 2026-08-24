@@ -104,7 +104,7 @@ index 6ae498b92300c82a6ea57094bb5217e187c46105..b5ec9cdaa22f8dcf2b419d71a9942b32
      struct mp_osd_res osd_res;
      double last_pts;
      int64_t next_render_time_ns;
-@@ -242,48 +266,256 @@ static void resize(struct vo *vo)
+@@ -242,48 +266,255 @@ static void resize(struct vo *vo)
      vo->want_redraw = true;
  }
  
@@ -330,7 +330,6 @@ index 6ae498b92300c82a6ea57094bb5217e187c46105..b5ec9cdaa22f8dcf2b419d71a9942b32
 +        return false;
 +    }
 +
-+    eglSwapInterval(p->osd_egl_display, 0);
 +    if (!create_osd_program(vo))
 +        return false;
 +
@@ -378,7 +377,7 @@ index 6ae498b92300c82a6ea57094bb5217e187c46105..b5ec9cdaa22f8dcf2b419d71a9942b32
      return true;
  }
  
-@@ -291,21 +523,24 @@ static bool sync_osd_window(struct vo *vo)
+@@ -291,21 +522,24 @@ static bool sync_osd_window(struct vo *vo)
  {
      struct priv *p = vo->priv;
      uint64_t id;
@@ -407,7 +406,7 @@ index 6ae498b92300c82a6ea57094bb5217e187c46105..b5ec9cdaa22f8dcf2b419d71a9942b32
  
      if (!id || width <= 0 || height <= 0) {
          if (!p->warned_missing_osd) {
-@@ -316,177 +551,109 @@ static bool sync_osd_window(struct vo *vo)
+@@ -316,177 +550,109 @@ static bool sync_osd_window(struct vo *vo)
          return false;
      }
  
@@ -668,7 +667,7 @@ index 6ae498b92300c82a6ea57094bb5217e187c46105..b5ec9cdaa22f8dcf2b419d71a9942b32
  }
  
  static bool draw_osd(struct vo *vo, double pts)
-@@ -494,45 +661,99 @@ static bool draw_osd(struct vo *vo, double pts)
+@@ -494,45 +660,99 @@ static bool draw_osd(struct vo *vo, double pts)
      struct priv *p = vo->priv;
      if (!sync_osd_window(vo))
          return false;
@@ -790,7 +789,7 @@ index 6ae498b92300c82a6ea57094bb5217e187c46105..b5ec9cdaa22f8dcf2b419d71a9942b32
      vo->hwdec_devs = hwdec_devices_create();
      p->hwctx = (struct mp_hwdec_ctx){
          .driver_name = "ohcodec",
-@@ -657,7 +878,8 @@ static void uninit(struct vo *vo)
+@@ -657,7 +877,8 @@ static void uninit(struct vo *vo)
      mp_mutex_unlock(&global_osd.lock);
  
      mp_image_unrefp(&p->next_image);
@@ -800,7 +799,7 @@ index 6ae498b92300c82a6ea57094bb5217e187c46105..b5ec9cdaa22f8dcf2b419d71a9942b32
  
      if (vo->hwdec_devs)
          hwdec_devices_remove(vo->hwdec_devs, &p->hwctx);
-@@ -669,7 +891,7 @@ static void uninit(struct vo *vo)
+@@ -669,7 +890,7 @@ static void uninit(struct vo *vo)
  }
  
  const struct vo_driver video_out_ohcodec = {

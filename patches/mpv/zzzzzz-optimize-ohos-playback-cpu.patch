@@ -10,16 +10,13 @@ Avoid redundant EGL context switches and surface queries for Surface-mode
 OSD. Use an atomic generation fast path for unchanged OSD surfaces and keep
 reusable GLES textures for libass masks and BGRA OSD bitmaps.
 
-Avoid measuring the OSD renderer when debug logging is disabled. Finally, add
-meaningful hysteresis to VSYNC interval notifications so display jitter does
-not continuously wake mpv's playloop.
+Avoid measuring the OSD renderer when debug logging is disabled.
 ---
  sub/osd.c                          | 14 +++--
  video/out/hwdec/hwdec_ohcodec.c | 23 +++--------
  video/out/hwdec/hwdec_ohcodec.h |  3 +-
- video/out/ohos_common.c          | 19 ++++++---
  video/out/vo_ohcodec.c           | 116 +++++++++++++++++++------------
- 5 files changed, 98 insertions(+), 77 deletions(-)
+ 4 files changed, 84 insertions(+), 69 deletions(-)
 
 diff --git a/sub/osd.c b/sub/osd.c
 --- a/sub/osd.c
@@ -135,57 +132,6 @@ diff --git a/video/out/hwdec/hwdec_ohcodec.h b/video/out/hwdec/hwdec_ohcodec.h
  
  bool ohcodec_interop_gl_init(struct ra_hwdec *hw);
  bool ohcodec_interop_pl_init(struct ra_hwdec *hw);
-diff --git a/video/out/ohos_common.c b/video/out/ohos_common.c
---- a/video/out/ohos_common.c
-+++ b/video/out/ohos_common.c
-@@ -40,6 +40,7 @@ struct vo_ohos_vsync_state {
-     int num_intervals;
-     int next_interval;
-     int64_t interval_ns;
-+    int64_t notified_interval_ns;
- };
- 
- static struct vo_ohos_vsync_state global_vsync = {
-@@ -60,6 +61,7 @@ static void clear_vsync_samples(struct vo_ohos_vsync_state *state)
-     state->num_intervals = 0;
-     state->next_interval = 0;
-     state->interval_ns = 0;
-+    state->notified_interval_ns = 0;
- }
- 
- static int64_t median_interval(struct vo_ohos_vsync_state *state)
-@@ -99,7 +101,6 @@ MPV_EXPORT void mpv_ohos_report_vsync(uint64_t surface_id,
-         global_vsync.surface_id = surface_id;
-     }
- 
--    int64_t old_interval = global_vsync.interval_ns;
-     if (global_vsync.last_timestamp_ns &&
-         timestamp_ns > global_vsync.last_timestamp_ns) {
-         uint64_t delta = timestamp_ns - global_vsync.last_timestamp_ns;
-@@ -122,12 +123,18 @@ MPV_EXPORT void mpv_ohos_report_vsync(uint64_t surface_id,
-     (void)target_timestamp_ns;
- 
-     int64_t new_interval = global_vsync.interval_ns;
-+    int64_t notify_threshold = MPMAX(
-+        global_vsync.notified_interval_ns / 50, MP_TIME_US_TO_NS(100));
-     bool interval_changed = new_interval > 0 &&
--        (was_stale || old_interval <= 0 || llabs(new_interval - old_interval) >
--                                           MPMAX(old_interval / 200, 1));
--    if (interval_changed && global_vsync.active_vo &&
--        global_vsync.active_surface_id == surface_id)
--        notify_vo = global_vsync.active_vo;
-+        (was_stale || global_vsync.notified_interval_ns <= 0 ||
-+         llabs(new_interval - global_vsync.notified_interval_ns) >
-+             notify_threshold);
-+    if (interval_changed) {
-+        global_vsync.notified_interval_ns = new_interval;
-+        if (global_vsync.active_vo &&
-+            global_vsync.active_surface_id == surface_id)
-+            notify_vo = global_vsync.active_vo;
-+    }
- 
-     // Keep the pointer protected until vo_event() has completed. Detach takes
-     // the same lock before the VO can be destroyed.
 diff --git a/video/out/vo_ohcodec.c b/video/out/vo_ohcodec.c
 --- a/video/out/vo_ohcodec.c
 +++ b/video/out/vo_ohcodec.c

@@ -1,15 +1,15 @@
 diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
-index cfa74c74e7..9a03fde3f3 100644
+index cfa74c74e7..8e542c3008 100644
 --- a/video/out/vo_gpu_next.c
 +++ b/video/out/vo_gpu_next.c
 @@ -134,6 +134,10 @@ struct priv {
      bool is_interpolated;
      bool want_reset;
      bool frame_pending;
-+    // OHCodec's NativeImage interop exposes one mutable external image. It
-+    // cannot keep several independently addressable source frames alive for
-+    // libplacebo's temporal mixer. Keep this path strictly single-frame.
-+    bool single_image_hwdec;
++    // OHCodec's NativeImage interop exposes one mutable external image. Keep
++    // temporal mixing disabled until the interop can retain independently
++    // addressable source images; this does not restrict the decoder queue.
++    bool mutable_image_hwdec;
  
      pl_options pars;
      struct m_config_cache *opts_cache;
@@ -18,47 +18,37 @@ index cfa74c74e7..9a03fde3f3 100644
      bool will_redraw = frame->display_synced && frame->num_vsyncs > 1;
      bool cache_frame = will_redraw || frame->still;
 -    bool can_interpolate = opts->interpolation && frame->display_synced &&
-+    bool can_interpolate = !p->single_image_hwdec && opts->interpolation &&
++    bool can_interpolate = !p->mutable_image_hwdec && opts->interpolation &&
 +                           frame->display_synced &&
                             !frame->still && frame->num_frames > 1;
      double pts_offset = can_interpolate ? frame->ideal_frame_vsync : 0;
      params.info_callback = info_callback;
-@@ -1534,6 +1539,20 @@ static void resize(struct vo *vo)
+@@ -1534,6 +1539,18 @@ static void resize(struct vo *vo)
  static int reconfig(struct vo *vo, struct mp_image_params *params)
  {
      struct priv *p = vo->priv;
 +    // External window resizes intentionally call reconfig(vo, NULL). Only a
 +    // real video reconfiguration carries image parameters.
 +    if (params) {
-+        bool single_image_hwdec = params->imgfmt == IMGFMT_OHCODEC;
-+        if (single_image_hwdec != p->single_image_hwdec) {
-+            p->single_image_hwdec = single_image_hwdec;
++        bool mutable_image_hwdec = params->imgfmt == IMGFMT_OHCODEC;
++        if (mutable_image_hwdec != p->mutable_image_hwdec) {
++            p->mutable_image_hwdec = mutable_image_hwdec;
 +            p->want_reset = true;
 +            update_render_options(vo);
-+            if (single_image_hwdec) {
-+                MP_INFO(vo, "OHCodec single-image interop: temporal mixing "
-+                        "disabled, decoder queue depth=1\n");
-+            }
++            if (mutable_image_hwdec)
++                MP_VERBOSE(vo, "OHCodec mutable-image interop: temporal mixing unavailable\n");
 +        }
 +    }
      if (!p->ra_ctx->fns->reconfig(p->ra_ctx))
          return -1;
  
-@@ -2548,13 +2567,14 @@ static void update_render_options(struct vo *vo)
+@@ -2548,7 +2565,8 @@ static void update_render_options(struct vo *vo)
      pars->params.upscaler = map_scaler(p, SCALER_SCALE);
      pars->params.downscaler = map_scaler(p, SCALER_DSCALE);
      pars->params.plane_upscaler = map_scaler(p, SCALER_CSCALE);
 -    pars->params.frame_mixer = opts->interpolation ? map_scaler(p, SCALER_TSCALE) : NULL;
-+    pars->params.frame_mixer = opts->interpolation && !p->single_image_hwdec
++    pars->params.frame_mixer = opts->interpolation && !p->mutable_image_hwdec
 +                            ? map_scaler(p, SCALER_TSCALE) : NULL;
  
      // Request as many frames as required from the decoder, depending on the
      // speed VPS/FPS ratio libplacebo may need more frames. Request frames up to
-     // ratio of 1/2, but only if anti aliasing is enabled.
--    int req_frames = 2;
--    if (pars->params.frame_mixer) {
-+    int req_frames = p->single_image_hwdec ? 1 : 2;
-+    if (!p->single_image_hwdec && pars->params.frame_mixer) {
-         req_frames += ceilf(pars->params.frame_mixer->kernel->radius) *
-                       (pars->params.skip_anti_aliasing ? 1 : 2);
-     }

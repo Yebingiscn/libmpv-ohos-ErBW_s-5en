@@ -29,8 +29,7 @@ if ! grep -q -- "-Dgpl=true" <<< "$configuration"; then
 fi
 
 symbols=$("$NM" -D --defined-only "$LIBMPV")
-for symbol in mpv_create mpv_ohos_report_vsync mpv_ohos_reset_vsync \
-              ohos_osd_set_global_surface; do
+for symbol in mpv_create ohos_osd_set_global_surface; do
   if ! grep -Eq "[[:space:]]$symbol$" <<< "$symbols"; then
     echo "Missing required dynamic symbol: $symbol" >&2
     exit 1
@@ -59,6 +58,13 @@ fi
 for marker in vvc_ohcodec video/vvc vvc_mp4toannexb; do
   if ! "$STRINGS" "$LIBMPV" | grep -Fx "$marker" >/dev/null; then
     echo "Missing VVC OHCodec marker: $marker" >&2
+    exit 1
+  fi
+done
+
+for symbol in mpv_ohos_report_vsync mpv_ohos_reset_vsync; do
+  if grep -Eq "[[:space:]]$symbol$" <<< "$symbols"; then
+    echo "Removed OHOS VSYNC symbol is still exported: $symbol" >&2
     exit 1
   fi
 done
@@ -119,9 +125,9 @@ if ! "$STRINGS" "$LIBMPV" | grep -F "[OHCodecPolicy]" >/dev/null; then
 fi
 
 if ! "$STRINGS" "$LIBMPV" | grep -F \
-    "OHCodec single-image interop: temporal mixing disabled, decoder queue depth=1" \
+    "OHCodec mutable-image interop: temporal mixing unavailable" \
     >/dev/null; then
-  echo "Missing OHCodec single-frame queue policy" >&2
+  echo "Missing OHCodec temporal-mixing safety marker" >&2
   exit 1
 fi
 
