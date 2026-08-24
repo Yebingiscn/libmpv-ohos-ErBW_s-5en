@@ -145,6 +145,11 @@ for marker in "[OSDGLES]" "OSD GLES Surface attached" \
   fi
 done
 
+if ! "$STRINGS" "$LIBMPV" | grep -F "OHAudio 10s: cb=" >/dev/null; then
+  echo "Missing nonblocking OHAudio callback diagnostics" >&2
+  exit 1
+fi
+
 echo "$features"
 echo "$configuration"
 grep -E "NEEDED|SONAME" <<< "$dynamic_section"

@@ -1,0 +1,566 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yebingiscn <Yebingiscn@users.noreply.github.com>
+Date: Tue, 25 Aug 2026 02:00:00 +0800
+Subject: [PATCH] audio/out: keep OHAudio callback nonblocking
+
+Move the potentially blocking OHAudio timestamp IPC to a low-rate clock
+thread and publish the result through an atomic snapshot. Use OHAudio's
+advanced callback with a nonblocking mpv buffer read, so lock contention
+returns zero bytes and lets the audio service back off without consuming
+uninitialized data or advancing the device clock with synthetic silence.
+
+Add low-frequency aggregate timing and underrun diagnostics. Healthy windows
+remain trace-only; anomalous callback, lock, or clock-query windows emit one
+warning line.
+---
+diff --git a/audio/out/ao_ohaudio.c b/audio/out/ao_ohaudio.c
+index 5010eef715..c439cf83fe 100644
+--- a/audio/out/ao_ohaudio.c
++++ b/audio/out/ao_ohaudio.c
+@@ -27,36 +27,278 @@
+ #include "osdep/threads.h"
+ #include "osdep/timer.h"
+ 
++#include <stdatomic.h>
++
+ #include <ohaudio/native_audiorenderer.h>
+ #include <ohaudio/native_audiostreambuilder.h>
+ 
++#define CLOCK_QUERY_INTERVAL_NS MP_TIME_MS_TO_NS(250)
++#define STATS_REPORT_INTERVAL_NS MP_TIME_S_TO_NS(10)
++#define CALLBACK_WARN_NS MP_TIME_MS_TO_NS(5)
++#define CLOCK_QUERY_WARN_NS MP_TIME_MS_TO_NS(20)
++
+ struct priv {
+     OH_AudioStreamBuilder* builder;
+     OH_AudioRenderer *renderer;
+-    int64_t last_query;
++
++    mp_thread clock_thread;
++    mp_mutex clock_lock;
++    mp_cond clock_wakeup;
++    bool clock_sync_initialized;
++    bool clock_thread_created;
++    bool clock_shutdown;
++
++    atomic_bool clock_running;
++    atomic_uint_fast64_t stream_epoch;
++    atomic_uint_fast64_t clock_epoch;
++    atomic_uint_fast64_t snapshot_epoch;
++    atomic_int_fast64_t snapshot_position;
++    atomic_int_fast64_t snapshot_timestamp;
++    atomic_int_fast64_t snapshot_published_at;
++
++    // Accessed only by the OHAudio write callback.
++    uint64_t callback_stream_epoch;
+     int64_t frame_position;
+-    int64_t frame_timestamp;
+     int64_t written_frames;
+     int64_t queued_frames;
+     bool timestamp_valid;
+ 
++    atomic_uint_fast64_t callback_count;
++    atomic_uint_fast64_t callback_total_ns;
++    atomic_uint_fast64_t callback_max_ns;
++    atomic_uint_fast64_t read_total_ns;
++    atomic_uint_fast64_t read_max_ns;
++    atomic_uint_fast64_t lock_contentions;
++    atomic_uint_fast64_t short_reads;
++    atomic_uint_fast64_t query_count;
++    atomic_uint_fast64_t query_total_ns;
++    atomic_uint_fast64_t query_max_ns;
++    atomic_uint_fast64_t query_failures;
++
+     int encoding_type;
+ };
+ 
+-static void reset_timing(struct priv *p)
++static void atomic_update_max(atomic_uint_fast64_t *value, uint64_t sample)
++{
++    uint_fast64_t current = atomic_load_explicit(value, memory_order_relaxed);
++    while (current < sample &&
++           !atomic_compare_exchange_weak_explicit(value, &current, sample,
++                                                   memory_order_relaxed,
++                                                   memory_order_relaxed))
++    {
++    }
++}
++
++static void init_timing(struct priv *p)
+ {
+-    p->last_query = 0;
++    atomic_init(&p->clock_running, false);
++    atomic_init(&p->stream_epoch, 1);
++    atomic_init(&p->clock_epoch, 1);
++    atomic_init(&p->snapshot_epoch, 0);
++    atomic_init(&p->snapshot_position, 0);
++    atomic_init(&p->snapshot_timestamp, 0);
++    atomic_init(&p->snapshot_published_at, 0);
++
++    atomic_init(&p->callback_count, 0);
++    atomic_init(&p->callback_total_ns, 0);
++    atomic_init(&p->callback_max_ns, 0);
++    atomic_init(&p->read_total_ns, 0);
++    atomic_init(&p->read_max_ns, 0);
++    atomic_init(&p->lock_contentions, 0);
++    atomic_init(&p->short_reads, 0);
++    atomic_init(&p->query_count, 0);
++    atomic_init(&p->query_total_ns, 0);
++    atomic_init(&p->query_max_ns, 0);
++    atomic_init(&p->query_failures, 0);
++
++    p->callback_stream_epoch = 0;
+     p->frame_position = 0;
+-    p->frame_timestamp = 0;
+     p->written_frames = 0;
+     p->queued_frames = 0;
+     p->timestamp_valid = false;
+ }
+ 
++static void set_clock_running(struct priv *p, bool running)
++{
++    if (!p->clock_sync_initialized)
++        return;
++
++    mp_mutex_lock(&p->clock_lock);
++    if (!p->clock_shutdown) {
++        atomic_fetch_add_explicit(&p->clock_epoch, 1, memory_order_acq_rel);
++        atomic_store_explicit(&p->clock_running, running, memory_order_release);
++        mp_cond_signal(&p->clock_wakeup);
++    }
++    mp_mutex_unlock(&p->clock_lock);
++}
++
++static void report_stats(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++    uint64_t callbacks = atomic_exchange_explicit(&p->callback_count, 0,
++                                                   memory_order_relaxed);
++    uint64_t callback_total = atomic_exchange_explicit(&p->callback_total_ns, 0,
++                                                        memory_order_relaxed);
++    uint64_t callback_max = atomic_exchange_explicit(&p->callback_max_ns, 0,
++                                                      memory_order_relaxed);
++    uint64_t read_total = atomic_exchange_explicit(&p->read_total_ns, 0,
++                                                    memory_order_relaxed);
++    uint64_t read_max = atomic_exchange_explicit(&p->read_max_ns, 0,
++                                                  memory_order_relaxed);
++    uint64_t contentions = atomic_exchange_explicit(&p->lock_contentions, 0,
++                                                     memory_order_relaxed);
++    uint64_t short_reads = atomic_exchange_explicit(&p->short_reads, 0,
++                                                     memory_order_relaxed);
++    uint64_t queries = atomic_exchange_explicit(&p->query_count, 0,
++                                                 memory_order_relaxed);
++    uint64_t query_total = atomic_exchange_explicit(&p->query_total_ns, 0,
++                                                     memory_order_relaxed);
++    uint64_t query_max = atomic_exchange_explicit(&p->query_max_ns, 0,
++                                                   memory_order_relaxed);
++    uint64_t query_failures = atomic_exchange_explicit(&p->query_failures, 0,
++                                                        memory_order_relaxed);
++
++    if (!callbacks && !queries)
++        return;
++
++    bool slow = callback_max >= CALLBACK_WARN_NS ||
++                read_max >= CALLBACK_WARN_NS ||
++                query_max >= CLOCK_QUERY_WARN_NS || contentions ||
++                short_reads || query_failures;
++    int level = slow ? MSGL_WARN : MSGL_TRACE;
++    mp_msg(ao->log, level,
++           "OHAudio 10s: cb=%llu avg/max=%.3f/%.3f ms, "
++           "read avg/max=%.3f/%.3f ms, lock-miss=%llu short=%llu, "
++           "clock=%llu avg/max=%.3f/%.3f ms fail=%llu\n",
++           (unsigned long long)callbacks,
++           callbacks ? callback_total / 1e6 / callbacks : 0.0,
++           callback_max / 1e6,
++           callbacks ? read_total / 1e6 / callbacks : 0.0,
++           read_max / 1e6,
++           (unsigned long long)contentions,
++           (unsigned long long)short_reads,
++           (unsigned long long)queries,
++           queries ? query_total / 1e6 / queries : 0.0,
++           query_max / 1e6,
++           (unsigned long long)query_failures);
++}
++
++static MP_THREAD_VOID clock_thread(void *arg)
++{
++    struct ao *ao = arg;
++    struct priv *p = ao->priv;
++    int64_t next_report = mp_time_ns() + STATS_REPORT_INTERVAL_NS;
++
++    mp_thread_set_name("ohaudio-clock");
++    mp_mutex_lock(&p->clock_lock);
++    while (!p->clock_shutdown) {
++        while (!p->clock_shutdown &&
++               !atomic_load_explicit(&p->clock_running, memory_order_acquire))
++            mp_cond_wait(&p->clock_wakeup, &p->clock_lock);
++
++        if (p->clock_shutdown)
++            break;
++
++        uint64_t epoch = atomic_load_explicit(&p->clock_epoch,
++                                               memory_order_acquire);
++        mp_mutex_unlock(&p->clock_lock);
++
++        int64_t position = 0;
++        int64_t timestamp = 0;
++        int64_t query_start = mp_time_ns();
++        OH_AudioStream_Result res = OH_AudioRenderer_GetAudioTimestampInfo(
++            p->renderer, &position, &timestamp);
++        int64_t now = mp_time_ns();
++        uint64_t query_ns = now - query_start;
++
++        atomic_fetch_add_explicit(&p->query_count, 1, memory_order_relaxed);
++        atomic_fetch_add_explicit(&p->query_total_ns, query_ns,
++                                  memory_order_relaxed);
++        atomic_update_max(&p->query_max_ns, query_ns);
++
++        bool valid = res == AUDIOSTREAM_SUCCESS && position >= 0 &&
++                     timestamp > 0 && timestamp <= now &&
++                     now - timestamp < MP_TIME_S_TO_NS(2);
++        if (!valid) {
++            atomic_fetch_add_explicit(&p->query_failures, 1,
++                                      memory_order_relaxed);
++        } else if (atomic_load_explicit(&p->clock_running,
++                                        memory_order_acquire) &&
++                   atomic_load_explicit(&p->clock_epoch,
++                                        memory_order_acquire) == epoch)
++        {
++            atomic_store_explicit(&p->snapshot_position, position,
++                                  memory_order_relaxed);
++            atomic_store_explicit(&p->snapshot_timestamp, timestamp,
++                                  memory_order_relaxed);
++            atomic_store_explicit(&p->snapshot_published_at, now,
++                                  memory_order_relaxed);
++            atomic_store_explicit(&p->snapshot_epoch, epoch,
++                                  memory_order_release);
++        }
++
++        if (now >= next_report) {
++            report_stats(ao);
++            next_report = now + STATS_REPORT_INTERVAL_NS;
++        }
++
++        mp_mutex_lock(&p->clock_lock);
++        if (!p->clock_shutdown &&
++            atomic_load_explicit(&p->clock_running, memory_order_acquire))
++        {
++            mp_cond_timedwait(&p->clock_wakeup, &p->clock_lock,
++                              CLOCK_QUERY_INTERVAL_NS);
++        }
++    }
++    mp_mutex_unlock(&p->clock_lock);
++
++    report_stats(ao);
++    MP_THREAD_RETURN();
++}
++
++static bool start_clock_thread(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++
++    if (mp_mutex_init(&p->clock_lock))
++        return false;
++    if (mp_cond_init(&p->clock_wakeup)) {
++        mp_mutex_destroy(&p->clock_lock);
++        return false;
++    }
++    p->clock_sync_initialized = true;
++
++    if (mp_thread_create(&p->clock_thread, clock_thread, ao))
++        return false;
++    p->clock_thread_created = true;
++    return true;
++}
++
++static void stop_clock_thread(struct priv *p)
++{
++    if (p->clock_thread_created) {
++        mp_mutex_lock(&p->clock_lock);
++        p->clock_shutdown = true;
++        atomic_store_explicit(&p->clock_running, false, memory_order_release);
++        mp_cond_signal(&p->clock_wakeup);
++        mp_mutex_unlock(&p->clock_lock);
++        mp_thread_join(p->clock_thread);
++        p->clock_thread_created = false;
++    }
++
++    if (p->clock_sync_initialized) {
++        mp_cond_destroy(&p->clock_wakeup);
++        mp_mutex_destroy(&p->clock_lock);
++        p->clock_sync_initialized = false;
++    }
++}
++
+ static void uninit(struct ao* ao)
+ {
+     struct priv* p = ao->priv;
+ 
++    stop_clock_thread(p);
++
+     if (p->renderer) {
+         uint32_t underflows;
+         if (OH_AudioRenderer_GetUnderflowCount(p->renderer, &underflows) ==
+@@ -70,11 +312,9 @@ static void uninit(struct ao* ao)
+         OH_AudioStreamBuilder_Destroy(p->builder);
+         p->builder = NULL;
+     }
+-
+-    reset_timing(p);
+ }
+ 
+-static OH_AudioData_Callback_Result audio_on_write_callback(
++static int32_t audio_on_write_callback(
+     OH_AudioRenderer* renderer,
+     void* userData,
+     void* audioData,
+@@ -82,36 +322,50 @@ static OH_AudioData_Callback_Result audio_on_write_callback(
+ {
+     struct ao* ao = userData;
+     struct priv* p = ao->priv;
++    (void)renderer;
+ 
++    int64_t callback_start = mp_time_ns();
+     int samples = audioDataSize / ao->sstride;
+-    int64_t now = mp_time_ns();
++    int64_t now = callback_start;
++
++    uint64_t stream_epoch = atomic_load_explicit(&p->stream_epoch,
++                                                  memory_order_acquire);
++    if (p->callback_stream_epoch != stream_epoch) {
++        p->callback_stream_epoch = stream_epoch;
++        p->frame_position = 0;
++        p->written_frames = 0;
++        p->queued_frames = 0;
++        p->timestamp_valid = false;
++    }
++
+     int64_t written = p->written_frames;
+ 
+-    // The timestamp query may involve audio-service IPC. Keep it outside the
+-    // per-buffer hot path except at the documented >= 200 ms interval.
+-    if (!p->last_query || now - p->last_query >= MP_TIME_MS_TO_NS(250)) {
+-        int64_t position, timestamp;
+-        OH_AudioStream_Result res = OH_AudioRenderer_GetAudioTimestampInfo(
+-            renderer, &position, &timestamp);
+-        p->last_query = now;
+-        if (res == AUDIOSTREAM_SUCCESS && position >= 0 && timestamp > 0 &&
+-            timestamp <= now && now - timestamp < MP_TIME_S_TO_NS(2))
+-        {
+-            // A route change resets position while written frames remain
+-            // cumulative. Start a new local epoch when that happens.
+-            if (p->timestamp_valid && position < p->frame_position) {
+-                p->written_frames = position;
+-                written = position;
+-            }
+-            p->frame_position = position;
+-            p->frame_timestamp = timestamp;
+-            p->timestamp_valid = true;
++    uint64_t clock_epoch = atomic_load_explicit(&p->clock_epoch,
++                                                 memory_order_acquire);
++    uint64_t snapshot_epoch = atomic_load_explicit(&p->snapshot_epoch,
++                                                    memory_order_acquire);
++    int64_t position = atomic_load_explicit(&p->snapshot_position,
++                                             memory_order_relaxed);
++    int64_t timestamp = atomic_load_explicit(&p->snapshot_timestamp,
++                                              memory_order_relaxed);
++    int64_t published_at = atomic_load_explicit(&p->snapshot_published_at,
++                                                 memory_order_relaxed);
++    bool snapshot_valid = snapshot_epoch == clock_epoch && timestamp > 0 &&
++                          timestamp <= now && published_at <= now &&
++                          now - published_at < MP_TIME_S_TO_NS(2);
++
++    if (snapshot_valid) {
++        // A route change can reset the device frame position independently of
++        // mpv's stream epoch. Rebase callback-local accounting when it does.
++        if (p->timestamp_valid && position < p->frame_position) {
++            p->written_frames = position;
++            written = position;
+         }
+-    }
++        p->frame_position = position;
++        p->timestamp_valid = true;
+ 
+-    if (p->timestamp_valid) {
+-        int64_t elapsed = now - p->frame_timestamp;
+-        int64_t played = p->frame_position +
++        int64_t elapsed = now - timestamp;
++        int64_t played = position +
+             elapsed * ao->samplerate / MP_TIME_S_TO_NS(1);
+         played = MPCLAMP(played, 0, written);
+         p->queued_frames = written - played;
+@@ -123,10 +377,34 @@ static OH_AudioData_Callback_Result audio_on_write_callback(
+ 
+     int64_t end_time = now +
+         MP_TIME_S_TO_NS(samples + p->queued_frames) / ao->samplerate;
+-    ao_read_data(ao, &audioData, samples, end_time, NULL, true, true);
+-    p->written_frames += samples;
++    bool lock_contended = false;
++    int64_t read_start = mp_time_ns();
++    int copied = ao_read_data_nonblocking(ao, &audioData, samples, end_time,
++                                          NULL, false, &lock_contended);
++    uint64_t read_ns = mp_time_ns() - read_start;
++    p->written_frames += copied;
++
++    atomic_fetch_add_explicit(&p->callback_count, 1, memory_order_relaxed);
++    atomic_fetch_add_explicit(&p->read_total_ns, read_ns,
++                              memory_order_relaxed);
++    atomic_update_max(&p->read_max_ns, read_ns);
++    if (lock_contended) {
++        atomic_fetch_add_explicit(&p->lock_contentions, 1,
++                                  memory_order_relaxed);
++    } else if (copied < samples &&
++               atomic_load_explicit(&p->clock_running, memory_order_acquire))
++    {
++        atomic_fetch_add_explicit(&p->short_reads, 1, memory_order_relaxed);
++    }
+ 
+-    return AUDIO_DATA_CALLBACK_RESULT_VALID;
++    uint64_t callback_ns = mp_time_ns() - callback_start;
++    atomic_fetch_add_explicit(&p->callback_total_ns, callback_ns,
++                              memory_order_relaxed);
++    atomic_update_max(&p->callback_max_ns, callback_ns);
++
++    // The advanced callback lets OHAudio ignore the untouched tail and back
++    // off briefly when zero bytes are returned after lock contention.
++    return copied * ao->sstride;
+ }
+ 
+ static int init(struct ao* ao)
+@@ -176,8 +454,9 @@ static int init(struct ao* ao)
+         break;
+     }
+ 
+-    OH_AudioRenderer_OnWriteDataCallback callback = audio_on_write_callback;
+-    OH_AudioStreamBuilder_SetRendererWriteDataCallback(p->builder, callback, ao);
++    OH_AudioRenderer_OnWriteDataCallbackAdvanced callback = audio_on_write_callback;
++    OH_AudioStreamBuilder_SetRendererWriteDataCallbackAdvanced(p->builder,
++                                                                callback, ao);
+ 
+     res = OH_AudioStreamBuilder_GenerateRenderer(p->builder, &p->renderer);
+ 
+@@ -186,7 +465,11 @@ static int init(struct ao* ao)
+         goto error;
+     }
+ 
+-    reset_timing(p);
++    init_timing(p);
++    if (!start_clock_thread(ao)) {
++        MP_ERR(ao, "Fail to create OHAudio clock thread.\n");
++        goto error;
++    }
+ 
+     return 0;
+ error:
+@@ -227,9 +510,10 @@ static void reset(struct ao *ao)
+ {
+     struct priv *p = ao->priv;
+ 
++    set_clock_running(p, false);
+     OH_AudioRenderer_Pause(p->renderer);
+     OH_AudioRenderer_Flush(p->renderer);
+-    reset_timing(p);
++    atomic_fetch_add_explicit(&p->stream_epoch, 1, memory_order_acq_rel);
+ }
+ 
+ static bool set_pause(struct ao *ao, bool paused)
+@@ -237,10 +521,13 @@ static bool set_pause(struct ao *ao, bool paused)
+     struct priv *p = ao->priv;
+ 
+     if (paused) {
++        set_clock_running(p, false);
+         OH_AudioRenderer_Pause(p->renderer);
+     } else {
+-        p->last_query = 0;
+-        OH_AudioRenderer_Start(p->renderer);
++        OH_AudioStream_Result res = OH_AudioRenderer_Start(p->renderer);
++        if (res != AUDIOSTREAM_SUCCESS)
++            return false;
++        set_clock_running(p, true);
+     }
+     return true;
+ }
+@@ -249,7 +536,11 @@ static void start(struct ao *ao)
+ {
+     struct priv *p = ao->priv;
+ 
+-    OH_AudioRenderer_Start(p->renderer);
++    OH_AudioStream_Result res = OH_AudioRenderer_Start(p->renderer);
++    if (res == AUDIOSTREAM_SUCCESS)
++        set_clock_running(p, true);
++    else
++        MP_ERR(ao, "Fail to start audio renderer: error code %d.\n", res);
+ }
+ 
+ #define OPT_BASE_STRUCT struct priv
+diff --git a/audio/out/buffer.c b/audio/out/buffer.c
+index 277b52410d..272324d088 100644
+--- a/audio/out/buffer.c
++++ b/audio/out/buffer.c
+@@ -204,13 +204,29 @@ static int ao_read_data_locked(struct ao *ao, void **data, int samples,
+ // If this is called in paused mode, it will always return 0.
+ // The caller should set out_time_ns to the expected delay until the last sample
+ // reaches the speakers, in nanoseconds, using mp_time_ns() as reference.
+-int ao_read_data(struct ao *ao, void **data, int samples, int64_t out_time_ns, bool *eof, bool pad_silence, bool blocking)
++static int ao_read_data_impl(struct ao *ao, void **data, int samples,
++                             int64_t out_time_ns, bool *eof,
++                             bool pad_silence, bool blocking,
++                             bool *lock_contended)
+ {
+     struct buffer_state *p = ao->buffer_state;
+ 
++    if (lock_contended)
++        *lock_contended = false;
++
+     if (blocking) {
+         mp_mutex_lock(&p->lock);
+     } else if (mp_mutex_trylock(&p->lock)) {
++        if (lock_contended)
++            *lock_contended = true;
++        if (eof)
++            *eof = false;
++        // A pull callback must never return an uninitialized device buffer.
++        // On contention, emit silence and let the next callback retry.
++        if (pad_silence && data) {
++            for (int n = 0; n < ao->num_planes; n++)
++                af_fill_silence(data[n], samples * ao->sstride, ao->format);
++        }
+         return 0;
+     }
+ 
+@@ -227,6 +243,21 @@ int ao_read_data(struct ao *ao, void **data, int samples, int64_t out_time_ns, b
+     return pos;
+ }
+ 
++int ao_read_data(struct ao *ao, void **data, int samples, int64_t out_time_ns,
++                 bool *eof, bool pad_silence, bool blocking)
++{
++    return ao_read_data_impl(ao, data, samples, out_time_ns, eof,
++                             pad_silence, blocking, NULL);
++}
++
++int ao_read_data_nonblocking(struct ao *ao, void **data, int samples,
++                             int64_t out_time_ns, bool *eof,
++                             bool pad_silence, bool *lock_contended)
++{
++    return ao_read_data_impl(ao, data, samples, out_time_ns, eof,
++                             pad_silence, false, lock_contended);
++}
++
+ // Same as ao_read_data(), but convert data according to *fmt.
+ // fmt->src_fmt and fmt->channels must be the same as the AO parameters.
+ int ao_read_data_converted(struct ao *ao, struct ao_convert_fmt *fmt,
+diff --git a/audio/out/internal.h b/audio/out/internal.h
+index 85fa777575..5b4b18ae14 100644
+--- a/audio/out/internal.h
++++ b/audio/out/internal.h
+@@ -201,6 +201,9 @@ struct ao_driver {
+ // These functions can be called by AOs.
+ 
+ int ao_read_data(struct ao *ao, void **data, int samples, int64_t out_time_ns, bool *eof, bool pad_silence, bool blocking);
++int ao_read_data_nonblocking(struct ao *ao, void **data, int samples,
++                             int64_t out_time_ns, bool *eof,
++                             bool pad_silence, bool *lock_contended);
+ 
+ bool ao_chmap_sel_adjust(struct ao *ao, const struct mp_chmap_sel *s,
+                          struct mp_chmap *map);
