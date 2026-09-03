@@ -1,0 +1,158 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: SweetVideo <sweetvideo@local>
+Date: Thu, 3 Sep 2026 00:00:00 +0800
+Subject: [PATCH] vo_gpu_next: add adaptive OHOS SDR to HDR output
+
+Prefer a 10-bit EGL surface for opt-in SDR-to-HDR rendering, fall back to
+the normal SDR surface when unavailable, and expose PQ/HLG target color
+spaces to libplacebo so inverse tone mapping stays inside gpu-next.
+---
+ options/options.c                 |  2 ++
+ options/options.h                 |  1 +
+ video/out/ohos_common.c           | 16 +++++++++
+ video/out/ohos_common.h           |  1 +
+ video/out/opengl/context_ohos.c   | 38 +++++++++++++++++++++-
+ 5 files changed, 57 insertions(+), 1 deletion(-)
+
+diff --git a/options/options.c b/options/options.c
+index caa702e..858f7cd 100644
+--- a/options/options.c
++++ b/options/options.c
+@@ -247,6 +247,8 @@ static const m_option_t mp_vo_opt_list[] = {
+ #endif
+ #if HAVE_EGL_OHOS
+     {"ohos-surface-size", OPT_SIZE_BOX(ohos_surface_size)},
++    {"ohos-sdr-to-hdr", OPT_CHOICE(ohos_sdr_to_hdr,
++        {"no", 0}, {"pq", 1}, {"hlg", 2})},
+ #endif
+ #if HAVE_D3D11
+     {"d3d11-composition-size", OPT_SIZE_BOX(d3d11_composition_size)},
+diff --git a/options/options.h b/options/options.h
+index 58fe0eb..9ab7592 100644
+--- a/options/options.h
++++ b/options/options.h
+@@ -87,6 +87,7 @@ typedef struct mp_vo_opts {
+     struct m_geometry android_surface_size;
+ 
+     struct m_geometry ohos_surface_size;
++    int ohos_sdr_to_hdr;
+ 
+     struct m_geometry d3d11_composition_size;
+ 
+diff --git a/video/out/ohos_common.c b/video/out/ohos_common.c
+index 6d769af..9b4930d 100644
+--- a/video/out/ohos_common.c
++++ b/video/out/ohos_common.c
+@@ -30,6 +30,7 @@ struct vo_ohos_state {
+     bool static_metadata_valid;
+     bool hdr_brightness_valid;
+     float hdr_brightness;
++    bool hdr_output_capable;
+ };
+ 
+ static bool is_hdr(const struct pl_color_space *color)
+@@ -152,6 +153,7 @@ bool vo_ohos_init(struct vo *vo)
+ 
+     *ctx = (struct vo_ohos_state){
+         .log = mp_log_new(ctx, vo->log, "ohos"),
++        .hdr_output_capable = true,
+     };
+ 
+     if (vo->opts->WinID == 0 || vo->opts->WinID == -1) {
+@@ -228,10 +230,24 @@ bool vo_ohos_set_surface_size(struct vo *vo, int w, int h)
+     return true;
+ }
+ 
++void vo_ohos_set_hdr_output_capable(struct vo *vo, bool capable)
++{
++    struct vo_ohos_state *ctx = vo->ohos;
++    if (ctx)
++        ctx->hdr_output_capable = capable;
++}
++
+ struct pl_color_space vo_ohos_preferred_csp(struct vo *vo)
+ {
++    struct vo_ohos_state *ctx = vo->ohos;
+     const struct pl_color_space color = vo_get_current_params(vo).color;
+ 
++    if (ctx && ctx->hdr_output_capable && vo->opts->ohos_sdr_to_hdr) {
++        struct pl_color_space target = vo->opts->ohos_sdr_to_hdr == 2
++            ? pl_color_space_bt2020_hlg : pl_color_space_hdr10;
++        return target;
++    }
++
+     if (color.transfer == PL_COLOR_TRC_PQ)
+         return pl_color_space_hdr10;
+     if (color.transfer == PL_COLOR_TRC_HLG)
+diff --git a/video/out/ohos_common.h b/video/out/ohos_common.h
+index 4791a4d..93f0495 100644
+--- a/video/out/ohos_common.h
++++ b/video/out/ohos_common.h
+@@ -31,6 +31,7 @@ void vo_ohos_uninit(struct vo *vo);
+ OHNativeWindow *vo_ohos_native_window(struct vo *vo);
+ bool vo_ohos_surface_size(struct vo *vo, int *w, int *h);
+ bool vo_ohos_set_surface_size(struct vo *vo, int w, int h);
++void vo_ohos_set_hdr_output_capable(struct vo *vo, bool capable);
+ struct pl_color_space vo_ohos_preferred_csp(struct vo *vo);
+ bool vo_ohos_set_color(struct vo *vo, struct mp_image_params *params);
+ void vo_ohos_invalidate_color(struct vo *vo);
+diff --git a/video/out/opengl/context_ohos.c b/video/out/opengl/context_ohos.c
+index 1eb5166..f4d3c49 100644
+--- a/video/out/opengl/context_ohos.c
++++ b/video/out/opengl/context_ohos.c
+@@ -30,6 +30,29 @@ struct priv {
+     EGLSurface egl_surface;
+ };
+ 
++struct hdr_config_selection {
++    EGLDisplay display;
++    bool ten_bit;
++};
++
++static int refine_hdr_config(void *user_data, EGLConfig *configs,
++                             int num_configs)
++{
++    struct hdr_config_selection *selection = user_data;
++    for (int n = 0; n < num_configs; n++) {
++        EGLint red = 0, green = 0, blue = 0, alpha = 0;
++        eglGetConfigAttrib(selection->display, configs[n], EGL_RED_SIZE, &red);
++        eglGetConfigAttrib(selection->display, configs[n], EGL_GREEN_SIZE, &green);
++        eglGetConfigAttrib(selection->display, configs[n], EGL_BLUE_SIZE, &blue);
++        eglGetConfigAttrib(selection->display, configs[n], EGL_ALPHA_SIZE, &alpha);
++        if (red == 10 && green == 10 && blue == 10 && alpha == 2) {
++            selection->ten_bit = true;
++            return n;
++        }
++    }
++    return 0;
++}
++
+ static pl_color_space_t ohos_preferred_csp(struct ra_ctx *ctx)
+ {
+     return vo_ohos_preferred_csp(ctx->vo);
+@@ -76,9 +99,22 @@ static bool ohos_init(struct ra_ctx *ctx)
+     }
+ 
+     EGLConfig config;
+-    if (!mpegl_create_context(ctx, p->egl_display, &p->egl_context, &config))
++    bool hdr_requested = ctx->vo->opts->ohos_sdr_to_hdr != 0;
++    struct hdr_config_selection selection = {.display = p->egl_display};
++    struct mpegl_cb config_cb = {0};
++    if (hdr_requested) {
++        config_cb.refine_config = refine_hdr_config;
++        config_cb.user_data = &selection;
++    }
++    if (!mpegl_create_context_cb(ctx, p->egl_display, config_cb,
++                                 &p->egl_context, &config))
+         goto fail;
+ 
++    vo_ohos_set_hdr_output_capable(ctx->vo,
++                                   !hdr_requested || selection.ten_bit);
++    if (hdr_requested && !selection.ten_bit)
++        MP_WARN(ctx, "No 10-bit EGLConfig; SDR-to-HDR disabled for this Surface\n");
++
+     OHNativeWindow *native_window = vo_ohos_native_window(ctx->vo);
+     EGLint native_visual_id = 0;
+     if (!eglGetConfigAttrib(p->egl_display, config, EGL_NATIVE_VISUAL_ID,
+-- 
+2.50.1
