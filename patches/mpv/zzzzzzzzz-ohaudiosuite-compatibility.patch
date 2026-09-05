@@ -1,0 +1,142 @@
+diff --git a/audio/out/ao_ohaudio.c b/audio/out/ao_ohaudio.c
+index 8c789b7..3c93a32 100644
+--- a/audio/out/ao_ohaudio.c
++++ b/audio/out/ao_ohaudio.c
+@@ -19,6 +19,7 @@
+  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
+  */
+ 
++#include "config.h"
+ #include "ao.h"
+ #include "internal.h"
+ #include "common/msg.h"
+@@ -39,7 +40,6 @@
+ #define STATS_REPORT_INTERVAL_NS MP_TIME_S_TO_NS(10)
+ #define CALLBACK_WARN_NS MP_TIME_MS_TO_NS(5)
+ #define CLOCK_QUERY_WARN_NS MP_TIME_MS_TO_NS(20)
+-#define SUITE_CALLBACK_FRAMES 1024
+ #define SUITE_SCRATCH_SIZE (256 * 1024)
+ 
+ enum suite_effect {
+@@ -397,7 +397,9 @@ static OH_AudioNode_Type suite_node_type(int effect)
+     case SUITE_EFFECT_PURE_VOICE_CHANGE:    return EFFECT_NODE_TYPE_PURE_VOICE_CHANGE;
+     case SUITE_EFFECT_GENERAL_VOICE_CHANGE: return EFFECT_NODE_TYPE_GENERAL_VOICE_CHANGE;
+     case SUITE_EFFECT_TEMPO_PITCH:          return EFFECT_NODE_TYPE_TEMPO_PITCH;
++#if HAVE_OHAUDIOSUITE_HOA
+     case SUITE_EFFECT_HOA_SPACE_RENDER:     return EFFECT_NODE_TYPE_HOA_SPACE_RENDER;
++#endif
+     default:                                return INPUT_NODE_TYPE_DEFAULT;
+     }
+ }
+@@ -476,7 +478,10 @@ static void select_suite_formats(struct ao *ao)
+ 
+     ao->samplerate = input_rate;
+     ao->format = input_format;
+-    mp_chmap_from_channels(&ao->channels, input_channels);
++    // HOA coefficients must retain the input track's channel order. A normal
++    // speaker layout here would cause mpv's converter to remix those channels.
++    if (p->suite_effect != SUITE_EFFECT_HOA_SPACE_RENDER)
++        mp_chmap_from_channels(&ao->channels, input_channels);
+ 
+     p->suite_input_format = (OH_AudioFormat) {
+         .samplingRate = (OH_Audio_SampleRate)input_rate,
+@@ -817,6 +822,7 @@ static int render_audio_suite(struct ao *ao, void *audio_data,
+         };
+         res = OH_AudioSuiteEngine_MultiRenderFrame(p->suite_pipeline, &array,
+                                                    &response_size, &finished);
++        response_size = MPCLAMP(response_size, 0, audio_data_size);
+         if (res == AUDIOSUITE_SUCCESS &&
+             p->suite_separation_output == SUITE_SEPARATION_MIX)
+         {
+@@ -963,14 +969,41 @@ static int init(struct ao* ao)
+         goto error;
+     }
+ 
++#if !HAVE_OHAUDIOSUITE_HOA
++    if (p->suite_effect == SUITE_EFFECT_HOA_SPACE_RENDER) {
++        MP_WARN(ao, "AudioSuite HOA is unavailable in this build's SDK; "
++                    "using plain OHAudio output.\n");
++        p->suite_effect = SUITE_EFFECT_OFF;
++    }
++#endif
++
++    if (p->suite_effect == SUITE_EFFECT_HOA_SPACE_RENDER) {
++        int channels;
++        suite_hoa_layout(p->suite_hoa_layout, &channels);
++        if (ao->channels.num != channels) {
++            MP_WARN(ao, "AudioSuite HOA needs %d input channels, got %d; "
++                        "using plain OHAudio output.\n", channels,
++                        ao->channels.num);
++            p->suite_effect = SUITE_EFFECT_OFF;
++        }
++    }
++
+     if (p->suite_effect != SUITE_EFFECT_OFF) {
++        int original_rate = ao->samplerate;
++        int original_format = ao->format;
++        struct mp_chmap original_channels = ao->channels;
+         select_suite_formats(ao);
+         if (p->encoding_type != AUDIOSTREAM_ENCODING_TYPE_RAW)
+             MP_WARN(ao, "AudioSuite requires raw PCM; ignoring encoding_type=%d.\n",
+                     p->encoding_type);
+-        if (!init_audio_suite(ao))
++        if (!init_audio_suite(ao)) {
+             MP_WARN(ao, "Continuing with plain OHAudio output.\n");
+-    } else {
++            ao->samplerate = original_rate;
++            ao->format = original_format;
++            ao->channels = original_channels;
++        }
++    }
++    if (!p->suite_active) {
+         ao->channels.num = MPCLAMP(ao->channels.num, 1, 16);
+         ao->samplerate = MPCLAMP(ao->samplerate, 8000, 192000);
+         if (af_fmt_is_int(ao->format)) {
+@@ -1014,9 +1047,6 @@ static int init(struct ao* ao)
+     if (res == AUDIOSTREAM_SUCCESS)
+         res = OH_AudioStreamBuilder_SetSampleFormat(
+             p->builder, stream_sample_format(renderer_format));
+-    if (res == AUDIOSTREAM_SUCCESS && p->suite_active)
+-        res = OH_AudioStreamBuilder_SetFrameSizeInCallback(
+-            p->builder, SUITE_CALLBACK_FRAMES);
+     if (res != AUDIOSTREAM_SUCCESS) {
+         MP_ERR(ao, "Fail to configure audio stream: error code %d.\n", res);
+         goto error;
+diff --git a/meson.build b/meson.build
+index 28013e4..39d6448 100644
+--- a/meson.build
++++ b/meson.build
+@@ -478,6 +478,8 @@ if features['android']
+ endif
+ 
+ features += {'ohos': get_option('ohos').enabled()}
++features += {'ohaudiosuite-hoa': features['ohos'] and cc.has_header_symbol(
++    'ohaudiosuite/native_audio_suite_base.h', 'EFFECT_NODE_TYPE_HOA_SPACE_RENDER')}
+ if features['ohos']
+     dependencies += [cc.find_library('ohaudio'),
+                      cc.find_library('ohaudiosuite'),
+diff --git a/DOCS/man/ao.rst b/DOCS/man/ao.rst
+index 98e1053..e4311d6 100644
+--- a/DOCS/man/ao.rst
++++ b/DOCS/man/ao.rst
+@@ -165,7 +165,9 @@ Available audio output drivers are:
+ ``ohaudio`` (HarmonyOS only)
+     Native HarmonyOS audio output. OHAudioSuite processing is disabled by
+     default and requires API 23 or newer (HOA space rendering requires API
+-    26). Unsupported effects fall back to plain OHAudio output.
++    26). The build SDK must also expose the HOA node declaration; some
++    OpenHarmony SDKs do not provide it. Such builds disable HOA processing.
++    Unsupported effects fall back to plain OHAudio output.
+ 
+     ``--ohaudio-suite-effect=<effect>``
+         Select ``off``, ``equalizer``, ``noise-reduction``, ``sound-field``,
+@@ -219,7 +221,8 @@ Available audio output drivers are:
+     ``--ohaudio-suite-hoa-layout=<layout>``
+         Select a first-, second-, or third-order ``acn-n3d``, ``acn-sn3d``, or
+         ``fuma`` HOA layout. The decoded channel order must already match the
+-        selected layout.
++        selected layout and contain exactly 4, 9, or 16 channels respectively.
++        Other channel counts fall back to normal playback without HOA processing.
+ 
+ ``openal``
+     OpenAL audio output driver.
