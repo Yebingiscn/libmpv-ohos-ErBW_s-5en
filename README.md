@@ -1,7 +1,12 @@
 # libmpv-ohos-build
 
-Build scripts of [libmpv](https://github.com/mpv-player/mpv) for ohos-arm64 (API 15+).
-The native dependencies are compiled with the HarmonyOS 7.0 Beta1 API 26 NDK.
+Build scripts of [libmpv](https://github.com/mpv-player/mpv) for ohos-arm64.
+The AudioSuite integration requires API 23+, with HOA rendering requiring API 26.
+Linux CI uses the pinned HarmonyOS 7.0 Release public NDK `26.0.0.38`
+(`20260829` archive, verified by SHA-256). Its AudioSuite base and engine headers
+are identical to the local DevEco `26.0.0.105` SDK headers.
+The SDK preflight checks version, API 26 AVCodec declarations, and the HOA node;
+the final binary check also requires the `ohaudiosuite-hoa` feature.
 
 Scripts are compatible with macOS, Linux and WSL, Windows is not supported.
 

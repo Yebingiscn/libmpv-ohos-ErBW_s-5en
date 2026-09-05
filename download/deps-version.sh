@@ -2,9 +2,13 @@
 
 set -eu
 
-# HarmonyOS SDK version. API 26 is provided by the 7.0 Beta1 public NDK.
-V_SDK=7.0-Beta1
+# Public API 26 Release NDK. AudioSuite headers match DevEco 26.0.0.105,
+# including the HOA node missing from the older Beta1 public package.
+V_SDK=7.0-Release
 V_SDK_REPOSITORY=harmonyos
+V_SDK_ARCHIVE=ohos-sdk-windows_linux-public_20260829.tar.gz
+V_SDK_SHA256=6bf6ae1efe8de0e8bd15ddbd7fac58bcb54d9620262a541b9b219439317a4c42
+V_SDK_NATIVE_VERSION=26.0.0.38
 
 # FFmpeg TLS/AV1 dependencies. Keep Mbed TLS on the supported 3.6 LTS ABI;
 # moving to the 4.x ABI needs a separate FFmpeg adapter validation.

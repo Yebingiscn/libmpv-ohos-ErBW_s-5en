@@ -16,7 +16,7 @@ fi
 features=$("$STRINGS" "$LIBMPV" | grep "^List of enabled features:")
 configuration=$("$STRINGS" "$LIBMPV" | grep "^Configuration:")
 
-for feature in dvdnav libarchive libbluray ohos; do
+for feature in dvdnav libarchive libbluray ohos ohaudiosuite-hoa; do
   if ! grep -Eq "(^| )$feature( |$)" <<< "$features"; then
     echo "Missing mpv feature: $feature" >&2
     exit 1
