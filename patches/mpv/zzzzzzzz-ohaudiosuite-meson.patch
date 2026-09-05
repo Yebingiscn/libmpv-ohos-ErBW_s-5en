@@ -1,0 +1,12 @@
+diff --git a/meson.build b/meson.build
+index dfbe327..28013e4 100644
+--- a/meson.build
++++ b/meson.build
+@@ -480,6 +480,7 @@ endif
+ features += {'ohos': get_option('ohos').enabled()}
+ if features['ohos']
+     dependencies += [cc.find_library('ohaudio'),
++                     cc.find_library('ohaudiosuite'),
+                      cc.find_library('native_media_codecbase'),
+                      cc.find_library('native_media_core'),
+                      cc.find_library('native_media_vdec'),

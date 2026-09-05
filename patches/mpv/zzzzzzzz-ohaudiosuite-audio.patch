@@ -1,0 +1,908 @@
+diff --git a/audio/out/ao_ohaudio.c b/audio/out/ao_ohaudio.c
+index c439cf8..a612c46 100644
+--- a/audio/out/ao_ohaudio.c
++++ b/audio/out/ao_ohaudio.c
+@@ -28,19 +28,67 @@
+ #include "osdep/timer.h"
+ 
+ #include <stdatomic.h>
++#include <string.h>
+ 
+ #include <ohaudio/native_audiorenderer.h>
+ #include <ohaudio/native_audiostreambuilder.h>
++#include <ohaudiosuite/native_audio_suite_base.h>
++#include <ohaudiosuite/native_audio_suite_engine.h>
+ 
+ #define CLOCK_QUERY_INTERVAL_NS MP_TIME_MS_TO_NS(250)
+ #define STATS_REPORT_INTERVAL_NS MP_TIME_S_TO_NS(10)
+ #define CALLBACK_WARN_NS MP_TIME_MS_TO_NS(5)
+ #define CLOCK_QUERY_WARN_NS MP_TIME_MS_TO_NS(20)
++#define SUITE_CALLBACK_FRAMES 1024
++#define SUITE_SCRATCH_SIZE (256 * 1024)
++
++enum suite_effect {
++    SUITE_EFFECT_OFF = 0,
++    SUITE_EFFECT_EQUALIZER,
++    SUITE_EFFECT_NOISE_REDUCTION,
++    SUITE_EFFECT_SOUND_FIELD,
++    SUITE_EFFECT_AUDIO_SEPARATION,
++    SUITE_EFFECT_VOICE_BEAUTIFIER,
++    SUITE_EFFECT_ENVIRONMENT,
++    SUITE_EFFECT_AUDIO_MIXER,
++    SUITE_EFFECT_SPACE_RENDER,
++    SUITE_EFFECT_PURE_VOICE_CHANGE,
++    SUITE_EFFECT_GENERAL_VOICE_CHANGE,
++    SUITE_EFFECT_TEMPO_PITCH,
++    SUITE_EFFECT_HOA_SPACE_RENDER,
++};
++
++enum suite_space_mode {
++    SUITE_SPACE_POSITION = 0,
++    SUITE_SPACE_ROTATION,
++    SUITE_SPACE_EXTENSION,
++};
++
++enum suite_separation_output {
++    SUITE_SEPARATION_VOCALS = 0,
++    SUITE_SEPARATION_ACCOMPANIMENT,
++    SUITE_SEPARATION_MIX,
++};
+ 
+ struct priv {
+     OH_AudioStreamBuilder* builder;
+     OH_AudioRenderer *renderer;
+ 
++    OH_AudioSuiteEngine *suite_engine;
++    OH_AudioSuitePipeline *suite_pipeline;
++    OH_AudioNode *suite_input;
++    OH_AudioNode *suite_effect_node;
++    OH_AudioNode *suite_output;
++    void *suite_scratch;
++    bool suite_active;
++    bool suite_render_failed;
++    OH_AudioFormat suite_input_format;
++    OH_AudioFormat suite_output_format;
++    int suite_input_stride;
++    int suite_output_stride;
++    int suite_output_rate;
++    int64_t suite_end_time;
++
+     mp_thread clock_thread;
+     mp_mutex clock_lock;
+     mp_cond clock_wakeup;
+@@ -76,6 +124,28 @@ struct priv {
+     atomic_uint_fast64_t query_failures;
+ 
+     int encoding_type;
++    int suite_effect;
++    int suite_eq_preset;
++    int suite_eq_gains[10];
++    int suite_sound_field;
++    int suite_environment;
++    int suite_beautifier;
++    int suite_space_mode;
++    float suite_space_x;
++    float suite_space_y;
++    float suite_space_z;
++    int suite_space_time;
++    int suite_space_direction;
++    float suite_space_radius;
++    int suite_space_angle;
++    int suite_pure_gender;
++    int suite_pure_type;
++    float suite_pure_pitch;
++    int suite_general_type;
++    float suite_tempo;
++    float suite_pitch;
++    int suite_separation_output;
++    int suite_hoa_layout;
+ };
+ 
+ static void atomic_update_max(atomic_uint_fast64_t *value, uint64_t sample)
+@@ -293,6 +363,410 @@ static void stop_clock_thread(struct priv *p)
+     }
+ }
+ 
++static const char *suite_effect_name(int effect)
++{
++    switch (effect) {
++    case SUITE_EFFECT_EQUALIZER:           return "equalizer";
++    case SUITE_EFFECT_NOISE_REDUCTION:     return "noise-reduction";
++    case SUITE_EFFECT_SOUND_FIELD:         return "sound-field";
++    case SUITE_EFFECT_AUDIO_SEPARATION:    return "audio-separation";
++    case SUITE_EFFECT_VOICE_BEAUTIFIER:    return "voice-beautifier";
++    case SUITE_EFFECT_ENVIRONMENT:         return "environment";
++    case SUITE_EFFECT_AUDIO_MIXER:         return "audio-mixer";
++    case SUITE_EFFECT_SPACE_RENDER:        return "space-render";
++    case SUITE_EFFECT_PURE_VOICE_CHANGE:   return "pure-voice-change";
++    case SUITE_EFFECT_GENERAL_VOICE_CHANGE:return "general-voice-change";
++    case SUITE_EFFECT_TEMPO_PITCH:         return "tempo-pitch";
++    case SUITE_EFFECT_HOA_SPACE_RENDER:    return "hoa-space-render";
++    default:                               return "off";
++    }
++}
++
++static OH_AudioNode_Type suite_node_type(int effect)
++{
++    switch (effect) {
++    case SUITE_EFFECT_EQUALIZER:            return EFFECT_NODE_TYPE_EQUALIZER;
++    case SUITE_EFFECT_NOISE_REDUCTION:      return EFFECT_NODE_TYPE_NOISE_REDUCTION;
++    case SUITE_EFFECT_SOUND_FIELD:          return EFFECT_NODE_TYPE_SOUND_FIELD;
++    case SUITE_EFFECT_AUDIO_SEPARATION:
++        return EFFECT_MULTII_OUTPUT_NODE_TYPE_AUDIO_SEPARATION;
++    case SUITE_EFFECT_VOICE_BEAUTIFIER:     return EFFECT_NODE_TYPE_VOICE_BEAUTIFIER;
++    case SUITE_EFFECT_ENVIRONMENT:          return EFFECT_NODE_TYPE_ENVIRONMENT_EFFECT;
++    case SUITE_EFFECT_AUDIO_MIXER:          return EFFECT_NODE_TYPE_AUDIO_MIXER;
++    case SUITE_EFFECT_SPACE_RENDER:         return EFFECT_NODE_TYPE_SPACE_RENDER;
++    case SUITE_EFFECT_PURE_VOICE_CHANGE:    return EFFECT_NODE_TYPE_PURE_VOICE_CHANGE;
++    case SUITE_EFFECT_GENERAL_VOICE_CHANGE: return EFFECT_NODE_TYPE_GENERAL_VOICE_CHANGE;
++    case SUITE_EFFECT_TEMPO_PITCH:          return EFFECT_NODE_TYPE_TEMPO_PITCH;
++    case SUITE_EFFECT_HOA_SPACE_RENDER:     return EFFECT_NODE_TYPE_HOA_SPACE_RENDER;
++    default:                                return INPUT_NODE_TYPE_DEFAULT;
++    }
++}
++
++static OH_AudioChannelLayout suite_hoa_layout(int layout, int *channels)
++{
++    static const OH_AudioChannelLayout layouts[] = {
++        CH_LAYOUT_AMB_ORDER1_ACN_N3D,
++        CH_LAYOUT_AMB_ORDER1_ACN_SN3D,
++        CH_LAYOUT_AMB_ORDER1_FUMA,
++        CH_LAYOUT_AMB_ORDER2_ACN_N3D,
++        CH_LAYOUT_AMB_ORDER2_ACN_SN3D,
++        CH_LAYOUT_AMB_ORDER2_FUMA,
++        CH_LAYOUT_AMB_ORDER3_ACN_N3D,
++        CH_LAYOUT_AMB_ORDER3_ACN_SN3D,
++        CH_LAYOUT_AMB_ORDER3_FUMA,
++    };
++    layout = MPCLAMP(layout, 0, (int)MP_ARRAY_SIZE(layouts) - 1);
++    *channels = layout < 3 ? 4 : layout < 6 ? 9 : 16;
++    return layouts[layout];
++}
++
++static OH_Audio_SampleFormat suite_sample_format(int format)
++{
++    switch (format) {
++    case AF_FORMAT_U8:    return AUDIO_SAMPLE_U8;
++    case AF_FORMAT_S32:   return AUDIO_SAMPLE_S32LE;
++    case AF_FORMAT_FLOAT: return AUDIO_SAMPLE_F32LE;
++    default:              return AUDIO_SAMPLE_S16LE;
++    }
++}
++
++static OH_AudioStream_SampleFormat stream_sample_format(int format)
++{
++    switch (format) {
++    case AF_FORMAT_U8:    return AUDIOSTREAM_SAMPLE_U8;
++    case AF_FORMAT_S32:   return AUDIOSTREAM_SAMPLE_S32LE;
++    case AF_FORMAT_FLOAT: return AUDIOSTREAM_SAMPLE_F32LE;
++    default:              return AUDIOSTREAM_SAMPLE_S16LE;
++    }
++}
++
++static void select_suite_formats(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++    int input_rate = 48000;
++    int input_channels = 2;
++    int input_format = AF_FORMAT_S16;
++    int output_rate = 48000;
++    int output_channels = 2;
++    int output_format = AF_FORMAT_S16;
++    OH_AudioChannelLayout input_layout = CH_LAYOUT_STEREO;
++
++    switch (p->suite_effect) {
++    case SUITE_EFFECT_NOISE_REDUCTION:
++    case SUITE_EFFECT_PURE_VOICE_CHANGE:
++        input_rate = output_rate = 16000;
++        input_channels = output_channels = 1;
++        input_layout = CH_LAYOUT_MONO;
++        break;
++    case SUITE_EFFECT_TEMPO_PITCH:
++        input_channels = output_channels = 1;
++        input_layout = CH_LAYOUT_MONO;
++        break;
++    case SUITE_EFFECT_AUDIO_SEPARATION:
++    case SUITE_EFFECT_AUDIO_MIXER:
++        input_format = output_format = AF_FORMAT_FLOAT;
++        break;
++    case SUITE_EFFECT_HOA_SPACE_RENDER:
++        input_layout = suite_hoa_layout(p->suite_hoa_layout, &input_channels);
++        input_format = output_format = AF_FORMAT_S32;
++        break;
++    default:
++        break;
++    }
++
++    ao->samplerate = input_rate;
++    ao->format = input_format;
++    mp_chmap_from_channels(&ao->channels, input_channels);
++
++    p->suite_input_format = (OH_AudioFormat) {
++        .samplingRate = (OH_Audio_SampleRate)input_rate,
++        .channelLayout = input_layout,
++        .channelCount = input_channels,
++        .encodingType = AUDIO_ENCODING_TYPE_RAW,
++        .sampleFormat = suite_sample_format(input_format),
++    };
++    p->suite_output_format = (OH_AudioFormat) {
++        .samplingRate = (OH_Audio_SampleRate)output_rate,
++        .channelLayout = output_channels == 1 ? CH_LAYOUT_MONO : CH_LAYOUT_STEREO,
++        .channelCount = output_channels,
++        .encodingType = AUDIO_ENCODING_TYPE_RAW,
++        .sampleFormat = suite_sample_format(output_format),
++    };
++    p->suite_input_stride = af_fmt_to_bytes(input_format) * input_channels;
++    p->suite_output_stride = af_fmt_to_bytes(output_format) * output_channels;
++    p->suite_output_rate = output_rate;
++}
++
++static int32_t suite_request_data(OH_AudioNode *node, void *user_data,
++                                  void *audio_data, int32_t audio_data_size,
++                                  bool *finished)
++{
++    struct ao *ao = user_data;
++    struct priv *p = ao->priv;
++    (void)node;
++
++    *finished = false;
++    int samples = audio_data_size / p->suite_input_stride;
++    int bytes = samples * p->suite_input_stride;
++    void *data = audio_data;
++    bool lock_contended = false;
++    int64_t read_start = mp_time_ns();
++    int copied = ao_read_data_nonblocking(ao, &data, samples,
++                                          p->suite_end_time, NULL, true,
++                                          &lock_contended);
++    uint64_t read_ns = mp_time_ns() - read_start;
++
++    atomic_fetch_add_explicit(&p->read_total_ns, read_ns,
++                              memory_order_relaxed);
++    atomic_update_max(&p->read_max_ns, read_ns);
++    if (lock_contended) {
++        atomic_fetch_add_explicit(&p->lock_contentions, 1,
++                                  memory_order_relaxed);
++    } else if (copied < samples &&
++               atomic_load_explicit(&p->clock_running, memory_order_acquire))
++    {
++        atomic_fetch_add_explicit(&p->short_reads, 1, memory_order_relaxed);
++    }
++
++    // AudioSuite repeatedly pulls until its output request is full. Supplying
++    // the silence already written by ao_read_data_nonblocking prevents a
++    // real-time RenderFrame call from spinning or timing out on an underrun.
++    if (bytes < audio_data_size)
++        memset((char *)audio_data + bytes, 0, audio_data_size - bytes);
++    return audio_data_size;
++}
++
++static bool suite_create_node(struct ao *ao, OH_AudioNodeBuilder *builder,
++                              OH_AudioNode_Type type,
++                              const OH_AudioFormat *format,
++                              OH_InputNode_RequestDataCallback callback,
++                              OH_AudioNode **node)
++{
++    struct priv *p = ao->priv;
++    OH_AudioSuite_Result res = OH_AudioSuiteNodeBuilder_Reset(builder);
++    if (res == AUDIOSUITE_SUCCESS)
++        res = OH_AudioSuiteNodeBuilder_SetNodeType(builder, type);
++    if (res == AUDIOSUITE_SUCCESS && format)
++        res = OH_AudioSuiteNodeBuilder_SetFormat(builder, *format);
++    if (res == AUDIOSUITE_SUCCESS && callback)
++        res = OH_AudioSuiteNodeBuilder_SetRequestDataCallback(builder,
++                                                               callback, ao);
++    if (res == AUDIOSUITE_SUCCESS)
++        res = OH_AudioSuiteEngine_CreateNode(p->suite_pipeline, builder, node);
++    if (res != AUDIOSUITE_SUCCESS) {
++        MP_WARN(ao, "AudioSuite failed to create node %d: error code %d.\n",
++                type, res);
++        return false;
++    }
++    return true;
++}
++
++static OH_AudioSuite_Result configure_suite_effect(struct priv *p)
++{
++    static const int32_t eq_presets[][10] = {
++        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
++        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
++        {3, 5, 2, -4, 1, 2, -3, 1, 4, 5},
++        {0, 0, 2, 0, 0, 4, 4, 2, 2, 5},
++        {2, 3, 2, 1, 0, 0, -5, -5, -5, -6},
++        {4, 3, 2, -3, 0, 0, 5, 4, 2, 0},
++        {2, 0, 2, 3, 6, 5, -1, 3, 4, 4},
++        {5, 2, 1, -1, -5, -5, -2, 1, 2, 4},
++        {1, 4, 5, 3, -2, -2, 2, 3, 5, 5},
++        {6, 4, 4, 2, 0, 1, 3, 3, 5, 4},
++    };
++
++    switch (p->suite_effect) {
++    case SUITE_EFFECT_EQUALIZER: {
++        OH_EqualizerFrequencyBandGains gains;
++        const int32_t *source = p->suite_eq_preset
++            ? eq_presets[MPCLAMP(p->suite_eq_preset, 1,
++                                 (int)MP_ARRAY_SIZE(eq_presets) - 1)]
++            : p->suite_eq_gains;
++        memcpy(gains.gains, source, sizeof(gains.gains));
++        return OH_AudioSuiteEngine_SetEqualizerFrequencyBandGains(
++            p->suite_effect_node, gains);
++    }
++    case SUITE_EFFECT_SOUND_FIELD:
++        return OH_AudioSuiteEngine_SetSoundFieldType(
++            p->suite_effect_node, (OH_SoundFieldType)p->suite_sound_field);
++    case SUITE_EFFECT_VOICE_BEAUTIFIER:
++        return OH_AudioSuiteEngine_SetVoiceBeautifierType(
++            p->suite_effect_node,
++            (OH_VoiceBeautifierType)p->suite_beautifier);
++    case SUITE_EFFECT_ENVIRONMENT:
++        return OH_AudioSuiteEngine_SetEnvironmentType(
++            p->suite_effect_node, (OH_EnvironmentType)p->suite_environment);
++    case SUITE_EFFECT_SPACE_RENDER:
++        if (p->suite_space_mode == SUITE_SPACE_ROTATION) {
++            OH_AudioSuite_SpaceRenderRotationParams params = {
++                .x = p->suite_space_x,
++                .y = p->suite_space_y,
++                .z = p->suite_space_z,
++                .surroundTime = p->suite_space_time,
++                .surroundDirection = p->suite_space_direction,
++            };
++            return OH_AudioSuiteEngine_SetSpaceRenderRotationParams(
++                p->suite_effect_node, params);
++        } else if (p->suite_space_mode == SUITE_SPACE_EXTENSION) {
++            OH_AudioSuite_SpaceRenderExtensionParams params = {
++                .extRadius = p->suite_space_radius,
++                .extAngle = p->suite_space_angle,
++            };
++            return OH_AudioSuiteEngine_SetSpaceRenderExtensionParams(
++                p->suite_effect_node, params);
++        } else {
++            OH_AudioSuite_SpaceRenderPositionParams params = {
++                .x = p->suite_space_x,
++                .y = p->suite_space_y,
++                .z = p->suite_space_z,
++            };
++            return OH_AudioSuiteEngine_SetSpaceRenderPositionParams(
++                p->suite_effect_node, params);
++        }
++    case SUITE_EFFECT_PURE_VOICE_CHANGE: {
++        OH_AudioSuite_PureVoiceChangeOption option = {
++            .optionGender = p->suite_pure_gender,
++            .optionType = p->suite_pure_type,
++            .pitch = p->suite_pure_pitch,
++        };
++        return OH_AudioSuiteEngine_SetPureVoiceChangeOption(
++            p->suite_effect_node, option);
++    }
++    case SUITE_EFFECT_GENERAL_VOICE_CHANGE:
++        return OH_AudioSuiteEngine_SetGeneralVoiceChangeType(
++            p->suite_effect_node, p->suite_general_type);
++    case SUITE_EFFECT_TEMPO_PITCH:
++        return OH_AudioSuiteEngine_SetTempoAndPitch(
++            p->suite_effect_node, p->suite_tempo, p->suite_pitch);
++    default:
++        return AUDIOSUITE_SUCCESS;
++    }
++}
++
++static void uninit_audio_suite(struct priv *p)
++{
++    if (p->suite_pipeline)
++        OH_AudioSuiteEngine_StopPipeline(p->suite_pipeline);
++    p->suite_active = false;
++    if (p->suite_effect_node) {
++        OH_AudioSuiteEngine_DestroyNode(p->suite_effect_node);
++        p->suite_effect_node = NULL;
++    }
++    if (p->suite_output) {
++        OH_AudioSuiteEngine_DestroyNode(p->suite_output);
++        p->suite_output = NULL;
++    }
++    if (p->suite_input) {
++        OH_AudioSuiteEngine_DestroyNode(p->suite_input);
++        p->suite_input = NULL;
++    }
++    if (p->suite_pipeline) {
++        OH_AudioSuiteEngine_DestroyPipeline(p->suite_pipeline);
++        p->suite_pipeline = NULL;
++    }
++    if (p->suite_engine) {
++        OH_AudioSuiteEngine_Destroy(p->suite_engine);
++        p->suite_engine = NULL;
++    }
++    talloc_free(p->suite_scratch);
++    p->suite_scratch = NULL;
++}
++
++static bool init_audio_suite(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++    OH_AudioNodeBuilder *builder = NULL;
++    OH_AudioNode_Type effect_type = suite_node_type(p->suite_effect);
++    OH_AudioSuite_Result res;
++    bool supported = false;
++
++    res = OH_AudioSuiteEngine_IsNodeTypeSupported(effect_type, &supported);
++    if (res != AUDIOSUITE_SUCCESS || !supported) {
++        MP_WARN(ao, "AudioSuite effect '%s' is not supported on this device.\n",
++                suite_effect_name(p->suite_effect));
++        return false;
++    }
++    if (OH_AudioSuiteEngine_Create(&p->suite_engine) != AUDIOSUITE_SUCCESS ||
++        OH_AudioSuiteEngine_CreatePipeline(p->suite_engine,
++                                           &p->suite_pipeline,
++                                           AUDIOSUITE_PIPELINE_REALTIME_MODE) !=
++            AUDIOSUITE_SUCCESS ||
++        OH_AudioSuiteNodeBuilder_Create(&builder) != AUDIOSUITE_SUCCESS)
++    {
++        MP_WARN(ao, "AudioSuite failed to create the real-time pipeline.\n");
++        goto error;
++    }
++
++    if (!suite_create_node(ao, builder, INPUT_NODE_TYPE_DEFAULT,
++                           &p->suite_input_format, suite_request_data,
++                           &p->suite_input) ||
++        !suite_create_node(ao, builder, effect_type, NULL, NULL,
++                           &p->suite_effect_node) ||
++        !suite_create_node(ao, builder, OUTPUT_NODE_TYPE_DEFAULT,
++                           &p->suite_output_format, NULL, &p->suite_output))
++        goto error;
++
++    res = configure_suite_effect(p);
++    if (res != AUDIOSUITE_SUCCESS) {
++        MP_WARN(ao, "AudioSuite failed to configure '%s': error code %d.\n",
++                suite_effect_name(p->suite_effect), res);
++        goto error;
++    }
++    if (OH_AudioSuiteEngine_ConnectNodes(p->suite_input,
++                                         p->suite_effect_node) !=
++            AUDIOSUITE_SUCCESS ||
++        OH_AudioSuiteEngine_ConnectNodes(p->suite_effect_node,
++                                         p->suite_output) !=
++            AUDIOSUITE_SUCCESS)
++    {
++        MP_WARN(ao, "AudioSuite failed to connect the '%s' pipeline.\n",
++                suite_effect_name(p->suite_effect));
++        goto error;
++    }
++    res = OH_AudioSuiteEngine_StartPipeline(p->suite_pipeline);
++    if (res != AUDIOSUITE_SUCCESS) {
++        MP_WARN(ao, "AudioSuite failed to start '%s': error code %d.\n",
++                suite_effect_name(p->suite_effect), res);
++        goto error;
++    }
++
++    if (p->suite_effect == SUITE_EFFECT_AUDIO_SEPARATION) {
++        p->suite_scratch = talloc_size(ao, SUITE_SCRATCH_SIZE);
++        if (!p->suite_scratch) {
++            MP_WARN(ao, "AudioSuite failed to allocate separation buffer.\n");
++            goto error;
++        }
++    }
++    p->suite_active = true;
++    OH_AudioSuiteNodeBuilder_Destroy(builder);
++    MP_INFO(ao, "AudioSuite real-time effect enabled: %s.\n",
++            suite_effect_name(p->suite_effect));
++    return true;
++
++error:
++    if (builder)
++        OH_AudioSuiteNodeBuilder_Destroy(builder);
++    uninit_audio_suite(p);
++    return false;
++}
++
++static bool restart_audio_suite(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++    if (!p->suite_active)
++        return true;
++    OH_AudioSuiteEngine_StopPipeline(p->suite_pipeline);
++    OH_AudioSuite_Result res =
++        OH_AudioSuiteEngine_StartPipeline(p->suite_pipeline);
++    if (res != AUDIOSUITE_SUCCESS) {
++        MP_ERR(ao, "AudioSuite failed to restart '%s': error code %d.\n",
++               suite_effect_name(p->suite_effect), res);
++        return false;
++    }
++    return true;
++}
++
+ static void uninit(struct ao* ao)
+ {
+     struct priv* p = ao->priv;
+@@ -308,12 +782,69 @@ static void uninit(struct ao* ao)
+         p->renderer = NULL;
+     }
+ 
++    uninit_audio_suite(p);
++
+     if (p->builder) {
+         OH_AudioStreamBuilder_Destroy(p->builder);
+         p->builder = NULL;
+     }
+ }
+ 
++static int render_audio_suite(struct ao *ao, void *audio_data,
++                              int32_t audio_data_size)
++{
++    struct priv *p = ao->priv;
++    int32_t response_size = 0;
++    bool finished = false;
++    OH_AudioSuite_Result res;
++
++    if (p->suite_effect == SUITE_EFFECT_AUDIO_SEPARATION) {
++        if (!p->suite_scratch || audio_data_size > SUITE_SCRATCH_SIZE)
++            return 0;
++
++        void *outputs[2];
++        if (p->suite_separation_output == SUITE_SEPARATION_ACCOMPANIMENT) {
++            outputs[0] = p->suite_scratch;
++            outputs[1] = audio_data;
++        } else {
++            outputs[0] = audio_data;
++            outputs[1] = p->suite_scratch;
++        }
++        OH_AudioDataArray array = {
++            .audioDataArray = outputs,
++            .arraySize = 2,
++            .requestFrameSize = audio_data_size,
++        };
++        res = OH_AudioSuiteEngine_MultiRenderFrame(p->suite_pipeline, &array,
++                                                   &response_size, &finished);
++        if (res == AUDIOSUITE_SUCCESS &&
++            p->suite_separation_output == SUITE_SEPARATION_MIX)
++        {
++            float *vocals = audio_data;
++            float *accompaniment = p->suite_scratch;
++            for (int n = 0; n < response_size / (int)sizeof(float); n++) {
++                float sample = vocals[n] + accompaniment[n];
++                vocals[n] = MPCLAMP(sample, -1.0f, 1.0f);
++            }
++        }
++    } else {
++        res = OH_AudioSuiteEngine_RenderFrame(p->suite_pipeline, audio_data,
++                                              audio_data_size, &response_size,
++                                              &finished);
++    }
++
++    if (res != AUDIOSUITE_SUCCESS) {
++        if (!p->suite_render_failed) {
++            MP_ERR(ao, "AudioSuite rendering '%s' failed: error code %d.\n",
++                   suite_effect_name(p->suite_effect), res);
++            p->suite_render_failed = true;
++        }
++        return 0;
++    }
++    p->suite_render_failed = false;
++    return MPCLAMP(response_size, 0, audio_data_size);
++}
++
+ static int32_t audio_on_write_callback(
+     OH_AudioRenderer* renderer,
+     void* userData,
+@@ -325,7 +856,9 @@ static int32_t audio_on_write_callback(
+     (void)renderer;
+ 
+     int64_t callback_start = mp_time_ns();
+-    int samples = audioDataSize / ao->sstride;
++    int output_stride = p->suite_active ? p->suite_output_stride : ao->sstride;
++    int output_rate = p->suite_active ? p->suite_output_rate : ao->samplerate;
++    int samples = audioDataSize / output_stride;
+     int64_t now = callback_start;
+ 
+     uint64_t stream_epoch = atomic_load_explicit(&p->stream_epoch,
+@@ -366,36 +899,44 @@ static int32_t audio_on_write_callback(
+ 
+         int64_t elapsed = now - timestamp;
+         int64_t played = position +
+-            elapsed * ao->samplerate / MP_TIME_S_TO_NS(1);
++            elapsed * output_rate / MP_TIME_S_TO_NS(1);
+         played = MPCLAMP(played, 0, written);
+         p->queued_frames = written - played;
+     } else {
+         // Before the hardware clock starts, all previously returned callback
+         // buffers are still the best estimate of the queued audio.
+-        p->queued_frames = MPMIN(written, ao->samplerate / 4);
++        p->queued_frames = MPMIN(written, output_rate / 4);
+     }
+ 
+     int64_t end_time = now +
+-        MP_TIME_S_TO_NS(samples + p->queued_frames) / ao->samplerate;
+-    bool lock_contended = false;
+-    int64_t read_start = mp_time_ns();
+-    int copied = ao_read_data_nonblocking(ao, &audioData, samples, end_time,
++        MP_TIME_S_TO_NS(samples + p->queued_frames) / output_rate;
++    int copied;
++    if (p->suite_active) {
++        p->suite_end_time = end_time;
++        copied = render_audio_suite(ao, audioData, audioDataSize) / output_stride;
++    } else {
++        bool lock_contended = false;
++        int64_t read_start = mp_time_ns();
++        copied = ao_read_data_nonblocking(ao, &audioData, samples, end_time,
+                                           NULL, false, &lock_contended);
+-    uint64_t read_ns = mp_time_ns() - read_start;
++        uint64_t read_ns = mp_time_ns() - read_start;
++        atomic_fetch_add_explicit(&p->read_total_ns, read_ns,
++                                  memory_order_relaxed);
++        atomic_update_max(&p->read_max_ns, read_ns);
++        if (lock_contended) {
++            atomic_fetch_add_explicit(&p->lock_contentions, 1,
++                                      memory_order_relaxed);
++        } else if (copied < samples &&
++                   atomic_load_explicit(&p->clock_running,
++                                        memory_order_acquire))
++        {
++            atomic_fetch_add_explicit(&p->short_reads, 1,
++                                      memory_order_relaxed);
++        }
++    }
+     p->written_frames += copied;
+ 
+     atomic_fetch_add_explicit(&p->callback_count, 1, memory_order_relaxed);
+-    atomic_fetch_add_explicit(&p->read_total_ns, read_ns,
+-                              memory_order_relaxed);
+-    atomic_update_max(&p->read_max_ns, read_ns);
+-    if (lock_contended) {
+-        atomic_fetch_add_explicit(&p->lock_contentions, 1,
+-                                  memory_order_relaxed);
+-    } else if (copied < samples &&
+-               atomic_load_explicit(&p->clock_running, memory_order_acquire))
+-    {
+-        atomic_fetch_add_explicit(&p->short_reads, 1, memory_order_relaxed);
+-    }
+ 
+     uint64_t callback_ns = mp_time_ns() - callback_start;
+     atomic_fetch_add_explicit(&p->callback_total_ns, callback_ns,
+@@ -404,13 +945,16 @@ static int32_t audio_on_write_callback(
+ 
+-    // The advanced callback lets OHAudio ignore the untouched tail and back
+-    // off briefly when zero bytes are returned after lock contention.
++    // The advanced callback lets OHAudio ignore any untouched tail and back
++    // off briefly when either the mpv buffer or AudioSuite returns no data.
+-    return copied * ao->sstride;
++    return copied * output_stride;
+ }
+ 
+ static int init(struct ao* ao)
+ {
+     struct priv* p = ao->priv;
+     OH_AudioStream_Result res = 0;
++    int renderer_rate;
++    int renderer_channels;
++    int renderer_format;
+ 
+     res = OH_AudioStreamBuilder_Create(&p->builder, AUDIOSTREAM_TYPE_RENDERER);
+ 
+@@ -419,44 +963,72 @@ static int init(struct ao* ao)
+         goto error;
+     }
+ 
+-    ao->channels.num = MPCLAMP(ao->channels.num, 1, 16);
+-    ao->samplerate = MPCLAMP(ao->samplerate, 8000, 192000);
+-
+-    OH_AudioStreamBuilder_SetChannelCount(p->builder, ao->channels.num);
+-    OH_AudioStreamBuilder_SetSamplingRate(p->builder, ao->samplerate);
+-    OH_AudioStreamBuilder_SetEncodingType(p->builder, p->encoding_type);
+-    OH_AudioStreamBuilder_SetRendererInfo(p->builder, AUDIOSTREAM_USAGE_MOVIE);
++    if (p->suite_effect != SUITE_EFFECT_OFF) {
++        select_suite_formats(ao);
++        if (p->encoding_type != AUDIOSTREAM_ENCODING_TYPE_RAW)
++            MP_WARN(ao, "AudioSuite requires raw PCM; ignoring encoding_type=%d.\n",
++                    p->encoding_type);
++        if (!init_audio_suite(ao))
++            MP_WARN(ao, "Continuing with plain OHAudio output.\n");
++    } else {
++        ao->channels.num = MPCLAMP(ao->channels.num, 1, 16);
++        ao->samplerate = MPCLAMP(ao->samplerate, 8000, 192000);
++        if (af_fmt_is_int(ao->format)) {
++            if (af_fmt_to_bytes(ao->format) > 2)
++                ao->format = AF_FORMAT_S32;
++            else
++                ao->format = af_fmt_from_planar(ao->format);
++        } else {
++            ao->format = AF_FORMAT_FLOAT;
++        }
++    }
+ 
+-    if (af_fmt_is_int(ao->format)) {
+-        if (af_fmt_to_bytes(ao->format) > 2)
+-            ao->format = AF_FORMAT_S32;
+-        else
+-            ao->format = af_fmt_from_planar(ao->format);
++    if (p->suite_active) {
++        renderer_rate = p->suite_output_format.samplingRate;
++        renderer_channels = p->suite_output_format.channelCount;
++        switch (p->suite_output_format.sampleFormat) {
++        case AUDIO_SAMPLE_S32LE: renderer_format = AF_FORMAT_S32; break;
++        case AUDIO_SAMPLE_F32LE: renderer_format = AF_FORMAT_FLOAT; break;
++        case AUDIO_SAMPLE_U8:    renderer_format = AF_FORMAT_U8; break;
++        default:                 renderer_format = AF_FORMAT_S16; break;
++        }
+     } else {
+-        ao->format = AF_FORMAT_FLOAT;
++        renderer_rate = ao->samplerate;
++        renderer_channels = ao->channels.num;
++        renderer_format = ao->format;
++        p->suite_output_rate = renderer_rate;
++        p->suite_output_stride = af_fmt_to_bytes(renderer_format) *
++                                 renderer_channels;
+     }
+ 
+-    switch (ao->format) {
+-    case AF_FORMAT_U8:
+-        OH_AudioStreamBuilder_SetSampleFormat(p->builder, AUDIOSTREAM_SAMPLE_U8);
+-        break;
+-    case AF_FORMAT_S16:
+-        OH_AudioStreamBuilder_SetSampleFormat(p->builder, AUDIOSTREAM_SAMPLE_S16LE);
+-        break;
+-    case AF_FORMAT_S32:
+-        OH_AudioStreamBuilder_SetSampleFormat(p->builder, AUDIOSTREAM_SAMPLE_S32LE);
+-        break;
+-    case AF_FORMAT_FLOAT:
+-        OH_AudioStreamBuilder_SetSampleFormat(p->builder, AUDIOSTREAM_SAMPLE_F32LE);
+-        break;
+-    default:
+-        OH_AudioStreamBuilder_SetSampleFormat(p->builder, AUDIOSTREAM_SAMPLE_S16LE);
+-        break;
++    res = OH_AudioStreamBuilder_SetChannelCount(p->builder, renderer_channels);
++    if (res == AUDIOSTREAM_SUCCESS)
++        res = OH_AudioStreamBuilder_SetSamplingRate(p->builder, renderer_rate);
++    if (res == AUDIOSTREAM_SUCCESS)
++        res = OH_AudioStreamBuilder_SetEncodingType(
++            p->builder, p->suite_active ? AUDIOSTREAM_ENCODING_TYPE_RAW
++                                        : p->encoding_type);
++    if (res == AUDIOSTREAM_SUCCESS)
++        res = OH_AudioStreamBuilder_SetRendererInfo(p->builder,
++                                                     AUDIOSTREAM_USAGE_MOVIE);
++    if (res == AUDIOSTREAM_SUCCESS)
++        res = OH_AudioStreamBuilder_SetSampleFormat(
++            p->builder, stream_sample_format(renderer_format));
++    if (res == AUDIOSTREAM_SUCCESS && p->suite_active)
++        res = OH_AudioStreamBuilder_SetFrameSizeInCallback(
++            p->builder, SUITE_CALLBACK_FRAMES);
++    if (res != AUDIOSTREAM_SUCCESS) {
++        MP_ERR(ao, "Fail to configure audio stream: error code %d.\n", res);
++        goto error;
+     }
+ 
+     OH_AudioRenderer_OnWriteDataCallbackAdvanced callback = audio_on_write_callback;
+-    OH_AudioStreamBuilder_SetRendererWriteDataCallbackAdvanced(p->builder,
+-                                                                callback, ao);
++    res = OH_AudioStreamBuilder_SetRendererWriteDataCallbackAdvanced(
++        p->builder, callback, ao);
++    if (res != AUDIOSTREAM_SUCCESS) {
++        MP_ERR(ao, "Fail to set audio callback: error code %d.\n", res);
++        goto error;
++    }
+ 
+     res = OH_AudioStreamBuilder_GenerateRenderer(p->builder, &p->renderer);
+ 
+@@ -513,6 +1085,8 @@ static void reset(struct ao *ao)
+     set_clock_running(p, false);
+     OH_AudioRenderer_Pause(p->renderer);
+     OH_AudioRenderer_Flush(p->renderer);
++    restart_audio_suite(ao);
++    p->suite_render_failed = false;
+     atomic_fetch_add_explicit(&p->stream_epoch, 1, memory_order_acq_rel);
+ }
+ 
+@@ -558,10 +1132,118 @@ const struct ao_driver audio_out_ohaudio = {
+     .priv_size = sizeof(struct priv),
+     .priv_defaults = &(const struct priv) {
+         .encoding_type = AUDIOSTREAM_ENCODING_TYPE_RAW,
++        .suite_effect = SUITE_EFFECT_OFF,
++        .suite_eq_preset = 1,
++        .suite_sound_field = SOUND_FIELD_FRONT_FACING,
++        .suite_environment = ENVIRONMENT_TYPE_BROADCAST,
++        .suite_beautifier = VOICE_BEAUTIFIER_TYPE_CLEAR,
++        .suite_space_mode = SUITE_SPACE_POSITION,
++        .suite_space_z = 1.0,
++        .suite_space_time = 5,
++        .suite_space_direction = SPACE_RENDER_CCW,
++        .suite_space_radius = 1.0,
++        .suite_space_angle = 90,
++        .suite_pure_gender = PURE_VOICE_CHANGE_FEMALE,
++        .suite_pure_type = PURE_VOICE_CHANGE_TYPE_CARTOON,
++        .suite_pure_pitch = OH_PURE_VOICE_DEFAULT_PITCH,
++        .suite_general_type = GENERAL_VOICE_CHANGE_TYPE_CUTE,
++        .suite_tempo = 1.0,
++        .suite_pitch = 1.0,
++        .suite_separation_output = SUITE_SEPARATION_VOCALS,
+     },
+     .options = (const struct m_option[]) {
+         {"encoding_type", OPT_INT(encoding_type),
+             M_RANGE(0, 2)},
++        {"suite-effect", OPT_CHOICE(suite_effect,
++            {"off", SUITE_EFFECT_OFF},
++            {"equalizer", SUITE_EFFECT_EQUALIZER},
++            {"noise-reduction", SUITE_EFFECT_NOISE_REDUCTION},
++            {"sound-field", SUITE_EFFECT_SOUND_FIELD},
++            {"audio-separation", SUITE_EFFECT_AUDIO_SEPARATION},
++            {"voice-beautifier", SUITE_EFFECT_VOICE_BEAUTIFIER},
++            {"environment", SUITE_EFFECT_ENVIRONMENT},
++            {"audio-mixer", SUITE_EFFECT_AUDIO_MIXER},
++            {"space-render", SUITE_EFFECT_SPACE_RENDER},
++            {"pure-voice-change", SUITE_EFFECT_PURE_VOICE_CHANGE},
++            {"general-voice-change", SUITE_EFFECT_GENERAL_VOICE_CHANGE},
++            {"tempo-pitch", SUITE_EFFECT_TEMPO_PITCH},
++            {"hoa-space-render", SUITE_EFFECT_HOA_SPACE_RENDER})},
++        {"suite-eq-preset", OPT_CHOICE(suite_eq_preset,
++            {"custom", 0}, {"default", 1}, {"ballads", 2},
++            {"chinese-style", 3}, {"classical", 4}, {"dance", 5},
++            {"jazz", 6}, {"pop", 7}, {"r-and-b", 8}, {"rock", 9})},
++        {"suite-eq-31", OPT_INT(suite_eq_gains[0]), M_RANGE(-10, 10)},
++        {"suite-eq-62", OPT_INT(suite_eq_gains[1]), M_RANGE(-10, 10)},
++        {"suite-eq-125", OPT_INT(suite_eq_gains[2]), M_RANGE(-10, 10)},
++        {"suite-eq-250", OPT_INT(suite_eq_gains[3]), M_RANGE(-10, 10)},
++        {"suite-eq-500", OPT_INT(suite_eq_gains[4]), M_RANGE(-10, 10)},
++        {"suite-eq-1k", OPT_INT(suite_eq_gains[5]), M_RANGE(-10, 10)},
++        {"suite-eq-2k", OPT_INT(suite_eq_gains[6]), M_RANGE(-10, 10)},
++        {"suite-eq-4k", OPT_INT(suite_eq_gains[7]), M_RANGE(-10, 10)},
++        {"suite-eq-8k", OPT_INT(suite_eq_gains[8]), M_RANGE(-10, 10)},
++        {"suite-eq-16k", OPT_INT(suite_eq_gains[9]), M_RANGE(-10, 10)},
++        {"suite-sound-field", OPT_CHOICE(suite_sound_field,
++            {"front-facing", SOUND_FIELD_FRONT_FACING},
++            {"grand", SOUND_FIELD_GRAND}, {"near", SOUND_FIELD_NEAR},
++            {"wide", SOUND_FIELD_WIDE})},
++        {"suite-environment", OPT_CHOICE(suite_environment,
++            {"broadcast", ENVIRONMENT_TYPE_BROADCAST},
++            {"earpiece", ENVIRONMENT_TYPE_EARPIECE},
++            {"underwater", ENVIRONMENT_TYPE_UNDERWATER},
++            {"gramophone", ENVIRONMENT_TYPE_GRAMOPHONE})},
++        {"suite-beautifier", OPT_CHOICE(suite_beautifier,
++            {"clear", VOICE_BEAUTIFIER_TYPE_CLEAR},
++            {"theatre", VOICE_BEAUTIFIER_TYPE_THEATRE},
++            {"cd", VOICE_BEAUTIFIER_TYPE_CD},
++            {"studio", VOICE_BEAUTIFIER_TYPE_RECORDING_STUDIO})},
++        {"suite-space-mode", OPT_CHOICE(suite_space_mode,
++            {"position", SUITE_SPACE_POSITION},
++            {"rotation", SUITE_SPACE_ROTATION},
++            {"extension", SUITE_SPACE_EXTENSION})},
++        {"suite-space-x", OPT_FLOAT(suite_space_x), M_RANGE(-5, 5)},
++        {"suite-space-y", OPT_FLOAT(suite_space_y), M_RANGE(-5, 5)},
++        {"suite-space-z", OPT_FLOAT(suite_space_z), M_RANGE(-5, 5)},
++        {"suite-space-time", OPT_INT(suite_space_time), M_RANGE(2, 40)},
++        {"suite-space-direction", OPT_CHOICE(suite_space_direction,
++            {"counterclockwise", SPACE_RENDER_CCW},
++            {"clockwise", SPACE_RENDER_CW})},
++        {"suite-space-radius", OPT_FLOAT(suite_space_radius), M_RANGE(1, 5)},
++        {"suite-space-angle", OPT_INT(suite_space_angle), M_RANGE(1, 359)},
++        {"suite-pure-gender", OPT_CHOICE(suite_pure_gender,
++            {"female", PURE_VOICE_CHANGE_FEMALE},
++            {"male", PURE_VOICE_CHANGE_MALE})},
++        {"suite-pure-type", OPT_CHOICE(suite_pure_type,
++            {"cartoon", PURE_VOICE_CHANGE_TYPE_CARTOON},
++            {"cute", PURE_VOICE_CHANGE_TYPE_CUTE},
++            {"female", PURE_VOICE_CHANGE_TYPE_FEMALE},
++            {"male", PURE_VOICE_CHANGE_TYPE_MALE},
++            {"monster", PURE_VOICE_CHANGE_TYPE_MONSTER},
++            {"robots", PURE_VOICE_CHANGE_TYPE_ROBOTS},
++            {"seasoned", PURE_VOICE_CHANGE_TYPE_SEASONED})},
++        {"suite-pure-pitch", OPT_FLOAT(suite_pure_pitch), M_RANGE(0, 3)},
++        {"suite-general-type", OPT_CHOICE(suite_general_type,
++            {"cute", GENERAL_VOICE_CHANGE_TYPE_CUTE},
++            {"cyberpunk", GENERAL_VOICE_CHANGE_TYPE_CYBERPUNK},
++            {"female", GENERAL_VOICE_CHANGE_TYPE_FEMALE},
++            {"male", GENERAL_VOICE_CHANGE_TYPE_MALE},
++            {"mix", GENERAL_VOICE_CHANGE_TYPE_MIX},
++            {"monster", GENERAL_VOICE_CHANGE_TYPE_MONSTER},
++            {"seasoned", GENERAL_VOICE_CHANGE_TYPE_SEASONED},
++            {"synth", GENERAL_VOICE_CHANGE_TYPE_SYNTH},
++            {"trill", GENERAL_VOICE_CHANGE_TYPE_TRILL},
++            {"war", GENERAL_VOICE_CHANGE_TYPE_WAR})},
++        {"suite-tempo", OPT_FLOAT(suite_tempo), M_RANGE(0.5, 10)},
++        {"suite-pitch", OPT_FLOAT(suite_pitch), M_RANGE(0.1, 5)},
++        {"suite-separation-output", OPT_CHOICE(suite_separation_output,
++            {"vocals", SUITE_SEPARATION_VOCALS},
++            {"accompaniment", SUITE_SEPARATION_ACCOMPANIMENT},
++            {"mix", SUITE_SEPARATION_MIX})},
++        {"suite-hoa-layout", OPT_CHOICE(suite_hoa_layout,
++            {"order1-acn-n3d", 0}, {"order1-acn-sn3d", 1},
++            {"order1-fuma", 2}, {"order2-acn-n3d", 3},
++            {"order2-acn-sn3d", 4}, {"order2-fuma", 5},
++            {"order3-acn-n3d", 6}, {"order3-acn-sn3d", 7},
++            {"order3-fuma", 8})},
+         {0}
+     },
+     .options_prefix = "ohaudio",

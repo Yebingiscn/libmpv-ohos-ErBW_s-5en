@@ -1,0 +1,70 @@
+diff --git a/DOCS/man/ao.rst b/DOCS/man/ao.rst
+index 7eb7c97..98e1053 100644
+--- a/DOCS/man/ao.rst
++++ b/DOCS/man/ao.rst
+@@ -162,6 +162,65 @@ Available audio output drivers are:
+ ``audiounit`` (iOS only)
+     Native iOS audio output driver using ``AudioUnits`` and AudioToolbox.
+ 
++``ohaudio`` (HarmonyOS only)
++    Native HarmonyOS audio output. OHAudioSuite processing is disabled by
++    default and requires API 23 or newer (HOA space rendering requires API
++    26). Unsupported effects fall back to plain OHAudio output.
++
++    ``--ohaudio-suite-effect=<effect>``
++        Select ``off``, ``equalizer``, ``noise-reduction``, ``sound-field``,
++        ``audio-separation``, ``voice-beautifier``, ``environment``,
++        ``audio-mixer``, ``space-render``, ``pure-voice-change``,
++        ``general-voice-change``, ``tempo-pitch``, or ``hoa-space-render``.
++
++    ``--ohaudio-suite-eq-preset=<preset>``
++        Select ``custom``, ``default``, ``ballads``, ``chinese-style``,
++        ``classical``, ``dance``, ``jazz``, ``pop``, ``r-and-b``, or ``rock``.
++        The custom 31 Hz through 16 kHz gains are set with
++        ``--ohaudio-suite-eq-31`` through ``--ohaudio-suite-eq-16k`` and have
++        a range of -10 dB to +10 dB.
++
++    ``--ohaudio-suite-sound-field=<front-facing|grand|near|wide>``
++        Select the sound-field effect variant.
++
++    ``--ohaudio-suite-environment=<broadcast|earpiece|underwater|gramophone>``
++        Select the environment effect variant.
++
++    ``--ohaudio-suite-beautifier=<clear|theatre|cd|studio>``
++        Select the voice beautifier variant.
++
++    ``--ohaudio-suite-space-mode=<position|rotation|extension>``
++        Select the space-rendering mode. Position and rotation use
++        ``--ohaudio-suite-space-x``, ``-y``, and ``-z`` (each -5 to 5 m).
++        Rotation additionally uses ``--ohaudio-suite-space-time`` (2 to 40 s)
++        and ``--ohaudio-suite-space-direction``. Extension uses
++        ``--ohaudio-suite-space-radius`` (1 to 5 m) and
++        ``--ohaudio-suite-space-angle`` (1 to 359 degrees).
++
++    ``--ohaudio-suite-pure-gender=<female|male>``
++    ``--ohaudio-suite-pure-type=<cartoon|cute|female|male|monster|robots|seasoned>``
++    ``--ohaudio-suite-pure-pitch=<value>``
++        Configure traditional voice changing. A pitch of 0 uses the system
++        recommendation; custom values must be between 0.3 and 3.0.
++
++    ``--ohaudio-suite-general-type=<type>``
++        Select ``cute``, ``cyberpunk``, ``female``, ``male``, ``mix``,
++        ``monster``, ``seasoned``, ``synth``, ``trill``, or ``war``.
++
++    ``--ohaudio-suite-tempo=<0.5-10>``
++    ``--ohaudio-suite-pitch=<0.1-5>``
++        Configure tempo and pitch processing. Tempo changes audio duration and
++        are therefore not suitable when normal video synchronization is
++        required.
++
++    ``--ohaudio-suite-separation-output=<vocals|accompaniment|mix>``
++        Select which source-separation result is sent to the audio device.
++
++    ``--ohaudio-suite-hoa-layout=<layout>``
++        Select a first-, second-, or third-order ``acn-n3d``, ``acn-sn3d``, or
++        ``fuma`` HOA layout. The decoded channel order must already match the
++        selected layout.
++
+ ``openal``
+     OpenAL audio output driver.
+ 

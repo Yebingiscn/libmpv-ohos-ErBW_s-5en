@@ -41,6 +41,10 @@ if ! grep -Eq "NEEDED.*libGLESv2\.so" <<< "$dynamic_section"; then
   echo "Direct OSD renderer is not linked to GLESv2" >&2
   exit 1
 fi
+if ! grep -Eq "NEEDED.*libohaudiosuite\.so" <<< "$dynamic_section"; then
+  echo "OHAudio output is not linked to AudioSuite" >&2
+  exit 1
+fi
 if grep -Eq "NEEDED.*lib(dvd|bluray|archive)" <<< "$dynamic_section"; then
   echo "Optical-media dependencies must be linked statically" >&2
   exit 1
@@ -147,6 +151,11 @@ done
 
 if ! "$STRINGS" "$LIBMPV" | grep -F "OHAudio 10s: cb=" >/dev/null; then
   echo "Missing nonblocking OHAudio callback diagnostics" >&2
+  exit 1
+fi
+if ! "$STRINGS" "$LIBMPV" | grep -F \
+    "AudioSuite real-time effect enabled" >/dev/null; then
+  echo "Missing OHAudioSuite real-time pipeline" >&2
   exit 1
 fi
 
