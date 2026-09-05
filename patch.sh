@@ -55,3 +55,4 @@ for dep_path in "${PATCHES[@]}"; do
 done
 
 "$ROOT/scripts/verify-ohos-osd-source.sh"
+bash "$ROOT/scripts/verify-vpe-adapter.sh"
