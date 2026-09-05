@@ -1,0 +1,498 @@
+diff --git a/options/options.c b/options/options.c
+--- a/options/options.c
++++ b/options/options.c
+@@ -247,6 +247,7 @@ static const m_option_t mp_vo_opt_list[] = {
+ #endif
+ #if HAVE_EGL_OHOS
+     {"ohos-surface-size", OPT_SIZE_BOX(ohos_surface_size)},
++    {"ohos-super-resolution", OPT_BOOL(ohos_super_resolution), .flags = UPDATE_VO},
+     {"ohos-sdr-to-hdr", OPT_CHOICE(ohos_sdr_to_hdr,
+         {"no", 0}, {"pq", 1}, {"hlg", 2})},
+ #endif
+diff --git a/options/options.h b/options/options.h
+--- a/options/options.h
++++ b/options/options.h
+@@ -88,6 +88,7 @@ typedef struct mp_vo_opts {
+ 
+     struct m_geometry ohos_surface_size;
+     int ohos_sdr_to_hdr;
++    bool ohos_super_resolution;
+ 
+     struct m_geometry d3d11_composition_size;
+ 
+diff --git a/meson.build b/meson.build
+--- a/meson.build
++++ b/meson.build
+@@ -489,9 +489,11 @@ if features['ohos']
+                      cc.find_library('native_buffer'),
+                      cc.find_library('native_image'),
+                      cc.find_library('native_window'),
++                     cc.find_library('video_processing'),
+                      cc.find_library('GLESv2')]
+     sources += files('audio/out/ao_ohaudio.c',
+                      'video/out/ohos_common.c',
++                     'video/out/ohos_vpe.c',
+                      'video/out/hwdec/hwdec_ohcodec.c',
+                      'video/out/vo_ohcodec.c')
+ endif
+diff --git a/video/out/ohos_common.c b/video/out/ohos_common.c
+--- a/video/out/ohos_common.c
++++ b/video/out/ohos_common.c
+@@ -16,13 +16,17 @@
+  */
+ 
+ #include "ohos_common.h"
++#include "ohos_vpe.h"
+ #include "common/msg.h"
++#include "input/input.h"
+ #include "video/mp_image.h"
+ #include "vo.h"
+ 
+ struct vo_ohos_state {
+     struct mp_log *log;
+     OHNativeWindow *native_window;
++    OHNativeWindow *display_window;
++    struct ohos_vpe *vpe;
+     bool color_space_valid;
+     OH_NativeBuffer_ColorSpace color_space;
+     bool metadata_type_valid;
+@@ -92,6 +96,8 @@ static void set_output_color(struct vo_ohos_state *ctx,
+ 
+     if (!ctx->color_space_valid || ctx->color_space != color_space) {
+         int ret = OH_NativeWindow_SetColorSpace(ctx->native_window, color_space);
++        if (!ret && ctx->vpe)
++            ret = OH_NativeWindow_SetColorSpace(ctx->display_window, color_space);
+         if (ret == 0) {
+             ctx->color_space = color_space;
+             ctx->color_space_valid = true;
+@@ -110,6 +116,10 @@ static void set_output_color(struct vo_ohos_state *ctx,
+         int ret = OH_NativeWindow_SetMetadataValue(
+             ctx->native_window, OH_HDR_METADATA_TYPE, sizeof(metadata_type),
+             (uint8_t *)&metadata_type);
++        if (!ret && ctx->vpe)
++            ret = OH_NativeWindow_SetMetadataValue(
++                ctx->display_window, OH_HDR_METADATA_TYPE, sizeof(metadata_type),
++                (uint8_t *)&metadata_type);
+         if (ret == 0) {
+             ctx->metadata_type = metadata_type;
+             ctx->metadata_type_valid = true;
+@@ -124,6 +134,10 @@ static void set_output_color(struct vo_ohos_state *ctx,
+         int ret = OH_NativeWindow_SetMetadataValue(
+             ctx->native_window, OH_HDR_STATIC_METADATA, sizeof(metadata),
+             (uint8_t *)&metadata);
++        if (!ret && ctx->vpe)
++            ret = OH_NativeWindow_SetMetadataValue(
++                ctx->display_window, OH_HDR_STATIC_METADATA, sizeof(metadata),
++                (uint8_t *)&metadata);
+         if (ret == 0) {
+             ctx->static_metadata_valid = true;
+         } else {
+@@ -136,7 +150,7 @@ static void set_output_color(struct vo_ohos_state *ctx,
+ 
+     if (!ctx->hdr_brightness_valid || ctx->hdr_brightness != hdr_brightness) {
+         int ret = OH_NativeWindow_NativeWindowHandleOpt(
+-            ctx->native_window, SET_HDR_WHITE_POINT_BRIGHTNESS, hdr_brightness);
++            ctx->display_window, SET_HDR_WHITE_POINT_BRIGHTNESS, hdr_brightness);
+         if (ret == 0) {
+             ctx->hdr_brightness = hdr_brightness;
+             ctx->hdr_brightness_valid = true;
+@@ -169,6 +183,13 @@ bool vo_ohos_init(struct vo *vo)
+         goto fail;
+     }
+ 
++    ctx->display_window = ctx->native_window;
++    if (vo->opts->ohos_super_resolution) {
++        ctx->vpe = ohos_vpe_create(vo->log, ctx->display_window,
++            vo->opts->ohos_surface_size.w, vo->opts->ohos_surface_size.h);
++        if (ctx->vpe)
++            ctx->native_window = ohos_vpe_input(ctx->vpe);
++    }
+     return true;
+ fail:
+     talloc_free(ctx);
+@@ -182,8 +203,9 @@ void vo_ohos_uninit(struct vo *vo)
+     if (!ctx)
+         return;
+ 
+-    if (ctx->native_window)
+-        OH_NativeWindow_DestroyNativeWindow(ctx->native_window);
++    ohos_vpe_destroy(ctx->vpe);
++    if (ctx->display_window)
++        OH_NativeWindow_DestroyNativeWindow(ctx->display_window);
+ 
+     talloc_free(ctx);
+     vo->ohos = NULL;
+@@ -219,6 +241,8 @@ bool vo_ohos_set_surface_size(struct vo *vo, int w, int h)
+     if (!ctx || !ctx->native_window || w <= 0 || h <= 0)
+         return false;
+ 
++    ohos_vpe_resize(ctx->vpe, w, h);
++
+     int ret = OH_NativeWindow_NativeWindowHandleOpt(
+         ctx->native_window, SET_BUFFER_GEOMETRY, w, h);
+     if (ret != 0) {
+@@ -292,3 +316,22 @@ void vo_ohos_invalidate_color(struct vo *vo)
+     ctx->static_metadata_valid = false;
+     ctx->hdr_brightness_valid = false;
+ }
++
++void vo_ohos_check_super_resolution(struct vo *vo)
++{
++    struct vo_ohos_state *ctx = vo->ohos;
++    if (ctx)
++        ohos_vpe_check(ctx->vpe, vo);
++}
++
++void ohos_vpe_check(struct ohos_vpe *vpe, struct vo *vo)
++{
++    // The core rebuilds VO/decoder and restores the playback position. Queue
++    // from the VO thread, never from a vendor processing callback.
++    int error = ohos_vpe_take_error(vpe);
++    if (error) {
++        MP_WARN(vo, "[SuperResolution] Processing failed (%d); restoring normal output\n", error);
++        const char *cmd[] = {"set", "ohos-super-resolution", "no", NULL};
++        mp_input_run_cmd(vo->input_ctx, cmd);
++    }
++}
+diff --git a/video/out/ohos_common.h b/video/out/ohos_common.h
+--- a/video/out/ohos_common.h
++++ b/video/out/ohos_common.h
+@@ -35,3 +35,4 @@ void vo_ohos_set_hdr_output_capable(struct vo *vo, bool capable);
+ struct pl_color_space vo_ohos_preferred_csp(struct vo *vo);
+ bool vo_ohos_set_color(struct vo *vo, struct mp_image_params *params);
+ void vo_ohos_invalidate_color(struct vo *vo);
++void vo_ohos_check_super_resolution(struct vo *vo);
+diff --git a/video/out/vo_ohcodec.c b/video/out/vo_ohcodec.c
+--- a/video/out/vo_ohcodec.c
++++ b/video/out/vo_ohcodec.c
+@@ -30,6 +30,7 @@
+ #include <libavutil/hwcontext_oh.h>
+ #include <mpv/client.h>
+ #include <native_window/external_window.h>
++#include "ohos_vpe.h"
+ 
+ #include "common/common.h"
+ #include "osdep/threads.h"
+@@ -137,13 +138,23 @@ static int64_t get_surface_time_ns(void)
+     return MP_TIME_S_TO_NS(ts.tv_sec) + ts.tv_nsec;
+ }
+ 
++struct ohcodec_output {
++    OHNativeWindow *window;
++    struct ohos_vpe *vpe;
++};
++
+ static void free_ohcodec_device(AVHWDeviceContext *ctx)
+ {
+     AVOHCodecDeviceContext *hwctx = ctx->hwctx;
+-    if (hwctx->native_window) {
+-        OH_NativeWindow_DestroyNativeWindow(hwctx->native_window);
+-        hwctx->native_window = NULL;
+-    }
++    struct ohcodec_output *output = ctx->user_opaque;
++    if (output) {
++        // AVHWDeviceContext outlives the decoder and all outstanding frames.
++        ohos_vpe_destroy(output->vpe);
++        if (output->window)
++            OH_NativeWindow_DestroyNativeWindow(output->window);
++        free(output);
++    }
++    hwctx->native_window = NULL;
+ }
+ 
+ static AVBufferRef *create_ohcodec_device_ref(struct vo *vo)
+@@ -158,21 +169,26 @@ static AVBufferRef *create_ohcodec_device_ref(struct vo *vo)
+         return NULL;
+ 
+     AVHWDeviceContext *ctx = (void *)device_ref->data;
++    struct ohcodec_output *output = calloc(1, sizeof(*output));
++    if (!output) {
++        av_buffer_unref(&device_ref);
++        return NULL;
++    }
++    ctx->user_opaque = output;
++    ctx->free = free_ohcodec_device;
+     AVOHCodecDeviceContext *hwctx = ctx->hwctx;
+     hwctx->direct_surface = 1;
+     uint64_t surface = 0;
+     memcpy(&surface, &vo->opts->WinID, sizeof(vo->opts->WinID));
+ 
+     int ret = OH_NativeWindow_CreateNativeWindowFromSurfaceId(
+-        surface, (OHNativeWindow **)&hwctx->native_window);
+-    if (ret != 0 || !hwctx->native_window) {
++        surface, &output->window);
++    if (ret != 0 || !output->window) {
+         MP_ERR(vo, "Failed to create video NativeWindow: %d\n", ret);
+         av_buffer_unref(&device_ref);
+         return NULL;
+     }
+-    ctx->free = free_ohcodec_device;
+-
+-    OHNativeWindow *window = hwctx->native_window;
++    OHNativeWindow *window = output->window;
+     ret = OH_NativeWindow_NativeWindowSetScalingModeV2(
+         window, OH_SCALING_MODE_SCALE_FIT_V2);
+     if (ret != 0)
+@@ -182,6 +198,12 @@ static AVBufferRef *create_ohcodec_device_ref(struct vo *vo)
+     if (ret != 0)
+         MP_VERBOSE(vo, "Failed to mark video Surface source type: %d\n", ret);
+ 
++    if (vo->opts->ohos_super_resolution) {
++        output->vpe = ohos_vpe_create(vo->log, window,
++            vo->opts->ohos_surface_size.w, vo->opts->ohos_surface_size.h);
++    }
++    hwctx->native_window = output->vpe ? ohos_vpe_input(output->vpe) : window;
++
+     if (av_hwdevice_ctx_init(device_ref) < 0)
+         av_buffer_unref(&device_ref);
+ 
+@@ -249,8 +271,8 @@ static void update_video_scaling_mode(struct vo *vo)
+         return;
+ 
+     AVHWDeviceContext *ctx = (void *)p->hwctx.av_device_ref->data;
+-    AVOHCodecDeviceContext *hwctx = ctx->hwctx;
+-    OHNativeWindow *window = hwctx->native_window;
++    struct ohcodec_output *output = ctx->user_opaque;
++    OHNativeWindow *window = output->window;
+     if (!window)
+         return;
+ 
+@@ -273,6 +295,20 @@ static void resize(struct vo *vo)
+     if (get_video_surface_size(vo, &width, &height)) {
+         vo->dwidth = width;
+         vo->dheight = height;
++        struct priv *p = vo->priv;
++        AVHWDeviceContext *device = (void *)p->hwctx.av_device_ref->data;
++        struct ohcodec_output *output = device->user_opaque;
++        // Keep the enhanced buffers' aspect ratio; the display Surface applies
++        // fit/stretch afterwards, just as it does for unprocessed decoder frames.
++        int source_w = 0, source_h = 0;
++        if (vo->params)
++            mp_image_params_get_dsize(vo->params, &source_w, &source_h);
++        if (source_w > 0 && source_h > 0) {
++            double scale = MPMIN((double)width / source_w, (double)height / source_h);
++            width = MPMAX(2, (int)(source_w * scale)) & ~1;
++            height = MPMAX(2, (int)(source_h * scale)) & ~1;
++        }
++        ohos_vpe_resize(output->vpe, width, height);
+     }
+     update_video_scaling_mode(vo);
+     update_osd_resolution(vo);
+@@ -860,6 +896,11 @@ static void flip_page(struct vo *vo)
+ static int control(struct vo *vo, uint32_t request, void *data)
+ {
+     struct priv *p = vo->priv;
++    if (p->hwctx.av_device_ref) {
++        AVHWDeviceContext *device = (void *)p->hwctx.av_device_ref->data;
++        struct ohcodec_output *output = device->user_opaque;
++        ohos_vpe_check(output->vpe, vo);
++    }
+ 
+     switch (request) {
+     case VOCTRL_SET_PANSCAN:
+diff --git a/video/out/opengl/context_ohos.c b/video/out/opengl/context_ohos.c
+--- a/video/out/opengl/context_ohos.c
++++ b/video/out/opengl/context_ohos.c
+@@ -186,6 +186,7 @@ static bool ohos_reconfig(struct ra_ctx *ctx)
+ 
+ static int ohos_control(struct ra_ctx *ctx, int *events, int request, void *arg)
+ {
++    vo_ohos_check_super_resolution(ctx->vo);
+     return VO_NOTIMPL;
+ }
+ 
+diff --git a/video/out/vulkan/context_ohos.c b/video/out/vulkan/context_ohos.c
+--- a/video/out/vulkan/context_ohos.c
++++ b/video/out/vulkan/context_ohos.c
+@@ -100,6 +100,7 @@ static bool ohos_reconfig(struct ra_ctx *ctx)
+ 
+ static int ohos_control(struct ra_ctx *ctx, int *events, int request, void *arg)
+ {
++    vo_ohos_check_super_resolution(ctx->vo);
+     return VO_NOTIMPL;
+ }
+ 
+diff --git a/video/out/ohos_vpe.c b/video/out/ohos_vpe.c
+new file mode 100644
+--- /dev/null
++++ b/video/out/ohos_vpe.c
+@@ -0,0 +1,155 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#include "ohos_vpe.h"
++
++#include <stdatomic.h>
++#include <stdlib.h>
++#include <multimedia/video_processing_engine/video_processing.h>
++#include <multimedia/player_framework/native_avformat.h>
++
++#include "common/msg.h"
++
++struct ohos_vpe {
++    OH_VideoProcessing *processor;
++    OHNativeWindow *input;
++    OHNativeWindow *output;
++    atomic_int error;
++    bool running;
++    bool fallback_queued;
++    int width;
++    int height;
++};
++
++static void on_error(OH_VideoProcessing *processor,
++                     VideoProcessing_ErrorCode error, void *data)
++{
++    struct ohos_vpe *vpe = data;
++    atomic_store(&vpe->error, error);
++}
++
++static void on_output(OH_VideoProcessing *processor, uint32_t index, void *data)
++{
++    struct ohos_vpe *vpe = data;
++    int ret = OH_VideoProcessing_RenderOutputBuffer(processor, index);
++    if (ret != VIDEO_PROCESSING_SUCCESS)
++        atomic_store(&vpe->error, ret);
++}
++
++void ohos_vpe_destroy(struct ohos_vpe *vpe)
++{
++    if (!vpe)
++        return;
++    // Never release callback user data until the vendor instance is destroyed.
++    if (vpe->running)
++        OH_VideoProcessing_Stop(vpe->processor);
++    if (vpe->processor && OH_VideoProcessing_Destroy(vpe->processor) !=
++                              VIDEO_PROCESSING_SUCCESS) {
++        // An unresponsive vendor instance may still call us. Retaining its
++        // small context and input window is safer than a callback use-after-free.
++        return;
++    }
++    if (vpe->input)
++        OH_NativeWindow_DestroyNativeWindow(vpe->input);
++    free(vpe);
++}
++
++void ohos_vpe_resize(struct ohos_vpe *vpe, int width, int height)
++{
++    if (!vpe || width <= 0 || height <= 0)
++        return;
++    if (vpe->width == width && vpe->height == height)
++        return;
++    int ret = OH_NativeWindow_NativeWindowHandleOpt(
++        vpe->output, SET_BUFFER_GEOMETRY, width, height);
++    if (ret)
++        atomic_store(&vpe->error, ret);
++    else {
++        vpe->width = width;
++        vpe->height = height;
++    }
++}
++
++struct ohos_vpe *ohos_vpe_create(struct mp_log *log, OHNativeWindow *output,
++                                int width, int height)
++{
++    struct ohos_vpe *vpe = calloc(1, sizeof(*vpe));
++    if (!vpe)
++        return NULL;
++    atomic_init(&vpe->error, 0);
++    vpe->output = output;
++    VideoProcessing_Callback *callbacks = NULL;
++    OH_AVFormat *format = NULL;
++    int ret = OH_VideoProcessing_Create(&vpe->processor,
++                                        VIDEO_PROCESSING_TYPE_DETAIL_ENHANCER);
++    if (ret)
++        goto fail;
++    ret = OH_VideoProcessingCallback_Create(&callbacks);
++    if (ret)
++        goto fail;
++    ret = OH_VideoProcessingCallback_BindOnError(callbacks, on_error);
++    if (ret)
++        goto fail;
++    ret = OH_VideoProcessingCallback_BindOnNewOutputBuffer(callbacks, on_output);
++    if (ret)
++        goto fail;
++    ret = OH_VideoProcessing_RegisterCallback(vpe->processor, callbacks, vpe);
++    if (ret)
++        goto fail;
++    OH_VideoProcessingCallback_Destroy(callbacks);
++    callbacks = NULL;
++    format = OH_AVFormat_Create();
++    if (!format) {
++        ret = VIDEO_PROCESSING_ERROR_NO_MEMORY;
++        goto fail;
++    }
++    if (!OH_AVFormat_SetIntValue(format,
++            VIDEO_DETAIL_ENHANCER_PARAMETER_KEY_QUALITY_LEVEL,
++            VIDEO_DETAIL_ENHANCER_QUALITY_LEVEL_HIGH)) {
++        ret = VIDEO_PROCESSING_ERROR_INVALID_PARAMETER;
++        goto fail;
++    }
++    ret = OH_VideoProcessing_SetParameter(vpe->processor, format);
++    if (ret)
++        goto fail;
++    OH_AVFormat_Destroy(format);
++    format = NULL;
++    ohos_vpe_resize(vpe, width, height);
++    ret = atomic_load(&vpe->error);
++    if (ret)
++        goto fail;
++    ret = OH_VideoProcessing_SetSurface(vpe->processor, output);
++    if (ret)
++        goto fail;
++    ret = OH_VideoProcessing_GetSurface(vpe->processor, &vpe->input);
++    if (ret)
++        goto fail;
++    ret = OH_VideoProcessing_Start(vpe->processor);
++    if (ret)
++        goto fail;
++    vpe->running = true;
++    mp_warn(log, "[SuperResolution] VPE high quality enabled\n");
++    return vpe;
++fail:
++    if (format)
++        OH_AVFormat_Destroy(format);
++    if (callbacks)
++        OH_VideoProcessingCallback_Destroy(callbacks);
++    mp_warn(log, "[SuperResolution] VPE unavailable (%d); using normal output\n", ret);
++    ohos_vpe_destroy(vpe);
++    return NULL;
++}
++
++OHNativeWindow *ohos_vpe_input(struct ohos_vpe *vpe)
++{
++    return vpe ? vpe->input : NULL;
++}
++
++int ohos_vpe_take_error(struct ohos_vpe *vpe)
++{
++    if (!vpe || vpe->fallback_queued)
++        return 0;
++    int error = atomic_load(&vpe->error);
++    if (!error)
++        return 0;
++    vpe->fallback_queued = true;
++    return error;
++}
+diff --git a/video/out/ohos_vpe.h b/video/out/ohos_vpe.h
+new file mode 100644
+--- /dev/null
++++ b/video/out/ohos_vpe.h
+@@ -0,0 +1,19 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <stdbool.h>
++#include <native_window/external_window.h>
++
++struct mp_log;
++struct vo;
++struct ohos_vpe;
++
++// The caller retains the output window until after destroy. The processor owns
++// its input window; producers must be destroyed before the processor.
++struct ohos_vpe *ohos_vpe_create(struct mp_log *log, OHNativeWindow *output,
++                                int width, int height);
++OHNativeWindow *ohos_vpe_input(struct ohos_vpe *vpe);
++void ohos_vpe_destroy(struct ohos_vpe *vpe);
++void ohos_vpe_resize(struct ohos_vpe *vpe, int width, int height);
++int ohos_vpe_take_error(struct ohos_vpe *vpe);
++void ohos_vpe_check(struct ohos_vpe *vpe, struct vo *vo);

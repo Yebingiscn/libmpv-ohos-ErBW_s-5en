@@ -37,6 +37,14 @@ for symbol in mpv_create ohos_osd_set_global_surface; do
 done
 
 dynamic_section=$("$READELF" -d "$LIBMPV")
+if ! grep -Eq "NEEDED.*libvideo_processing\.so" <<< "$dynamic_section"; then
+  echo "Super resolution is not linked to the video processing engine" >&2
+  exit 1
+fi
+if ! "$STRINGS" "$LIBMPV" | grep -Fx "ohos-super-resolution" >/dev/null; then
+  echo "Missing super-resolution option in libmpv" >&2
+  exit 1
+fi
 if ! grep -Eq "NEEDED.*libGLESv2\.so" <<< "$dynamic_section"; then
   echo "Direct OSD renderer is not linked to GLESv2" >&2
   exit 1

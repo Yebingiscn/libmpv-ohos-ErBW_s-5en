@@ -41,6 +41,26 @@ a time. This keeps the zero-copy path short and prevents playback-speed changes
 from exhausting the decoder output pool. Spatial GPU shaders remain available;
 software-decoded video is unaffected and may still use temporal interpolation.
 
+## System video super resolution
+
+`--ohos-super-resolution=yes` enables VPE detail enhancement at fixed HIGH
+quality. The default is `no`. There are no selectable quality levels. The same
+option covers direct OHCodec Surface output, GPU hardware decoding, and software
+decoding, including both OpenGL and Vulkan GPU contexts. GPU processing enhances
+the rendered output; direct decoding feeds the VPE input Surface before display.
+Direct-mode subtitles remain on their separate OSD Surface.
+
+Changing the option recreates the video output and decoder through mpv's normal
+VO update path, restoring the current playback position. The VPE input remains
+alive until its producer is released. Unsupported initialization uses normal
+output; asynchronous processing errors switch the live option off and rebuild
+normal output. Logs use the `[SuperResolution]` prefix. Device support and visual
+quality require on-device testing; VPE is not guaranteed to match AVPlayer's SR.
+
+`scripts/verify-vpe-adapter.sh` exercises initialization failures, fixed HIGH
+quality, output callbacks, resize, fallback, and failed vendor destruction.
+`verify.sh` requires the final binary to include the option and VPE dependency.
+
 ## Automatic OHCodec playback policy
 
 Both OHCodec output paths automatically pass the source frame rate to the
