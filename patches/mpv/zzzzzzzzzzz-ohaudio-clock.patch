@@ -1,0 +1,474 @@
+diff --git a/audio/out/ao_ohaudio.c b/audio/out/ao_ohaudio.c
+--- a/audio/out/ao_ohaudio.c
++++ b/audio/out/ao_ohaudio.c
+@@ -27,19 +27,18 @@
+ #include "options/m_option.h"
+ #include "osdep/threads.h"
+ #include "osdep/timer.h"
++#include "ohaudio_clock.h"
+ 
+ #include <stdatomic.h>
+ #include <string.h>
++#include <time.h>
+ 
+ #include <ohaudio/native_audiorenderer.h>
+ #include <ohaudio/native_audiostreambuilder.h>
+ #include <ohaudiosuite/native_audio_suite_base.h>
+ #include <ohaudiosuite/native_audio_suite_engine.h>
+ 
+-#define CLOCK_QUERY_INTERVAL_NS MP_TIME_MS_TO_NS(250)
+-#define STATS_REPORT_INTERVAL_NS MP_TIME_S_TO_NS(10)
+-#define CALLBACK_WARN_NS MP_TIME_MS_TO_NS(5)
+-#define CLOCK_QUERY_WARN_NS MP_TIME_MS_TO_NS(20)
++#define CLOCK_QUERY_INTERVAL_NS MP_TIME_MS_TO_NS(20)
+ #define SUITE_SCRATCH_SIZE (256 * 1024)
+ 
+ enum suite_effect {
+@@ -81,7 +80,7 @@ struct priv {
+     OH_AudioNode *suite_output;
+     void *suite_scratch;
+     bool suite_active;
+-    bool suite_render_failed;
++    atomic_int suite_last_error;
+     OH_AudioFormat suite_input_format;
+     OH_AudioFormat suite_output_format;
+     int suite_input_stride;
+@@ -99,10 +98,8 @@ struct priv {
+     atomic_bool clock_running;
+     atomic_uint_fast64_t stream_epoch;
+     atomic_uint_fast64_t clock_epoch;
+-    atomic_uint_fast64_t snapshot_epoch;
+-    atomic_int_fast64_t snapshot_position;
+-    atomic_int_fast64_t snapshot_timestamp;
+-    atomic_int_fast64_t snapshot_published_at;
++    struct ohaudio_clock_snapshot snapshot;
++    struct ohaudio_clock_sample callback_snapshot;
+ 
+     // Accessed only by the OHAudio write callback.
+     uint64_t callback_stream_epoch;
+@@ -111,18 +108,6 @@ struct priv {
+     int64_t queued_frames;
+     bool timestamp_valid;
+ 
+-    atomic_uint_fast64_t callback_count;
+-    atomic_uint_fast64_t callback_total_ns;
+-    atomic_uint_fast64_t callback_max_ns;
+-    atomic_uint_fast64_t read_total_ns;
+-    atomic_uint_fast64_t read_max_ns;
+-    atomic_uint_fast64_t lock_contentions;
+-    atomic_uint_fast64_t short_reads;
+-    atomic_uint_fast64_t query_count;
+-    atomic_uint_fast64_t query_total_ns;
+-    atomic_uint_fast64_t query_max_ns;
+-    atomic_uint_fast64_t query_failures;
+-
+     int encoding_type;
+     int suite_effect;
+     int suite_eq_preset;
+@@ -148,38 +133,14 @@ struct priv {
+     int suite_hoa_layout;
+ };
+ 
+-static void atomic_update_max(atomic_uint_fast64_t *value, uint64_t sample)
+-{
+-    uint_fast64_t current = atomic_load_explicit(value, memory_order_relaxed);
+-    while (current < sample &&
+-           !atomic_compare_exchange_weak_explicit(value, &current, sample,
+-                                                   memory_order_relaxed,
+-                                                   memory_order_relaxed))
+-    {
+-    }
+-}
+-
+ static void init_timing(struct priv *p)
+ {
+     atomic_init(&p->clock_running, false);
+     atomic_init(&p->stream_epoch, 1);
+     atomic_init(&p->clock_epoch, 1);
+-    atomic_init(&p->snapshot_epoch, 0);
+-    atomic_init(&p->snapshot_position, 0);
+-    atomic_init(&p->snapshot_timestamp, 0);
+-    atomic_init(&p->snapshot_published_at, 0);
+-
+-    atomic_init(&p->callback_count, 0);
+-    atomic_init(&p->callback_total_ns, 0);
+-    atomic_init(&p->callback_max_ns, 0);
+-    atomic_init(&p->read_total_ns, 0);
+-    atomic_init(&p->read_max_ns, 0);
+-    atomic_init(&p->lock_contentions, 0);
+-    atomic_init(&p->short_reads, 0);
+-    atomic_init(&p->query_count, 0);
+-    atomic_init(&p->query_total_ns, 0);
+-    atomic_init(&p->query_max_ns, 0);
+-    atomic_init(&p->query_failures, 0);
++    ohaudio_clock_init(&p->snapshot);
++    p->callback_snapshot = (struct ohaudio_clock_sample){0};
++    atomic_init(&p->suite_last_error, 0);
+ 
+     p->callback_stream_epoch = 0;
+     p->frame_position = 0;
+@@ -202,62 +163,12 @@ static void set_clock_running(struct priv *p, bool running)
+     mp_mutex_unlock(&p->clock_lock);
+ }
+ 
+-static void report_stats(struct ao *ao)
+-{
+-    struct priv *p = ao->priv;
+-    uint64_t callbacks = atomic_exchange_explicit(&p->callback_count, 0,
+-                                                   memory_order_relaxed);
+-    uint64_t callback_total = atomic_exchange_explicit(&p->callback_total_ns, 0,
+-                                                        memory_order_relaxed);
+-    uint64_t callback_max = atomic_exchange_explicit(&p->callback_max_ns, 0,
+-                                                      memory_order_relaxed);
+-    uint64_t read_total = atomic_exchange_explicit(&p->read_total_ns, 0,
+-                                                    memory_order_relaxed);
+-    uint64_t read_max = atomic_exchange_explicit(&p->read_max_ns, 0,
+-                                                  memory_order_relaxed);
+-    uint64_t contentions = atomic_exchange_explicit(&p->lock_contentions, 0,
+-                                                     memory_order_relaxed);
+-    uint64_t short_reads = atomic_exchange_explicit(&p->short_reads, 0,
+-                                                     memory_order_relaxed);
+-    uint64_t queries = atomic_exchange_explicit(&p->query_count, 0,
+-                                                 memory_order_relaxed);
+-    uint64_t query_total = atomic_exchange_explicit(&p->query_total_ns, 0,
+-                                                     memory_order_relaxed);
+-    uint64_t query_max = atomic_exchange_explicit(&p->query_max_ns, 0,
+-                                                   memory_order_relaxed);
+-    uint64_t query_failures = atomic_exchange_explicit(&p->query_failures, 0,
+-                                                        memory_order_relaxed);
+-
+-    if (!callbacks && !queries)
+-        return;
+-
+-    bool slow = callback_max >= CALLBACK_WARN_NS ||
+-                read_max >= CALLBACK_WARN_NS ||
+-                query_max >= CLOCK_QUERY_WARN_NS || contentions ||
+-                short_reads || query_failures;
+-    int level = slow ? MSGL_WARN : MSGL_TRACE;
+-    mp_msg(ao->log, level,
+-           "OHAudio 10s: cb=%llu avg/max=%.3f/%.3f ms, "
+-           "read avg/max=%.3f/%.3f ms, lock-miss=%llu short=%llu, "
+-           "clock=%llu avg/max=%.3f/%.3f ms fail=%llu\n",
+-           (unsigned long long)callbacks,
+-           callbacks ? callback_total / 1e6 / callbacks : 0.0,
+-           callback_max / 1e6,
+-           callbacks ? read_total / 1e6 / callbacks : 0.0,
+-           read_max / 1e6,
+-           (unsigned long long)contentions,
+-           (unsigned long long)short_reads,
+-           (unsigned long long)queries,
+-           queries ? query_total / 1e6 / queries : 0.0,
+-           query_max / 1e6,
+-           (unsigned long long)query_failures);
+-}
+-
+ static MP_THREAD_VOID clock_thread(void *arg)
+ {
+     struct ao *ao = arg;
+     struct priv *p = ao->priv;
+-    int64_t next_report = mp_time_ns() + STATS_REPORT_INTERVAL_NS;
++    int reported_clock_error = 0;
++    int reported_suite_error = 0;
+ 
+     mp_thread_set_name("ohaudio-clock");
+     mp_mutex_lock(&p->clock_lock);
+@@ -275,41 +186,44 @@ static MP_THREAD_VOID clock_thread(void *arg)
+ 
+         int64_t position = 0;
+         int64_t timestamp = 0;
+-        int64_t query_start = mp_time_ns();
+         OH_AudioStream_Result res = OH_AudioRenderer_GetAudioTimestampInfo(
+             p->renderer, &position, &timestamp);
++        struct timespec mono;
++        bool mono_valid = clock_gettime(CLOCK_MONOTONIC, &mono) == 0;
+         int64_t now = mp_time_ns();
+-        uint64_t query_ns = now - query_start;
+-
+-        atomic_fetch_add_explicit(&p->query_count, 1, memory_order_relaxed);
+-        atomic_fetch_add_explicit(&p->query_total_ns, query_ns,
+-                                  memory_order_relaxed);
+-        atomic_update_max(&p->query_max_ns, query_ns);
+-
+-        bool valid = res == AUDIOSTREAM_SUCCESS && position >= 0 &&
+-                     timestamp > 0 && timestamp <= now &&
+-                     now - timestamp < MP_TIME_S_TO_NS(2);
+-        if (!valid) {
+-            atomic_fetch_add_explicit(&p->query_failures, 1,
+-                                      memory_order_relaxed);
+-        } else if (atomic_load_explicit(&p->clock_running,
+-                                        memory_order_acquire) &&
+-                   atomic_load_explicit(&p->clock_epoch,
+-                                        memory_order_acquire) == epoch)
++        int64_t mapped_timestamp = 0;
++        bool valid = res == AUDIOSTREAM_SUCCESS && position >= 0 && mono_valid &&
++                     ohaudio_clock_translate(timestamp,
++                         MP_TIME_S_TO_NS(mono.tv_sec) + mono.tv_nsec,
++                         now, &mapped_timestamp);
++        if (valid && atomic_load_explicit(&p->clock_running, memory_order_acquire) &&
++            atomic_load_explicit(&p->clock_epoch, memory_order_acquire) == epoch)
+         {
+-            atomic_store_explicit(&p->snapshot_position, position,
+-                                  memory_order_relaxed);
+-            atomic_store_explicit(&p->snapshot_timestamp, timestamp,
+-                                  memory_order_relaxed);
+-            atomic_store_explicit(&p->snapshot_published_at, now,
+-                                  memory_order_relaxed);
+-            atomic_store_explicit(&p->snapshot_epoch, epoch,
+-                                  memory_order_release);
++            ohaudio_clock_publish(&p->snapshot, (struct ohaudio_clock_sample) {
++                .epoch = epoch, .position = position,
++                .timestamp = mapped_timestamp, .published_at = now,
++            });
+         }
+ 
+-        if (now >= next_report) {
+-            report_stats(ao);
+-            next_report = now + STATS_REPORT_INTERVAL_NS;
++        // Diagnostics run off the real-time callback and only on state changes.
++        bool current_epoch = atomic_load_explicit(&p->clock_running, memory_order_acquire) &&
++            atomic_load_explicit(&p->clock_epoch, memory_order_acquire) == epoch;
++        if (current_epoch) {
++            int error = valid ? 0 : (res != AUDIOSTREAM_SUCCESS ? (int)res : -1);
++            if (error != reported_clock_error) {
++                if (error)
++                    MP_WARN(ao, "OHAudio clock unavailable: api=%d reason=%s; using estimated delay\n",
++                            res, res != AUDIOSTREAM_SUCCESS ? "API failure" : "invalid timestamp");
++                else
++                    MP_VERBOSE(ao, "OHAudio hardware clock recovered\n");
++                reported_clock_error = error;
++            }
++        }
++        int suite_error = atomic_load_explicit(&p->suite_last_error, memory_order_relaxed);
++        if (suite_error != reported_suite_error) {
++            if (suite_error)
++                MP_WARN(ao, "AudioSuite rendering failed: error code %d\n", suite_error);
++            reported_suite_error = suite_error;
+         }
+ 
+         mp_mutex_lock(&p->clock_lock);
+@@ -322,7 +236,6 @@ static MP_THREAD_VOID clock_thread(void *arg)
+     }
+     mp_mutex_unlock(&p->clock_lock);
+ 
+-    report_stats(ao);
+     MP_THREAD_RETURN();
+ }
+ 
+@@ -514,24 +427,8 @@ static int32_t suite_request_data(OH_AudioNode *node, void *user_data,
+     int samples = audio_data_size / p->suite_input_stride;
+     int bytes = samples * p->suite_input_stride;
+     void *data = audio_data;
+-    bool lock_contended = false;
+-    int64_t read_start = mp_time_ns();
+-    int copied = ao_read_data_nonblocking(ao, &data, samples,
+-                                          p->suite_end_time, NULL, true,
+-                                          &lock_contended);
+-    uint64_t read_ns = mp_time_ns() - read_start;
+-
+-    atomic_fetch_add_explicit(&p->read_total_ns, read_ns,
+-                              memory_order_relaxed);
+-    atomic_update_max(&p->read_max_ns, read_ns);
+-    if (lock_contended) {
+-        atomic_fetch_add_explicit(&p->lock_contentions, 1,
+-                                  memory_order_relaxed);
+-    } else if (copied < samples &&
+-               atomic_load_explicit(&p->clock_running, memory_order_acquire))
+-    {
+-        atomic_fetch_add_explicit(&p->short_reads, 1, memory_order_relaxed);
+-    }
++    ao_read_data_nonblocking(ao, &data, samples, p->suite_end_time,
++                             NULL, true, NULL);
+ 
+     // AudioSuite repeatedly pulls until its output request is full. Supplying
+     // the silence already written by ao_read_data_nonblocking prevents a
+@@ -840,14 +737,11 @@ static int render_audio_suite(struct ao *ao, void *audio_data,
+     }
+ 
+     if (res != AUDIOSUITE_SUCCESS) {
+-        if (!p->suite_render_failed) {
+-            MP_ERR(ao, "AudioSuite rendering '%s' failed: error code %d.\n",
+-                   suite_effect_name(p->suite_effect), res);
+-            p->suite_render_failed = true;
+-        }
++        // Logging can allocate or block. Report errors from the clock thread.
++        atomic_store_explicit(&p->suite_last_error, res, memory_order_relaxed);
+         return 0;
+     }
+-    p->suite_render_failed = false;
++    atomic_store_explicit(&p->suite_last_error, 0, memory_order_relaxed);
+     return MPCLAMP(response_size, 0, audio_data_size);
+ }
+ 
+@@ -861,11 +755,10 @@ static int32_t audio_on_write_callback(
+     struct priv* p = ao->priv;
+     (void)renderer;
+ 
+-    int64_t callback_start = mp_time_ns();
+     int output_stride = p->suite_active ? p->suite_output_stride : ao->sstride;
+     int output_rate = p->suite_active ? p->suite_output_rate : ao->samplerate;
+     int samples = audioDataSize / output_stride;
+-    int64_t now = callback_start;
++    int64_t now = mp_time_ns();
+ 
+     uint64_t stream_epoch = atomic_load_explicit(&p->stream_epoch,
+                                                   memory_order_acquire);
+@@ -881,17 +774,11 @@ static int32_t audio_on_write_callback(
+ 
+     uint64_t clock_epoch = atomic_load_explicit(&p->clock_epoch,
+                                                  memory_order_acquire);
+-    uint64_t snapshot_epoch = atomic_load_explicit(&p->snapshot_epoch,
+-                                                    memory_order_acquire);
+-    int64_t position = atomic_load_explicit(&p->snapshot_position,
+-                                             memory_order_relaxed);
+-    int64_t timestamp = atomic_load_explicit(&p->snapshot_timestamp,
+-                                              memory_order_relaxed);
+-    int64_t published_at = atomic_load_explicit(&p->snapshot_published_at,
+-                                                 memory_order_relaxed);
+-    bool snapshot_valid = snapshot_epoch == clock_epoch && timestamp > 0 &&
+-                          timestamp <= now && published_at <= now &&
+-                          now - published_at < MP_TIME_S_TO_NS(2);
++    ohaudio_clock_read(&p->snapshot, &p->callback_snapshot);
++    struct ohaudio_clock_sample snapshot = p->callback_snapshot;
++    int64_t position = snapshot.position;
++    int64_t timestamp = snapshot.timestamp;
++    bool snapshot_valid = ohaudio_clock_valid(snapshot, clock_epoch, now);
+ 
+     if (snapshot_valid) {
+         // A route change can reset the device frame position independently of
+@@ -921,34 +808,11 @@ static int32_t audio_on_write_callback(
+         p->suite_end_time = end_time;
+         copied = render_audio_suite(ao, audioData, audioDataSize) / output_stride;
+     } else {
+-        bool lock_contended = false;
+-        int64_t read_start = mp_time_ns();
+         copied = ao_read_data_nonblocking(ao, &audioData, samples, end_time,
+-                                          NULL, false, &lock_contended);
+-        uint64_t read_ns = mp_time_ns() - read_start;
+-        atomic_fetch_add_explicit(&p->read_total_ns, read_ns,
+-                                  memory_order_relaxed);
+-        atomic_update_max(&p->read_max_ns, read_ns);
+-        if (lock_contended) {
+-            atomic_fetch_add_explicit(&p->lock_contentions, 1,
+-                                      memory_order_relaxed);
+-        } else if (copied < samples &&
+-                   atomic_load_explicit(&p->clock_running,
+-                                        memory_order_acquire))
+-        {
+-            atomic_fetch_add_explicit(&p->short_reads, 1,
+-                                      memory_order_relaxed);
+-        }
++                                          NULL, false, NULL);
+     }
+     p->written_frames += copied;
+ 
+-    atomic_fetch_add_explicit(&p->callback_count, 1, memory_order_relaxed);
+-
+-    uint64_t callback_ns = mp_time_ns() - callback_start;
+-    atomic_fetch_add_explicit(&p->callback_total_ns, callback_ns,
+-                              memory_order_relaxed);
+-    atomic_update_max(&p->callback_max_ns, callback_ns);
+-
+     // The advanced callback lets OHAudio ignore any untouched tail and back
+     // off briefly when either the mpv buffer or AudioSuite returns no data.
+     return copied * output_stride;
+@@ -1116,7 +980,6 @@ static void reset(struct ao *ao)
+     OH_AudioRenderer_Pause(p->renderer);
+     OH_AudioRenderer_Flush(p->renderer);
+     restart_audio_suite(ao);
+-    p->suite_render_failed = false;
+     atomic_fetch_add_explicit(&p->stream_epoch, 1, memory_order_acq_rel);
+ }
+ 
+diff --git a/audio/out/ohaudio_clock.h b/audio/out/ohaudio_clock.h
+new file mode 100644
+--- /dev/null
++++ b/audio/out/ohaudio_clock.h
+@@ -0,0 +1,88 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdatomic.h>
++
++#define OHAUDIO_CLOCK_MAX_AGE_NS INT64_C(2000000000)
++
++// OHAudio uses CLOCK_MONOTONIC; mpv can use CLOCK_MONOTONIC_RAW with
++// an additional private origin. Map the sample's age, not its absolute value.
++static inline bool ohaudio_clock_translate(int64_t timestamp, int64_t mono_now,
++                                           int64_t mpv_now, int64_t *mapped)
++{
++    if (timestamp <= 0 || timestamp > mono_now)
++        return false;
++    int64_t age = mono_now - timestamp;
++    if (age >= OHAUDIO_CLOCK_MAX_AGE_NS || mpv_now <= age)
++        return false;
++    *mapped = mpv_now - age;
++    return true;
++}
++
++struct ohaudio_clock_sample {
++    uint64_t epoch;
++    int64_t position;
++    int64_t timestamp;
++    int64_t published_at;
++};
++
++struct ohaudio_clock_snapshot {
++    atomic_uint_fast64_t sequence;
++    atomic_uint_fast64_t epoch;
++    atomic_int_fast64_t position;
++    atomic_int_fast64_t timestamp;
++    atomic_int_fast64_t published_at;
++};
++
++static inline void ohaudio_clock_init(struct ohaudio_clock_snapshot *s)
++{
++    atomic_init(&s->sequence, 0);
++    atomic_init(&s->epoch, 0);
++    atomic_init(&s->position, 0);
++    atomic_init(&s->timestamp, 0);
++    atomic_init(&s->published_at, 0);
++}
++
++// Single background writer. Sequential consistency also orders the payload
++// with the sequence checks; using only an unchanged epoch cannot prevent tears.
++static inline void ohaudio_clock_publish(struct ohaudio_clock_snapshot *s,
++                                         struct ohaudio_clock_sample v)
++{
++    atomic_fetch_add(&s->sequence, 1);
++    atomic_store(&s->epoch, v.epoch);
++    atomic_store(&s->position, v.position);
++    atomic_store(&s->timestamp, v.timestamp);
++    atomic_store(&s->published_at, v.published_at);
++    atomic_fetch_add(&s->sequence, 1);
++}
++
++// One bounded attempt: the audio callback never waits or spins for the writer.
++// On contention the caller retains its last coherent sample.
++static inline bool ohaudio_clock_read(struct ohaudio_clock_snapshot *s,
++                                      struct ohaudio_clock_sample *out)
++{
++    uint64_t seq = atomic_load(&s->sequence);
++    if (seq & 1)
++        return false;
++    struct ohaudio_clock_sample value = {
++        .epoch = atomic_load(&s->epoch),
++        .position = atomic_load(&s->position),
++        .timestamp = atomic_load(&s->timestamp),
++        .published_at = atomic_load(&s->published_at),
++    };
++    if (atomic_load(&s->sequence) != seq)
++        return false;
++    *out = value;
++    return true;
++}
++
++static inline bool ohaudio_clock_valid(struct ohaudio_clock_sample s,
++                                       uint64_t epoch, int64_t now)
++{
++    return s.epoch == epoch && s.position >= 0 && s.timestamp > 0 &&
++           s.timestamp <= now && s.published_at <= now &&
++           now - s.published_at < OHAUDIO_CLOCK_MAX_AGE_NS &&
++           now - s.timestamp < OHAUDIO_CLOCK_MAX_AGE_NS;
++}

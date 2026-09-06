@@ -157,8 +157,12 @@ for marker in "[OSDGLES]" "OSD GLES Surface attached" \
   fi
 done
 
-if ! "$STRINGS" "$LIBMPV" | grep -F "OHAudio 10s: cb=" >/dev/null; then
-  echo "Missing nonblocking OHAudio callback diagnostics" >&2
+if ! "$STRINGS" "$LIBMPV" | grep -F "OHAudio clock unavailable:" >/dev/null; then
+  echo "Missing OHAudio clock state diagnostics" >&2
+  exit 1
+fi
+if "$STRINGS" "$LIBMPV" | grep -F "OHAudio 10s: cb=" >/dev/null; then
+  echo "Unexpected OHAudio performance statistics" >&2
   exit 1
 fi
 if ! "$STRINGS" "$LIBMPV" | grep -F \

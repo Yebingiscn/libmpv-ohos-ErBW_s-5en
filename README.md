@@ -109,6 +109,14 @@ libass/OSD bitmap pipeline.
 but BD-J, `libaacs` and `libbdplus` are not; encrypted Blu-ray images therefore
 still require an external decryption solution.
 
+OHAudio translates the hardware CLOCK_MONOTONIC timestamp into mpv's timebase
+before calculating queued audio. A coherent atomic snapshot lets the audio
+callback read clock updates without waiting for the background query thread.
+Audio callbacks have no performance timing counters or periodic statistics;
+clock availability and AudioSuite errors are reported on state changes by the
+background thread. The patch stage tests timestamp conversion, stale samples,
+stream epochs, and concurrent snapshot publication on the build host.
+
 ## Build Dependencies
 
 - git
