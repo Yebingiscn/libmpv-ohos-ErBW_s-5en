@@ -1,0 +1,36 @@
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -646,6 +646,24 @@
+     return true;
+ }
+ 
++// Integer upload fallbacks (e.g. GLES without R16 UNORM) cannot use
++// hardware bilinear sampling. NULL filters let libplacebo choose sampling
++// supported by the source texture instead of disabling the scaler on error.
++static void adapt_sampling(const struct pl_frame *frame,
++                           struct pl_render_params *params)
++{
++    for (int n = 0; n < frame->num_planes; n++) {
++        pl_tex tex = frame->planes[n].texture;
++        if (tex && !(tex->params.format->caps & PL_FMT_CAP_LINEAR)) {
++            params->upscaler = NULL;
++            params->downscaler = NULL;
++            params->plane_upscaler = NULL;
++            params->plane_downscaler = NULL;
++            return;
++        }
++    }
++}
++
+ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src,
+                       struct pl_frame *frame)
+ {
+@@ -1458,2 +1477,4 @@
+     // Render frame
++    for (int i = 0; i < mix.num_frames; i++)
++        adapt_sampling(mix.frames[i], &params);
+     if (!pl_render_image_mix(p->rr, &mix, &target, &params)) {
+@@ -1795,1 +1816,2 @@
++    adapt_sampling(&image, &params);
+     if (!pl_render_image(p->rr, &image, &target, &params)) {
