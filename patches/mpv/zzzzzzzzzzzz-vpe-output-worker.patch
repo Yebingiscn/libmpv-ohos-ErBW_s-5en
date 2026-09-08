@@ -1,0 +1,315 @@
+diff --git a/video/out/ohos_vpe.c b/video/out/ohos_vpe.c
+--- a/video/out/ohos_vpe.c
++++ b/video/out/ohos_vpe.c
+@@ -7,6 +7,11 @@
+ #include <multimedia/player_framework/native_avformat.h>
+ 
+ #include "common/msg.h"
++#include "osdep/threads.h"
++#include "osdep/timer.h"
++
++#define OUTPUT_QUEUE_SIZE 32
++#define FIRST_OUTPUT_TIMEOUT_NS MP_TIME_S_TO_NS(3)
+ 
+ struct ohos_vpe {
+     OH_VideoProcessing *processor;
+@@ -17,27 +22,133 @@ struct ohos_vpe {
+     bool fallback_queued;
+     int width;
+     int height;
++    struct mp_log *log;
++    mp_mutex lock;
++    mp_cond wakeup;
++    mp_thread worker;
++    bool worker_created;
++    bool shutdown;
++    uint32_t queue[OUTPUT_QUEUE_SIZE];
++    unsigned head, count;
++    bool first_output;
++    int64_t first_input;
++    void (*notify)(void *);
++    void *notify_data;
+ };
+ 
++// lock held; destroy disables notification before the VO can be released.
++static void notify_error(struct ohos_vpe *vpe)
++{
++    if (!vpe->shutdown && vpe->notify)
++        vpe->notify(vpe->notify_data);
++}
++
++void ohos_vpe_set_wakeup(struct ohos_vpe *vpe, void (*wakeup)(void *), void *data)
++{
++    if (!vpe) return;
++    mp_mutex_lock(&vpe->lock);
++    vpe->notify = wakeup;
++    vpe->notify_data = data;
++    if (atomic_load(&vpe->error)) notify_error(vpe);
++    mp_mutex_unlock(&vpe->lock);
++}
++
+ static void on_error(OH_VideoProcessing *processor,
+                      VideoProcessing_ErrorCode error, void *data)
+ {
+     struct ohos_vpe *vpe = data;
+     atomic_store(&vpe->error, error);
++    mp_mutex_lock(&vpe->lock);
++    notify_error(vpe);
++    mp_mutex_unlock(&vpe->lock);
+ }
+ 
+ static void on_output(OH_VideoProcessing *processor, uint32_t index, void *data)
+ {
+     struct ohos_vpe *vpe = data;
+-    int ret = OH_VideoProcessing_RenderOutputBuffer(processor, index);
+-    if (ret != VIDEO_PROCESSING_SUCCESS)
+-        atomic_store(&vpe->error, ret);
++    // Vendor callbacks only enqueue tokens. Never re-enter VPE from here.
++    mp_mutex_lock(&vpe->lock);
++    if (!vpe->shutdown) {
++        if (vpe->count == OUTPUT_QUEUE_SIZE) {
++            atomic_store(&vpe->error, VIDEO_PROCESSING_ERROR_PROCESS_FAILED);
++            notify_error(vpe);
++        } else {
++            vpe->queue[(vpe->head + vpe->count++) % OUTPUT_QUEUE_SIZE] = index;
++            mp_cond_signal(&vpe->wakeup);
++        }
++    }
++    mp_mutex_unlock(&vpe->lock);
++}
++
++static MP_THREAD_VOID output_worker(void *data)
++{
++    struct ohos_vpe *vpe = data;
++    mp_mutex_lock(&vpe->lock);
++    while (!vpe->shutdown) {
++        if (vpe->count) {
++            uint32_t index = vpe->queue[vpe->head];
++            vpe->head = (vpe->head + 1) % OUTPUT_QUEUE_SIZE;
++            vpe->count--;
++            mp_mutex_unlock(&vpe->lock);
++            int ret = OH_VideoProcessing_RenderOutputBuffer(vpe->processor, index);
++            mp_mutex_lock(&vpe->lock);
++            if (ret) {
++                atomic_store(&vpe->error, ret);
++                notify_error(vpe);
++            } else if (!vpe->first_output) {
++                vpe->first_output = true;
++                mp_warn(vpe->log, "[SuperResolution] First output submitted\n");
++            }
++            continue;
++        }
++        if (vpe->first_input && !vpe->first_output && !atomic_load(&vpe->error)) {
++            int64_t left = FIRST_OUTPUT_TIMEOUT_NS - (mp_time_ns() - vpe->first_input);
++            if (left <= 0) {
++                atomic_store(&vpe->error, VIDEO_PROCESSING_ERROR_PROCESS_FAILED);
++                notify_error(vpe);
++                mp_warn(vpe->log, "[SuperResolution] No first output; requesting normal output\n");
++                continue;
++            }
++            mp_cond_timedwait(&vpe->wakeup, &vpe->lock, left);
++        } else {
++            mp_cond_wait(&vpe->wakeup, &vpe->lock);
++        }
++    }
++    mp_mutex_unlock(&vpe->lock);
++    MP_THREAD_RETURN();
++}
++
++void ohos_vpe_note_input(struct ohos_vpe *vpe)
++{
++    if (!vpe)
++        return;
++    mp_mutex_lock(&vpe->lock);
++    if (!vpe->first_input && !vpe->first_output) {
++        vpe->first_input = mp_time_ns();
++        mp_cond_signal(&vpe->wakeup);
++    }
++    mp_mutex_unlock(&vpe->lock);
++}
++
++void ohos_vpe_stop_output(struct ohos_vpe *vpe)
++{
++    if (!vpe)
++        return;
++    mp_mutex_lock(&vpe->lock);
++    vpe->shutdown = true;
++    mp_cond_signal(&vpe->wakeup);
++    mp_mutex_unlock(&vpe->lock);
++    if (vpe->worker_created) {
++        mp_thread_join(vpe->worker);
++        vpe->worker_created = false;
++    }
+ }
+ 
+ void ohos_vpe_destroy(struct ohos_vpe *vpe)
+ {
+     if (!vpe)
+         return;
++    ohos_vpe_stop_output(vpe);
+     // Never release callback user data until the vendor instance is destroyed.
+     if (vpe->running)
+         OH_VideoProcessing_Stop(vpe->processor);
+@@ -49,6 +160,8 @@ void ohos_vpe_destroy(struct ohos_vpe *vpe)
+     }
+     if (vpe->input)
+         OH_NativeWindow_DestroyNativeWindow(vpe->input);
++    mp_cond_destroy(&vpe->wakeup);
++    mp_mutex_destroy(&vpe->lock);
+     free(vpe);
+ }
+ 
+@@ -75,6 +188,16 @@ struct ohos_vpe *ohos_vpe_create(struct mp_log *log, OHNativeWindow *output,
+     if (!vpe)
+         return NULL;
+     atomic_init(&vpe->error, 0);
++    if (mp_mutex_init(&vpe->lock)) {
++        free(vpe);
++        return NULL;
++    }
++    if (mp_cond_init(&vpe->wakeup)) {
++        mp_mutex_destroy(&vpe->lock);
++        free(vpe);
++        return NULL;
++    }
++    vpe->log = log;
+     vpe->output = output;
+     VideoProcessing_Callback *callbacks = NULL;
+     OH_AVFormat *format = NULL;
+@@ -126,6 +249,11 @@ struct ohos_vpe *ohos_vpe_create(struct mp_log *log, OHNativeWindow *output,
+     if (ret)
+         goto fail;
+     vpe->running = true;
++    if (mp_thread_create(&vpe->worker, output_worker, vpe)) {
++        ret = VIDEO_PROCESSING_ERROR_NO_MEMORY;
++        goto fail;
++    }
++    vpe->worker_created = true;
+     mp_warn(log, "[SuperResolution] VPE high quality enabled\n");
+     return vpe;
+ fail:
+diff --git a/video/out/ohos_vpe.h b/video/out/ohos_vpe.h
+--- a/video/out/ohos_vpe.h
++++ b/video/out/ohos_vpe.h
+@@ -14,6 +14,10 @@ struct ohos_vpe *ohos_vpe_create(struct mp_log *log, OHNativeWindow *output,
+                                 int width, int height);
+ OHNativeWindow *ohos_vpe_input(struct ohos_vpe *vpe);
+ void ohos_vpe_destroy(struct ohos_vpe *vpe);
++void ohos_vpe_stop_output(struct ohos_vpe *vpe);
+ void ohos_vpe_resize(struct ohos_vpe *vpe, int width, int height);
+ int ohos_vpe_take_error(struct ohos_vpe *vpe);
++void ohos_vpe_note_input(struct ohos_vpe *vpe);
++void ohos_vpe_set_wakeup(struct ohos_vpe *vpe, void (*wakeup)(void *), void *data);
++void ohos_vpe_attach(struct ohos_vpe *vpe, struct vo *vo);
+ void ohos_vpe_check(struct ohos_vpe *vpe, struct vo *vo);
+diff --git a/video/out/ohos_common.c b/video/out/ohos_common.c
+--- a/video/out/ohos_common.c
++++ b/video/out/ohos_common.c
+@@ -189,6 +189,7 @@ bool vo_ohos_init(struct vo *vo)
+             vo->opts->ohos_surface_size.w, vo->opts->ohos_surface_size.h);
+         if (ctx->vpe)
+             ctx->native_window = ohos_vpe_input(ctx->vpe);
++        ohos_vpe_attach(ctx->vpe, vo);
+     }
+     return true;
+ fail:
+@@ -317,6 +318,22 @@ void vo_ohos_invalidate_color(struct vo *vo)
+     ctx->hdr_brightness_valid = false;
+ }
+ 
++static void vpe_wakeup(void *data)
++{
++    vo_wakeup(data);
++}
++
++void ohos_vpe_attach(struct ohos_vpe *vpe, struct vo *vo)
++{
++    ohos_vpe_set_wakeup(vpe, vpe_wakeup, vo);
++}
++
++void vo_ohos_super_resolution_input(struct vo *vo)
++{
++    if (vo->ohos)
++        ohos_vpe_note_input(vo->ohos->vpe);
++}
++
+ void vo_ohos_check_super_resolution(struct vo *vo)
+ {
+     struct vo_ohos_state *ctx = vo->ohos;
+diff --git a/video/out/ohos_common.h b/video/out/ohos_common.h
+--- a/video/out/ohos_common.h
++++ b/video/out/ohos_common.h
+@@ -36,3 +36,4 @@ struct pl_color_space vo_ohos_preferred_csp(struct vo *vo);
+ bool vo_ohos_set_color(struct vo *vo, struct mp_image_params *params);
+ void vo_ohos_invalidate_color(struct vo *vo);
+ void vo_ohos_check_super_resolution(struct vo *vo);
++void vo_ohos_super_resolution_input(struct vo *vo);
+diff --git a/video/out/opengl/context_ohos.c b/video/out/opengl/context_ohos.c
+--- a/video/out/opengl/context_ohos.c
++++ b/video/out/opengl/context_ohos.c
+@@ -66,6 +66,7 @@ static void ohos_set_color(struct ra_ctx *ctx, struct mp_image_params *params)
+ static void ohos_swap_buffers(struct ra_ctx *ctx)
+ {
+     struct priv *p = ctx->priv;
++    vo_ohos_super_resolution_input(ctx->vo);
+     eglSwapBuffers(p->egl_display, p->egl_surface);
+ }
+ 
+diff --git a/video/out/vulkan/context_ohos.c b/video/out/vulkan/context_ohos.c
+--- a/video/out/vulkan/context_ohos.c
++++ b/video/out/vulkan/context_ohos.c
+@@ -37,6 +37,11 @@ static void ohos_set_color(struct ra_ctx *ctx, struct mp_image_params *params)
+     vo_ohos_set_color(ctx->vo, params);
+ }
+ 
++static void ohos_swap_buffers(struct ra_ctx *ctx)
++{
++    vo_ohos_super_resolution_input(ctx->vo);
++}
++
+ static void ohos_uninit(struct ra_ctx *ctx)
+ {
+     struct priv *p = ctx->priv;
+@@ -64,6 +69,7 @@ static bool ohos_init(struct ra_ctx *ctx)
+     };
+ 
+     struct ra_ctx_params params = {
++        .swap_buffers = ohos_swap_buffers,
+         .preferred_csp = ohos_preferred_csp,
+         .set_color = ohos_set_color,
+     };
+diff --git a/video/out/vo_ohcodec.c b/video/out/vo_ohcodec.c
+--- a/video/out/vo_ohcodec.c
++++ b/video/out/vo_ohcodec.c
+@@ -201,6 +201,7 @@ static AVBufferRef *create_ohcodec_device_ref(struct vo *vo)
+     if (vo->opts->ohos_super_resolution) {
+         output->vpe = ohos_vpe_create(vo->log, window,
+             vo->opts->ohos_surface_size.w, vo->opts->ohos_surface_size.h);
++        ohos_vpe_attach(output->vpe, vo);
+     }
+     hwctx->native_window = output->vpe ? ohos_vpe_input(output->vpe) : window;
+ 
+@@ -883,6 +884,9 @@ static void flip_page(struct vo *vo)
+     if (!buffer) {
+         MP_ERR(vo, "OHCodec frame is missing its output token\n");
+     } else {
++        AVHWDeviceContext *device = (void *)p->hwctx.av_device_ref->data;
++        struct ohcodec_output *output = device->user_opaque;
++        ohos_vpe_note_input(output->vpe);
+         int ret = p->next_render_time_ns > 0
+             ? av_ohcodec_release_buffer_at_time(buffer,
+                                                 p->next_render_time_ns)
+@@ -921,6 +925,13 @@ static int control(struct vo *vo, uint32_t request, void *data)
+ static void uninit(struct vo *vo)
+ {
+     struct priv *p = vo->priv;
++    // Decoder references can keep the device/VPE alive beyond this VO.
++    // Stop its worker and wakeups while the VO and log are still valid.
++    if (p->hwctx.av_device_ref) {
++        AVHWDeviceContext *device = (void *)p->hwctx.av_device_ref->data;
++        struct ohcodec_output *output = device->user_opaque;
++        ohos_vpe_stop_output(output->vpe);
++    }
+ 
+     mp_mutex_lock(&global_osd.lock);
+     if (global_osd.active_vo == vo)

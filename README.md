@@ -57,6 +57,12 @@ output; asynchronous processing errors switch the live option off and rebuild
 normal output. Logs use the `[SuperResolution]` prefix. Device support and visual
 quality require on-device testing; VPE is not guaranteed to match AVPlayer's SR.
 
+VPE output callbacks enqueue buffer tokens for an application-owned worker;
+they never call back into VPE rendering. Once frame submission begins, missing
+the first output for three seconds requests normal output and wakes the VO.
+This guard does not count file loading time or require performance statistics.
+Successful buffer submission is logged once; it does not prove physical display.
+
 `scripts/verify-vpe-adapter.sh` exercises initialization failures, fixed HIGH
 quality, output callbacks, resize, fallback, and failed vendor destruction.
 `verify.sh` requires the final binary to include the option and VPE dependency.

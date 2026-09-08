@@ -3,16 +3,26 @@
 #include <assert.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdatomic.h>
+#include "osdep/threads.h"
+#include "osdep/timer.h"
 #include <multimedia/video_processing_engine/video_processing.h>
 #include <multimedia/player_framework/native_avformat.h>
 #include "video/out/ohos_vpe.h"
 
 const int32_t VIDEO_PROCESSING_TYPE_DETAIL_ENHANCER = 2;
 const char *VIDEO_DETAIL_ENHANCER_PARAMETER_KEY_QUALITY_LEVEL = "quality";
-enum { CREATE = 1, CALLBACK, BIND_ERROR, BIND_OUTPUT, REGISTER, FORMAT,
-       VALUE, PARAMETER, RESIZE, SURFACE, INPUT, START };
+enum { CREATE = 1, CALLBACK_CREATE, BIND_ERROR, BIND_OUTPUT, REGISTER, FORMAT,
+       VALUE, PARAMETER, RESIZE, SURFACE, INPUT_SURFACE, START };
 static int fail_at, processors, formats, callbacks, inputs, running, quality;
-static int stage, resize_count, rendered, destroy_error, width, height;
+static int stage, resize_count, destroy_error, width, height;
+static atomic_int rendered, render_error;
+static atomic_bool hold_render;
+static atomic_int wakeups;
+static void wake_vo(void *data) { atomic_fetch_add(&wakeups, 1); }
+static atomic_int_fast64_t fake_time = 1000000000;
+static _Thread_local bool in_callback;
+int64_t mp_time_ns(void) { return atomic_load(&fake_time); }
 static OH_VideoProcessingCallback_OnError error_cb;
 static OH_VideoProcessingCallback_OnNewOutputBuffer output_cb;
 static void *callback_data;
@@ -29,7 +39,7 @@ VideoProcessing_ErrorCode OH_VideoProcessing_Create(OH_VideoProcessing **p, int 
 }
 VideoProcessing_ErrorCode OH_VideoProcessingCallback_Create(VideoProcessing_Callback **p)
 {
-    int r = step(CALLBACK); if (!r) { *p = (void *)&callback_token; callbacks++; } return r;
+    int r = step(CALLBACK_CREATE); if (!r) { *p = (void *)&callback_token; callbacks++; } return r;
 }
 VideoProcessing_ErrorCode OH_VideoProcessingCallback_BindOnError(
     VideoProcessing_Callback *p, OH_VideoProcessingCallback_OnError cb)
@@ -59,7 +69,7 @@ int32_t OH_NativeWindow_NativeWindowHandleOpt(OHNativeWindow *w, int code, ...)
 VideoProcessing_ErrorCode OH_VideoProcessing_SetSurface(OH_VideoProcessing *p, const OHNativeWindow *w)
 { assert(w == WINDOW); return step(SURFACE); }
 VideoProcessing_ErrorCode OH_VideoProcessing_GetSurface(OH_VideoProcessing *p, OHNativeWindow **w)
-{ int r = step(INPUT); if (!r) { *w = WINDOW; inputs++; } return r; }
+{ int r = step(INPUT_SURFACE); if (!r) { *w = WINDOW; inputs++; } return r; }
 VideoProcessing_ErrorCode OH_VideoProcessing_Start(OH_VideoProcessing *p)
 { int r = step(START); if (!r) running++; return r; }
 VideoProcessing_ErrorCode OH_VideoProcessing_Stop(OH_VideoProcessing *p)
@@ -72,7 +82,30 @@ VideoProcessing_ErrorCode OH_VideoProcessing_Destroy(OH_VideoProcessing *p)
 void OH_NativeWindow_DestroyNativeWindow(OHNativeWindow *w)
 { assert(!running && !processors && inputs == 1); inputs--; }
 VideoProcessing_ErrorCode OH_VideoProcessing_RenderOutputBuffer(OH_VideoProcessing *p, uint32_t index)
-{ assert(index == 7); rendered++; return 0; }
+{
+    assert(!in_callback && index == 7);
+    atomic_fetch_add(&rendered, 1);
+    while (atomic_load(&hold_render)) test_sleep();
+    return atomic_load(&render_error);
+}
+
+static void emit_output(void)
+{
+    in_callback = true;
+    output_cb(PROCESSOR, 7, callback_data);
+    in_callback = false;
+}
+
+static int wait_error(struct ohos_vpe *vpe)
+{
+    for (int n = 0; n < 2000; n++) {
+        int err = ohos_vpe_take_error(vpe);
+        if (err) return err;
+        test_sleep();
+    }
+    assert(!"Expected fallback");
+    return 0;
+}
 
 int main(void)
 {
@@ -93,8 +126,12 @@ int main(void)
     assert(width == 1280 && height == 720 && resize_count == old_resizes + 1);
     ohos_vpe_resize(vpe, 0, 0);
     assert(resize_count == old_resizes + 1);
-    output_cb(PROCESSOR, 7, callback_data);
+    emit_output();
+    for (int n = 0; n < 2000 && !atomic_load(&rendered); n++) test_sleep();
     assert(rendered == 1 && !ohos_vpe_take_error(vpe));
+    ohos_vpe_note_input(vpe);
+    atomic_fetch_add(&fake_time, MP_TIME_S_TO_NS(10));
+    assert(!ohos_vpe_take_error(vpe)); // a displayed first frame disarms timeout
     error_cb(PROCESSOR, VIDEO_PROCESSING_ERROR_PROCESS_FAILED, callback_data);
     assert(ohos_vpe_take_error(vpe) == VIDEO_PROCESSING_ERROR_PROCESS_FAILED);
     assert(!ohos_vpe_take_error(vpe)); // one fallback request per instance
@@ -110,12 +147,45 @@ int main(void)
 
     fail_at = 0;
     vpe = ohos_vpe_create(NULL, WINDOW, 1920, 1080);
+    atomic_fetch_add(&fake_time, MP_TIME_S_TO_NS(10));
+    assert(!ohos_vpe_take_error(vpe)); // loading alone never arms timeout
+    ohos_vpe_note_input(vpe);
+    ohos_vpe_set_wakeup(vpe, wake_vo, NULL);
+    atomic_fetch_add(&fake_time, MP_TIME_S_TO_NS(4));
+    assert(wait_error(vpe) == VIDEO_PROCESSING_ERROR_PROCESS_FAILED);
+    assert(atomic_load(&wakeups) > 0); // wake a sleeping VO to request fallback
+    assert(!ohos_vpe_take_error(vpe));
+    ohos_vpe_destroy(vpe);
+
+    vpe = ohos_vpe_create(NULL, WINDOW, 1920, 1080);
+    atomic_store(&render_error, VIDEO_PROCESSING_ERROR_PROCESS_FAILED);
+    emit_output();
+    assert(wait_error(vpe) == VIDEO_PROCESSING_ERROR_PROCESS_FAILED);
+    ohos_vpe_destroy(vpe);
+    atomic_store(&render_error, 0);
+
+    vpe = ohos_vpe_create(NULL, WINDOW, 1920, 1080);
+    atomic_store(&hold_render, true);
+    int previous = atomic_load(&rendered);
+    emit_output();
+    for (int n = 0; n < 2000 && atomic_load(&rendered) == previous; n++) test_sleep();
+    assert(atomic_load(&rendered) > previous);
+    for (int n = 0; n < 33; n++) emit_output();
+    assert(wait_error(vpe) == VIDEO_PROCESSING_ERROR_PROCESS_FAILED); // bounded queue
+    atomic_store(&hold_render, false);
+    ohos_vpe_stop_output(vpe);
+    previous = atomic_load(&rendered);
+    emit_output(); // late callbacks after stopping cannot submit more frames
+    assert(atomic_load(&rendered) == previous);
+    ohos_vpe_destroy(vpe); // stop is idempotent, processor still destroyed once
+
+    vpe = ohos_vpe_create(NULL, WINDOW, 1920, 1080);
     destroy_error = 1;
     ohos_vpe_destroy(vpe);
     // Failed destruction must retain callback data and the input window.
     assert(processors == 1 && inputs == 1 && !running);
     error_cb(PROCESSOR, VIDEO_PROCESSING_ERROR_PROCESS_FAILED, callback_data);
     assert(ohos_vpe_take_error(vpe));
-    puts("VPE lifecycle: 12 setup failures, high quality, output, resize, fallback and failed destruction passed");
+    puts("VPE lifecycle: setup failures, high quality, worker output, first-frame timeout, render failure, resize and teardown passed");
     return 0;
 }

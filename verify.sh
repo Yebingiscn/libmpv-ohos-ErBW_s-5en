@@ -157,6 +157,14 @@ for marker in "[OSDGLES]" "OSD GLES Surface attached" \
   fi
 done
 
+for marker in "[SuperResolution] First output submitted" \
+              "[SuperResolution] No first output; requesting normal output"; do
+  if ! "$STRINGS" "$LIBMPV" | grep -F "$marker" >/dev/null; then
+    echo "Missing VPE output recovery marker: $marker" >&2
+    exit 1
+  fi
+done
+
 if ! "$STRINGS" "$LIBMPV" | grep -F "OHAudio clock unavailable:" >/dev/null; then
   echo "Missing OHAudio clock state diagnostics" >&2
   exit 1
