@@ -34,7 +34,7 @@ jobs:
       matrix:
         arch: [arm64, x86_64]
     env:
-      TARGET_ARCH: ${{ matrix.arch }}
+      MPV_BUILD_ARCH: ${{ matrix.arch }}
     steps:
       - name: Clone repository
         uses: actions/checkout@v7

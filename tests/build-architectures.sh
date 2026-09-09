@@ -8,8 +8,10 @@ export -f uname
 
 for arch in arm64 x86_64; do
   (
-    export TARGET_ARCH=$arch
+    unset TARGET_ARCH
+    export MPV_BUILD_ARCH=$arch
     . ./env.sh
+    test "${TARGET_ARCH+x}" != x
     test "$DEST" = "$ROOT_DIR/libmpv/$arch-build"
     test "$CROSS_FILE" = "$ROOT_DIR/libmpv/$arch-crossfile.ini"
     if [ "$arch" = arm64 ]; then
@@ -33,15 +35,23 @@ for arch in arm64 x86_64; do
     ! grep -q '@' <<< "$cross"
     grep -F "cpu_family = '$FFMPEG_ARCH'" <<< "$cross" >/dev/null
     grep -F -- "--target=$TARGET_TRIPLE" <<< "$cross" >/dev/null
+    # Lua uses this implicit rule. An exported TARGET_ARCH=arm64 used to
+    # append a bare "arm64" input to every compile command.
+    compile=$("${MPV_TEST_MAKE:-make}" -Bn -f tests/build-implicit.mk tests/vpe/lifecycle.o)
+    grep -F -- "--target=$TARGET_TRIPLE" <<< "$compile" >/dev/null
+    if grep -Eq '(^|[[:space:]])(arm64|x86_64)([[:space:]]|$)' <<< "$compile"; then
+      echo "Architecture selector leaked into compiler arguments: $compile" >&2
+      exit 1
+    fi
     echo "$arch configuration passed"
   )
 done
 (
-  unset TARGET_ARCH
+  unset MPV_BUILD_ARCH
   . ./env.sh
-  test "$TARGET_ARCH" = arm64
+  test "$MPV_BUILD_ARCH" = arm64
 )
-if (export TARGET_ARCH=invalid; . ./env.sh) >/dev/null 2>&1; then
+if (export MPV_BUILD_ARCH=invalid; . ./env.sh) >/dev/null 2>&1; then
   echo 'Invalid architecture was accepted' >&2
   exit 1
 fi

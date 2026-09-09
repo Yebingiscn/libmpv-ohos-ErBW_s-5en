@@ -7,8 +7,9 @@ and patches. The combined `artifact` download contains `libmpv_aarch64.zip`
 (ARM64 devices) and `libmpv_x86_64.zip` (x86_64 emulators), each containing its
 own `libmpv.so`. Architecture-specific downloads remain available if one job fails.
 
-For a local Linux/macOS build, run `TARGET_ARCH=arm64 ./bundle.sh` (default) or
-`TARGET_ARCH=x86_64 ./bundle.sh`. Use a **separate fresh checkout per architecture**:
+For a local Linux/macOS build, run `MPV_BUILD_ARCH=arm64 ./bundle.sh` (default) or
+`MPV_BUILD_ARCH=x86_64 ./bundle.sh`. Do not use `TARGET_ARCH`: GNU Make treats
+that variable as compiler flags. Use a **separate fresh checkout per architecture**:
 dependency source directories contain in-tree build caches and cannot be shared
 between architectures. Outputs go to `libmpv/<architecture>-build/`.
 Install NASM for x86_64 assembly. ARM here means ARM64, not 32-bit ARM.

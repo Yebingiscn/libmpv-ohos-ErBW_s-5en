@@ -15,7 +15,7 @@ fi
 
 elf_header=$("$READELF" -h "$LIBMPV")
 if ! grep -F "Machine:" <<< "$elf_header" | grep -F "$ELF_MACHINE" >/dev/null; then
-  echo "Wrong output architecture; expected $TARGET_ARCH ($ELF_MACHINE)" >&2
+  echo "Wrong output architecture; expected $MPV_BUILD_ARCH ($ELF_MACHINE)" >&2
   exit 1
 fi
 

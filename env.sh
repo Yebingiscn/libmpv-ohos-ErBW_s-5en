@@ -16,8 +16,10 @@ elif [ "$(uname -s)" = "Darwin" ]; then
   export CORES=$(sysctl -n hw.ncpu)
 fi
 
-export TARGET_ARCH=${TARGET_ARCH:-arm64}
-case "$TARGET_ARCH" in
+# TARGET_ARCH is consumed by GNU Make's built-in C rules as compiler flags.
+# Keep our architecture selector separate from toolchain-owned variables.
+export MPV_BUILD_ARCH=${MPV_BUILD_ARCH:-arm64}
+case "$MPV_BUILD_ARCH" in
   arm64)
     export TARGET_TRIPLE=aarch64-linux-ohos RUST_TARGET=aarch64-unknown-linux-ohos
     export OHOS_ARCH=arm64-v8a FFMPEG_ARCH=aarch64 FFMPEG_CPU=armv8-a
@@ -28,10 +30,10 @@ case "$TARGET_ARCH" in
     export OHOS_ARCH=x86_64 FFMPEG_ARCH=x86_64 FFMPEG_CPU=x86-64
     export ELF_MACHINE='Advanced Micro Devices X86-64' ARCHIVE_ARCH=x86_64
     ;;
-  *) echo "Unsupported TARGET_ARCH: $TARGET_ARCH" >&2; exit 1 ;;
+  *) echo "Unsupported MPV_BUILD_ARCH: $MPV_BUILD_ARCH" >&2; exit 1 ;;
 esac
-export DEST=$ROOT_DIR/libmpv/$TARGET_ARCH-build
-export CROSS_FILE=$ROOT_DIR/libmpv/$TARGET_ARCH-crossfile.ini
+export DEST=$ROOT_DIR/libmpv/$MPV_BUILD_ARCH-build
+export CROSS_FILE=$ROOT_DIR/libmpv/$MPV_BUILD_ARCH-crossfile.ini
 export PATH=$OHOS_NDK_HOME/native/build-tools/cmake/bin:$PATH
 export PKG_CONFIG_PATH=$DEST/lib/pkgconfig
 export PKG_CONFIG_LIBDIR=$OHOS_NDK_HOME/native/sysroot/usr/lib
