@@ -157,10 +157,13 @@ for marker in "[OSDGLES]" "OSD GLES Surface attached" \
   fi
 done
 
-for marker in "[SuperResolution] First output submitted" \
+for marker in "[SuperResolution] submitted input=" \
+              "[SuperResolution] configured input/output=" \
+              "[SuperResolution] VPE high quality started after Surface configuration" \
+              "[SuperResolution] HDR+VPE processing failed" \
               "[SuperResolution] No first output; requesting normal output"; do
   if ! "$STRINGS" "$LIBMPV" | grep -F "$marker" >/dev/null; then
-    echo "Missing VPE output recovery marker: $marker" >&2
+    echo "Missing VPE pipeline marker: $marker" >&2
     exit 1
   fi
 done
