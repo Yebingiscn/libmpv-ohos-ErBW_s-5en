@@ -1,0 +1,23 @@
+[host_machine]
+system = 'linux'
+cpu_family = '@CPU_FAMILY@'
+cpu = '@CPU@'
+endian = 'little'
+
+[binaries]
+c = '@OHOS_NDK_HOME@/native/llvm/bin/clang'
+cpp = '@OHOS_NDK_HOME@/native/llvm/bin/clang++'
+ar = '@OHOS_NDK_HOME@/native/llvm/bin/llvm-ar'
+strip = '@OHOS_NDK_HOME@/native/llvm/bin/llvm-strip'
+c_ld = '@OHOS_NDK_HOME@/native/llvm/bin/ld.lld'
+cpp_ld = '@OHOS_NDK_HOME@/native/llvm/bin/ld.lld'
+pkg-config = 'pkg-config'
+
+[built-in options]
+c_args = ['--target=@TARGET_TRIPLE@', '--sysroot=@OHOS_NDK_HOME@/native/sysroot', '-fPIC', '-D__MUSL__=1', '-Wno-int-conversion']
+cpp_args = ['--target=@TARGET_TRIPLE@', '--sysroot=@OHOS_NDK_HOME@/native/sysroot', '-fPIC', '-D__MUSL__=1', '-Wno-int-conversion']
+c_link_args = ['--target=@TARGET_TRIPLE@', '-fuse-ld=lld', '-lc++_shared']
+cpp_link_args = ['--target=@TARGET_TRIPLE@', '-fuse-ld=lld', '-lc++_shared']
+buildtype = 'release'
+default_library = 'static'
+wrap_mode = 'nodownload'

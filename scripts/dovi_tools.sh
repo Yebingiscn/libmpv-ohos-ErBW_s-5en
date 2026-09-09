@@ -19,7 +19,7 @@ fi
 
 cargo cinstall \
   --release \
-  --target=aarch64-unknown-linux-ohos \
+  --target="$RUST_TARGET" \
   --library-type=staticlib \
   --prefix=$DEST \
   --libdir=lib

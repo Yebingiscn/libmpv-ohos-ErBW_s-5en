@@ -21,7 +21,7 @@ mkdir -p .build
 cd .build
 
 meson setup .. \
-  --cross-file $ROOT_DIR/libmpv/arm64-crossfile.ini \
+  --cross-file "$CROSS_FILE" \
   --prefix=$DEST \
   --force-fallback-for=libudfread \
   -Denable_docs=false \

@@ -16,15 +16,30 @@ elif [ "$(uname -s)" = "Darwin" ]; then
   export CORES=$(sysctl -n hw.ncpu)
 fi
 
-export DEST=$ROOT_DIR/libmpv/arm64-build
+export TARGET_ARCH=${TARGET_ARCH:-arm64}
+case "$TARGET_ARCH" in
+  arm64)
+    export TARGET_TRIPLE=aarch64-linux-ohos RUST_TARGET=aarch64-unknown-linux-ohos
+    export OHOS_ARCH=arm64-v8a FFMPEG_ARCH=aarch64 FFMPEG_CPU=armv8-a
+    export ELF_MACHINE=AArch64 ARCHIVE_ARCH=aarch64
+    ;;
+  x86_64)
+    export TARGET_TRIPLE=x86_64-linux-ohos RUST_TARGET=x86_64-unknown-linux-ohos
+    export OHOS_ARCH=x86_64 FFMPEG_ARCH=x86_64 FFMPEG_CPU=x86-64
+    export ELF_MACHINE='Advanced Micro Devices X86-64' ARCHIVE_ARCH=x86_64
+    ;;
+  *) echo "Unsupported TARGET_ARCH: $TARGET_ARCH" >&2; exit 1 ;;
+esac
+export DEST=$ROOT_DIR/libmpv/$TARGET_ARCH-build
+export CROSS_FILE=$ROOT_DIR/libmpv/$TARGET_ARCH-crossfile.ini
 export PATH=$OHOS_NDK_HOME/native/build-tools/cmake/bin:$PATH
 export PKG_CONFIG_PATH=$DEST/lib/pkgconfig
 export PKG_CONFIG_LIBDIR=$OHOS_NDK_HOME/native/sysroot/usr/lib
 export PKG_CONFIG_INCLUDEDIR=$OHOS_NDK_HOME/native/sysroot/usr/include
 
 export AS=$OHOS_NDK_HOME/native/llvm/bin/llvm-as
-export CC="$OHOS_NDK_HOME/native/llvm/bin/clang --target=aarch64-linux-ohos --sysroot=$OHOS_NDK_HOME/native/sysroot"
-export CXX="$OHOS_NDK_HOME/native/llvm/bin/clang++ --target=aarch64-linux-ohos --sysroot=$OHOS_NDK_HOME/native/sysroot"
+export CC="$OHOS_NDK_HOME/native/llvm/bin/clang --target=$TARGET_TRIPLE --sysroot=$OHOS_NDK_HOME/native/sysroot"
+export CXX="$OHOS_NDK_HOME/native/llvm/bin/clang++ --target=$TARGET_TRIPLE --sysroot=$OHOS_NDK_HOME/native/sysroot"
 export LD=$OHOS_NDK_HOME/native/llvm/bin/ld.lld
 export STRIP=$OHOS_NDK_HOME/native/llvm/bin/llvm-strip
 export RANLIB=$OHOS_NDK_HOME/native/llvm/bin/llvm-ranlib

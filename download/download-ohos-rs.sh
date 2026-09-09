@@ -9,7 +9,7 @@ else
   wget -qO - https://sh.rustup.rs | sh
 fi
 
-rustup target add aarch64-unknown-linux-ohos
+rustup target add "$RUST_TARGET"
 # cargo-c is a host tool. Do not let the OHOS target compiler environment
 # leak into its vendored C dependencies.
 env -u CC -u CXX -u CFLAGS -u CXXFLAGS -u AR -u RANLIB \

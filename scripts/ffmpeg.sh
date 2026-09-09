@@ -22,8 +22,8 @@ cd .build
 
 ../configure \
   --prefix=$DEST \
-  --arch=aarch64 \
-  --cpu=armv8-a \
+  --arch="$FFMPEG_ARCH" \
+  --cpu="$FFMPEG_CPU" \
   --target-os=linux \
   --enable-static \
   --disable-shared \

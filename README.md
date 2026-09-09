@@ -1,6 +1,19 @@
 # libmpv-ohos-build
 
-Build scripts of [libmpv](https://github.com/mpv-player/mpv) for ohos-arm64.
+Build scripts of [libmpv](https://github.com/mpv-player/mpv) for OpenHarmony ARM64 and x86_64.
+
+CI builds both architectures in isolated jobs with the same pinned dependencies
+and patches. The combined `artifact` download contains `libmpv_aarch64.zip`
+(ARM64 devices) and `libmpv_x86_64.zip` (x86_64 emulators), each containing its
+own `libmpv.so`. Architecture-specific downloads remain available if one job fails.
+
+For a local Linux/macOS build, run `TARGET_ARCH=arm64 ./bundle.sh` (default) or
+`TARGET_ARCH=x86_64 ./bundle.sh`. Use a **separate fresh checkout per architecture**:
+dependency source directories contain in-tree build caches and cannot be shared
+between architectures. Outputs go to `libmpv/<architecture>-build/`.
+Install NASM for x86_64 assembly. ARM here means ARM64, not 32-bit ARM.
+The emulator also needs x86_64 app-side native libraries; hardware decoding,
+HDR and VPE availability depend on its system image and GPU capabilities.
 The AudioSuite integration requires API 23+, with HOA rendering requiring API 26.
 Linux CI uses the pinned HarmonyOS 7.0 Release public NDK `26.0.0.38`
 (`20260829` archive, verified by SHA-256). Its AudioSuite base and engine headers

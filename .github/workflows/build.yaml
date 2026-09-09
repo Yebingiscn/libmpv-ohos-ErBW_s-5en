@@ -27,8 +27,14 @@ permissions:
 
 jobs:
   build:
-    name: Build
+    name: Build (${{ matrix.arch }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [arm64, x86_64]
+    env:
+      TARGET_ARCH: ${{ matrix.arch }}
     steps:
       - name: Clone repository
         uses: actions/checkout@v7
@@ -36,9 +42,12 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt install -y autoconf automake cmake gperf libtool ninja-build pkg-config
+          sudo apt install -y autoconf automake cmake gperf libtool ninja-build pkg-config nasm
           pip3 install meson
         shell: bash
+
+      - name: Check build configuration
+        run: bash tests/build-architectures.sh
 
       - name: Bundle
         run: |
@@ -49,9 +58,34 @@ jobs:
       - name: Upload Artifact
         uses: actions/upload-artifact@v7
         with:
-          name: artifact
+          name: libmpv-${{ matrix.arch }}
           path: |
-            ./libmpv/arm64-build/*.zip
+            ./libmpv/${{ matrix.arch }}-build/*.zip
+          if-no-files-found: error
+
+  package:
+    name: Package ARM64 and x86_64
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download architecture artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: libmpv-*
+          merge-multiple: true
+          path: dist
+
+      - name: Check both architectures are present
+        run: |
+          test -s dist/libmpv_aarch64.zip
+          test -s dist/libmpv_x86_64.zip
+
+      - name: Upload combined artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: artifact
+          path: dist/*.zip
+          if-no-files-found: error
 
       - name: Prepare release
         if: ${{ github.event.inputs.release == 'true' }}
@@ -68,4 +102,4 @@ jobs:
           body: |
             **Workflow run**: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           files: |
-            ./libmpv/arm64-build/*.zip
+            dist/*.zip

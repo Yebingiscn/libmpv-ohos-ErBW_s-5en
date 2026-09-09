@@ -7,5 +7,6 @@ set -eu
 ./build.sh
 ./verify.sh
 
-cd ./libmpv/arm64-build
-zip libmpv_aarch64.zip libmpv.so
+. ./env.sh
+cd "$DEST"
+zip "libmpv_$ARCHIVE_ARCH.zip" libmpv.so
