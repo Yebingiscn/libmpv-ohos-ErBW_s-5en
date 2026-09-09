@@ -8,12 +8,19 @@
 #include "osdep/timer.h"
 #include <multimedia/video_processing_engine/video_processing.h>
 #include <multimedia/player_framework/native_avformat.h>
+#include <native_buffer/native_buffer.h>
 #include "video/out/ohos_vpe.h"
 
 const int32_t VIDEO_PROCESSING_TYPE_DETAIL_ENHANCER = 2;
 const char *VIDEO_DETAIL_ENHANCER_PARAMETER_KEY_QUALITY_LEVEL = "quality";
 enum { CREATE = 1, CALLBACK_CREATE, BIND_ERROR, BIND_OUTPUT, REGISTER, FORMAT,
-       VALUE, PARAMETER, RESIZE, SURFACE, INPUT_SURFACE, START };
+       VALUE, PARAMETER, RESIZE, OUTPUT_FORMAT, OUTPUT_GET_USAGE, OUTPUT_USAGE,
+       OUTPUT_COLOR, SURFACE, INPUT_SURFACE, INPUT_FORMAT, INPUT_GET_USAGE,
+       INPUT_USAGE, INPUT_COLOR, START };
+static int expected_format = NATIVEBUFFER_PIXEL_FMT_RGBA_8888;
+static OH_NativeBuffer_ColorSpace expected_color = OH_COLORSPACE_DISPLAY_SRGB;
+static int output_format, input_format;
+static bool output_color_set, input_color_set;
 static int fail_at, processors, formats, callbacks, inputs, running, quality;
 static int stage, resize_count, destroy_error, width, height;
 static atomic_int rendered, render_error;
@@ -29,12 +36,15 @@ static void *callback_data;
 static int processor_token, window_token, callback_token, format_token;
 #define PROCESSOR ((OH_VideoProcessing *)&processor_token)
 #define WINDOW ((OHNativeWindow *)&window_token)
+#define INPUT ((OHNativeWindow *)&inputs)
 static int step(int n) { stage = n; return fail_at == n ? 29210004 : 0; }
 void mp_warn(struct mp_log *log, const char *format, ...) {}
 
 VideoProcessing_ErrorCode OH_VideoProcessing_Create(OH_VideoProcessing **p, int type)
 {
     assert(type == VIDEO_PROCESSING_TYPE_DETAIL_ENHANCER);
+    output_format = input_format = 0;
+    output_color_set = input_color_set = false;
     int r = step(CREATE); if (!r) { *p = PROCESSOR; processors++; } return r;
 }
 VideoProcessing_ErrorCode OH_VideoProcessingCallback_Create(VideoProcessing_Callback **p)
@@ -62,16 +72,41 @@ VideoProcessing_ErrorCode OH_VideoProcessing_SetParameter(
 { assert(quality == VIDEO_DETAIL_ENHANCER_QUALITY_LEVEL_HIGH); return step(PARAMETER); }
 int32_t OH_NativeWindow_NativeWindowHandleOpt(OHNativeWindow *w, int code, ...)
 {
-    assert(code == SET_BUFFER_GEOMETRY);
-    va_list ap; va_start(ap, code); width = va_arg(ap, int); height = va_arg(ap, int); va_end(ap);
-    resize_count++; return step(RESIZE);
+    va_list ap; va_start(ap, code);
+    int r = 0;
+    if (code == SET_BUFFER_GEOMETRY) {
+        width = va_arg(ap, int); height = va_arg(ap, int);
+        resize_count++; r = step(RESIZE);
+    } else if (code == SET_FORMAT) {
+        assert(!running);
+        int value = va_arg(ap, int); assert(value == expected_format);
+        if (w == WINDOW) output_format = value; else input_format = value;
+        r = step(w == WINDOW ? OUTPUT_FORMAT : INPUT_FORMAT);
+    } else if (code == GET_USAGE) {
+        *va_arg(ap, uint64_t *) = 1;
+        r = step(w == WINDOW ? OUTPUT_GET_USAGE : INPUT_GET_USAGE);
+    } else if (code == SET_USAGE) {
+        assert(va_arg(ap, uint64_t) == (1 | NATIVEBUFFER_USAGE_HW_RENDER | NATIVEBUFFER_USAGE_HW_TEXTURE));
+        r = step(w == WINDOW ? OUTPUT_USAGE : INPUT_USAGE);
+    } else { assert(!"unexpected window option"); }
+    va_end(ap); return r;
+}
+int32_t OH_NativeWindow_SetColorSpace(OHNativeWindow *w, OH_NativeBuffer_ColorSpace color)
+{
+    assert(!running && color == expected_color);
+    if (w == WINDOW) output_color_set = true; else input_color_set = true;
+    return step(w == WINDOW ? OUTPUT_COLOR : INPUT_COLOR);
 }
 VideoProcessing_ErrorCode OH_VideoProcessing_SetSurface(OH_VideoProcessing *p, const OHNativeWindow *w)
-{ assert(w == WINDOW); return step(SURFACE); }
+{ assert(w == WINDOW && output_format == expected_format && output_color_set); return step(SURFACE); }
 VideoProcessing_ErrorCode OH_VideoProcessing_GetSurface(OH_VideoProcessing *p, OHNativeWindow **w)
-{ int r = step(INPUT_SURFACE); if (!r) { *w = WINDOW; inputs++; } return r; }
+{ int r = step(INPUT_SURFACE); if (!r) { *w = INPUT; inputs++; } return r; }
 VideoProcessing_ErrorCode OH_VideoProcessing_Start(OH_VideoProcessing *p)
-{ int r = step(START); if (!r) running++; return r; }
+{
+    assert(output_format == expected_format && input_format == expected_format);
+    assert(output_color_set && input_color_set);
+    int r = step(START); if (!r) running++; return r;
+}
 VideoProcessing_ErrorCode OH_VideoProcessing_Stop(OH_VideoProcessing *p)
 { assert(running == 1); running--; return 0; }
 VideoProcessing_ErrorCode OH_VideoProcessing_Destroy(OH_VideoProcessing *p)
@@ -96,6 +131,18 @@ static void emit_output(void)
     in_callback = false;
 }
 
+static struct ohos_vpe *create_and_start(struct mp_log *log, OHNativeWindow *window,
+                                        int w, int h)
+{
+    struct ohos_vpe *vpe = ohos_vpe_create_configured(log, window, w, h, expected_format, expected_color);
+    assert(!running);
+    if (vpe && !ohos_vpe_start(vpe)) {
+        ohos_vpe_destroy(vpe);
+        return NULL;
+    }
+    return vpe;
+}
+
 static int wait_error(struct ohos_vpe *vpe)
 {
     for (int n = 0; n < 2000; n++) {
@@ -111,14 +158,19 @@ int main(void)
 {
     for (int n = CREATE; n <= START; n++) {
         fail_at = n;
-        struct ohos_vpe *vpe = ohos_vpe_create(NULL, WINDOW, 1920, 1080);
+        struct ohos_vpe *vpe = create_and_start(NULL, WINDOW, 1920, 1080);
         assert(!vpe && stage == n);
         assert(!processors && !formats && !callbacks && !inputs && !running);
     }
     fail_at = 0;
-    struct ohos_vpe *vpe = ohos_vpe_create(NULL, WINDOW, 1920, 1080);
+    struct ohos_vpe *prepared = ohos_vpe_create_configured(NULL, WINDOW, 1920, 1080,
+                                                         expected_format, expected_color);
+    assert(prepared && !running && processors == 1 && inputs == 1);
+    ohos_vpe_destroy(prepared);
+    assert(!processors && !inputs && !running);
+    struct ohos_vpe *vpe = create_and_start(NULL, WINDOW, 1920, 1080);
     assert(vpe && running == 1 && inputs == 1 && processors == 1);
-    assert(!formats && !callbacks && ohos_vpe_input(vpe) == WINDOW);
+    assert(!formats && !callbacks && ohos_vpe_input(vpe) == INPUT);
     int old_resizes = resize_count;
     ohos_vpe_resize(vpe, 1920, 1080);
     assert(resize_count == old_resizes);
@@ -138,7 +190,7 @@ int main(void)
     ohos_vpe_destroy(vpe);
     assert(!processors && !formats && !callbacks && !inputs && !running);
 
-    vpe = ohos_vpe_create(NULL, WINDOW, 1920, 1080);
+    vpe = create_and_start(NULL, WINDOW, 1920, 1080);
     fail_at = RESIZE;
     ohos_vpe_resize(vpe, 640, 360);
     assert(ohos_vpe_take_error(vpe));
@@ -146,7 +198,7 @@ int main(void)
     assert(!processors && !inputs && !running);
 
     fail_at = 0;
-    vpe = ohos_vpe_create(NULL, WINDOW, 1920, 1080);
+    vpe = create_and_start(NULL, WINDOW, 1920, 1080);
     atomic_fetch_add(&fake_time, MP_TIME_S_TO_NS(10));
     assert(!ohos_vpe_take_error(vpe)); // loading alone never arms timeout
     ohos_vpe_note_input(vpe);
@@ -157,14 +209,14 @@ int main(void)
     assert(!ohos_vpe_take_error(vpe));
     ohos_vpe_destroy(vpe);
 
-    vpe = ohos_vpe_create(NULL, WINDOW, 1920, 1080);
+    vpe = create_and_start(NULL, WINDOW, 1920, 1080);
     atomic_store(&render_error, VIDEO_PROCESSING_ERROR_PROCESS_FAILED);
     emit_output();
     assert(wait_error(vpe) == VIDEO_PROCESSING_ERROR_PROCESS_FAILED);
     ohos_vpe_destroy(vpe);
     atomic_store(&render_error, 0);
 
-    vpe = ohos_vpe_create(NULL, WINDOW, 1920, 1080);
+    vpe = create_and_start(NULL, WINDOW, 1920, 1080);
     atomic_store(&hold_render, true);
     int previous = atomic_load(&rendered);
     emit_output();
@@ -179,13 +231,22 @@ int main(void)
     assert(atomic_load(&rendered) == previous);
     ohos_vpe_destroy(vpe); // stop is idempotent, processor still destroyed once
 
-    vpe = ohos_vpe_create(NULL, WINDOW, 1920, 1080);
+    vpe = create_and_start(NULL, WINDOW, 1920, 1080);
+    ohos_vpe_destroy(vpe);
+    expected_format = NATIVEBUFFER_PIXEL_FMT_RGBA_1010102;
+    expected_color = OH_COLORSPACE_DISPLAY_BT2020_PQ;
+    vpe = create_and_start(NULL, WINDOW, 2236, 1258);
+    assert(vpe && running && input_format == output_format);
+    ohos_vpe_destroy(vpe);
+    expected_color = OH_COLORSPACE_DISPLAY_BT2020_HLG;
+    vpe = create_and_start(NULL, WINDOW, 2236, 1258);
+    assert(vpe && running && input_format == output_format);
     destroy_error = 1;
     ohos_vpe_destroy(vpe);
     // Failed destruction must retain callback data and the input window.
     assert(processors == 1 && inputs == 1 && !running);
     error_cb(PROCESSOR, VIDEO_PROCESSING_ERROR_PROCESS_FAILED, callback_data);
     assert(ohos_vpe_take_error(vpe));
-    puts("VPE lifecycle: setup failures, high quality, worker output, first-frame timeout, render failure, resize and teardown passed");
+    puts("VPE lifecycle: SDR/PQ/HLG format negotiation before Start, setup failures, prepared teardown, worker output, timeout, resize and teardown passed");
     return 0;
 }

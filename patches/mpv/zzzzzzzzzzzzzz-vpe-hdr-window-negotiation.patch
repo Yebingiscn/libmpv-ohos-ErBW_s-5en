@@ -1,0 +1,326 @@
+diff --git a/video/out/ohos_vpe.c b/video/out/ohos_vpe.c
+--- a/video/out/ohos_vpe.c
++++ b/video/out/ohos_vpe.c
+@@ -3,6 +3,7 @@
+ 
+ #include <stdatomic.h>
+ #include <stdlib.h>
++#include <native_buffer/native_buffer.h>
+ #include <multimedia/video_processing_engine/video_processing.h>
+ #include <multimedia/player_framework/native_avformat.h>
+ 
+@@ -32,6 +33,7 @@ struct ohos_vpe {
+     unsigned head, count;
+     bool first_output;
+     int64_t first_input;
++    unsigned input_count, output_count;
+     void (*notify)(void *);
+     void *notify_data;
+ };
+@@ -95,9 +97,12 @@ static MP_THREAD_VOID output_worker(void *data)
+             if (ret) {
+                 atomic_store(&vpe->error, ret);
+                 notify_error(vpe);
+-            } else if (!vpe->first_output) {
++            } else {
+                 vpe->first_output = true;
+-                mp_warn(vpe->log, "[SuperResolution] First output submitted\n");
++                vpe->output_count++;
++                if (vpe->output_count == 1 || vpe->output_count % 120 == 0)
++                    mp_warn(vpe->log, "[SuperResolution] submitted input=%u output=%u pending=%u\n",
++                            vpe->input_count, vpe->output_count, vpe->count);
+             }
+             continue;
+         }
+@@ -123,6 +128,10 @@ void ohos_vpe_note_input(struct ohos_vpe *vpe)
+     if (!vpe)
+         return;
+     mp_mutex_lock(&vpe->lock);
++    vpe->input_count++;
++    if (vpe->input_count == 1 || vpe->input_count % 120 == 0)
++        mp_warn(vpe->log, "[SuperResolution] input=%u output=%u pending=%u\n",
++                vpe->input_count, vpe->output_count, vpe->count);
+     if (!vpe->first_input && !vpe->first_output) {
+         vpe->first_input = mp_time_ns();
+         mp_cond_signal(&vpe->wakeup);
+@@ -181,8 +190,27 @@ void ohos_vpe_resize(struct ohos_vpe *vpe, int width, int height)
+     }
+ }
+ 
+-struct ohos_vpe *ohos_vpe_create(struct mp_log *log, OHNativeWindow *output,
+-                                int width, int height)
++static int configure_window(OHNativeWindow *window, int pixel_format,
++                            OH_NativeBuffer_ColorSpace color_space,
++                            int width, int height)
++{
++    int ret = OH_NativeWindow_NativeWindowHandleOpt(
++        window, SET_BUFFER_GEOMETRY, width, height);
++    if (ret) return ret;
++    ret = OH_NativeWindow_NativeWindowHandleOpt(window, SET_FORMAT, pixel_format);
++    if (ret) return ret;
++    uint64_t usage = 0;
++    ret = OH_NativeWindow_NativeWindowHandleOpt(window, GET_USAGE, &usage);
++    if (ret) return ret;
++    usage |= NATIVEBUFFER_USAGE_HW_RENDER | NATIVEBUFFER_USAGE_HW_TEXTURE;
++    ret = OH_NativeWindow_NativeWindowHandleOpt(window, SET_USAGE, usage);
++    if (ret) return ret;
++    return OH_NativeWindow_SetColorSpace(window, color_space);
++}
++
++struct ohos_vpe *ohos_vpe_create_configured(struct mp_log *log, OHNativeWindow *output,
++                                int width, int height, int pixel_format,
++                                OH_NativeBuffer_ColorSpace color_space)
+ {
+     struct ohos_vpe *vpe = calloc(1, sizeof(*vpe));
+     if (!vpe)
+@@ -237,6 +265,9 @@ struct ohos_vpe *ohos_vpe_create(struct mp_log *log, OHNativeWindow *output,
+     format = NULL;
+     ohos_vpe_resize(vpe, width, height);
+     ret = atomic_load(&vpe->error);
++    if (ret)
++        goto fail;
++    ret = pixel_format >= 0 ? configure_window(output, pixel_format, color_space, width, height) : 0;
+     if (ret)
+         goto fail;
+     ret = OH_VideoProcessing_SetSurface(vpe->processor, output);
+@@ -245,32 +276,60 @@ struct ohos_vpe *ohos_vpe_create(struct mp_log *log, OHNativeWindow *output,
+     ret = OH_VideoProcessing_GetSurface(vpe->processor, &vpe->input);
+     if (ret)
+         goto fail;
+-    ret = OH_VideoProcessing_Start(vpe->processor);
++    ret = pixel_format >= 0 ? configure_window(vpe->input, pixel_format, color_space, width, height) : 0;
+     if (ret)
+         goto fail;
+-    vpe->running = true;
+-    if (mp_thread_create(&vpe->worker, output_worker, vpe)) {
+-        ret = VIDEO_PROCESSING_ERROR_NO_MEMORY;
+-        goto fail;
+-    }
+-    vpe->worker_created = true;
+-    mp_warn(log, "[SuperResolution] VPE high quality enabled\n");
++    mp_warn(log, "[SuperResolution] configured input/output=%dx%d format=%d color=%d; awaiting Start\n",
++            width, height, pixel_format, (int)color_space);
+     return vpe;
+ fail:
+     if (format)
+         OH_AVFormat_Destroy(format);
+     if (callbacks)
+         OH_VideoProcessingCallback_Destroy(callbacks);
+-    mp_warn(log, "[SuperResolution] VPE unavailable (%d); using normal output\n", ret);
++    mp_warn(log, "[SuperResolution] VPE configuration failed (%d), format=%d color=%d\n",
++            ret, pixel_format, (int)color_space);
+     ohos_vpe_destroy(vpe);
+     return NULL;
+ }
+ 
++bool ohos_vpe_start(struct ohos_vpe *vpe)
++{
++    if (!vpe || vpe->running)
++        return vpe && vpe->running;
++    int ret = OH_VideoProcessing_Start(vpe->processor);
++    if (ret) {
++        mp_warn(vpe->log, "[SuperResolution] Start failed: %d\n", ret);
++        return false;
++    }
++    vpe->running = true;
++    if (mp_thread_create(&vpe->worker, output_worker, vpe)) {
++        mp_warn(vpe->log, "[SuperResolution] Output worker creation failed\n");
++        return false;
++    }
++    vpe->worker_created = true;
++    mp_warn(vpe->log, "[SuperResolution] VPE high quality started after Surface configuration\n");
++    return true;
++}
++
+ OHNativeWindow *ohos_vpe_input(struct ohos_vpe *vpe)
+ {
+     return vpe ? vpe->input : NULL;
+ }
+ 
++// Direct decoder Surface output negotiates its format in OHCodec, not EGL.
++struct ohos_vpe *ohos_vpe_create(struct mp_log *log, OHNativeWindow *output,
++                                int width, int height)
++{
++    struct ohos_vpe *vpe = ohos_vpe_create_configured(log, output, width, height,
++                                                     -1, OH_COLORSPACE_DISPLAY_SRGB);
++    if (vpe && !ohos_vpe_start(vpe)) {
++        ohos_vpe_destroy(vpe);
++        return NULL;
++    }
++    return vpe;
++}
++
+ int ohos_vpe_take_error(struct ohos_vpe *vpe)
+ {
+     if (!vpe || vpe->fallback_queued)
+diff --git a/video/out/ohos_vpe.h b/video/out/ohos_vpe.h
+--- a/video/out/ohos_vpe.h
++++ b/video/out/ohos_vpe.h
+@@ -2,6 +2,7 @@
+ #pragma once
+ 
+ #include <stdbool.h>
++#include <native_buffer/buffer_common.h>
+ #include <native_window/external_window.h>
+ 
+ struct mp_log;
+@@ -12,6 +13,11 @@ struct ohos_vpe;
+ // its input window; producers must be destroyed before the processor.
+ struct ohos_vpe *ohos_vpe_create(struct mp_log *log, OHNativeWindow *output,
+                                 int width, int height);
++// GPU output: configure first, publish metadata, then explicitly start.
++struct ohos_vpe *ohos_vpe_create_configured(struct mp_log *log, OHNativeWindow *output,
++                                int width, int height, int pixel_format,
++                                OH_NativeBuffer_ColorSpace color_space);
++bool ohos_vpe_start(struct ohos_vpe *vpe);
+ OHNativeWindow *ohos_vpe_input(struct ohos_vpe *vpe);
+ void ohos_vpe_destroy(struct ohos_vpe *vpe);
+ void ohos_vpe_stop_output(struct ohos_vpe *vpe);
+diff --git a/video/out/ohos_common.c b/video/out/ohos_common.c
+--- a/video/out/ohos_common.c
++++ b/video/out/ohos_common.c
+@@ -184,13 +184,6 @@ bool vo_ohos_init(struct vo *vo)
+     }
+ 
+     ctx->display_window = ctx->native_window;
+-    if (vo->opts->ohos_super_resolution) {
+-        ctx->vpe = ohos_vpe_create(vo->log, ctx->display_window,
+-            vo->opts->ohos_surface_size.w, vo->opts->ohos_surface_size.h);
+-        if (ctx->vpe)
+-            ctx->native_window = ohos_vpe_input(ctx->vpe);
+-        ohos_vpe_attach(ctx->vpe, vo);
+-    }
+     return true;
+ fail:
+     talloc_free(ctx);
+@@ -198,6 +191,27 @@ fail:
+     return false;
+ }
+ 
++bool vo_ohos_prepare_output(struct vo *vo, int pixel_format)
++{
++    struct vo_ohos_state *ctx = vo->ohos;
++    if (!vo->opts->ohos_super_resolution)
++        return true;
++    int w, h;
++    if (!vo_ohos_surface_size(vo, &w, &h))
++        return false;
++    struct pl_color_space color = vo_ohos_preferred_csp(vo);
++    ctx->vpe = ohos_vpe_create_configured(vo->log, ctx->display_window, w, h,
++                              pixel_format, get_color_space(&color));
++    if (!ctx->vpe)
++        return false;
++    ctx->native_window = ohos_vpe_input(ctx->vpe);
++    ohos_vpe_attach(ctx->vpe, vo);
++    // Both windows exist now; publish matching HDR metadata before Start can
++    // allocate any buffers. EGL will bind the already configured input next.
++    set_output_color(ctx, color);
++    return ohos_vpe_start(ctx->vpe);
++}
++
+ void vo_ohos_uninit(struct vo *vo)
+ {
+     struct vo_ohos_state *ctx = vo->ohos;
+@@ -236,6 +250,12 @@ bool vo_ohos_surface_size(struct vo *vo, int *out_w, int *out_h)
+     return true;
+ }
+ 
++void vo_ohos_stop_output(struct vo *vo)
++{
++    if (vo->ohos)
++        ohos_vpe_stop_output(vo->ohos->vpe);
++}
++
+ bool vo_ohos_set_surface_size(struct vo *vo, int w, int h)
+ {
+     struct vo_ohos_state *ctx = vo->ohos;
+@@ -347,6 +367,10 @@ void ohos_vpe_check(struct ohos_vpe *vpe, struct vo *vo)
+     // from the VO thread, never from a vendor processing callback.
+     int error = ohos_vpe_take_error(vpe);
+     if (error) {
++        if (vo->opts->ohos_sdr_to_hdr) {
++            MP_ERR(vo, "[SuperResolution] HDR+VPE processing failed (%d); keeping both requested options for diagnosis\n", error);
++            return;
++        }
+         MP_WARN(vo, "[SuperResolution] Processing failed (%d); restoring normal output\n", error);
+         const char *cmd[] = {"set", "ohos-super-resolution", "no", NULL};
+         mp_input_run_cmd(vo->input_ctx, cmd);
+diff --git a/video/out/ohos_common.h b/video/out/ohos_common.h
+--- a/video/out/ohos_common.h
++++ b/video/out/ohos_common.h
+@@ -27,7 +27,9 @@ struct vo;
+ struct mp_image_params;
+ 
+ bool vo_ohos_init(struct vo *vo);
++bool vo_ohos_prepare_output(struct vo *vo, int pixel_format);
+ void vo_ohos_uninit(struct vo *vo);
++void vo_ohos_stop_output(struct vo *vo);
+ OHNativeWindow *vo_ohos_native_window(struct vo *vo);
+ bool vo_ohos_surface_size(struct vo *vo, int *w, int *h);
+ bool vo_ohos_set_surface_size(struct vo *vo, int w, int h);
+diff --git a/video/out/opengl/context_ohos.c b/video/out/opengl/context_ohos.c
+--- a/video/out/opengl/context_ohos.c
++++ b/video/out/opengl/context_ohos.c
+@@ -66,13 +66,16 @@ static void ohos_set_color(struct ra_ctx *ctx, struct mp_image_params *params)
+ static void ohos_swap_buffers(struct ra_ctx *ctx)
+ {
+     struct priv *p = ctx->priv;
+-    vo_ohos_super_resolution_input(ctx->vo);
+-    eglSwapBuffers(p->egl_display, p->egl_surface);
++    if (eglSwapBuffers(p->egl_display, p->egl_surface))
++        vo_ohos_super_resolution_input(ctx->vo);
++    else
++        MP_ERR(ctx, "EGL swap failed: 0x%x\n", eglGetError());
+ }
+ 
+ static void ohos_uninit(struct ra_ctx *ctx)
+ {
+     struct priv *p = ctx->priv;
++    vo_ohos_stop_output(ctx->vo);
+     ra_gl_ctx_uninit(ctx);
+ 
+     if (p->egl_surface) {
+@@ -116,7 +119,6 @@ static bool ohos_init(struct ra_ctx *ctx)
+     if (hdr_requested && !selection.ten_bit)
+         MP_WARN(ctx, "No 10-bit EGLConfig; SDR-to-HDR disabled for this Surface\n");
+ 
+-    OHNativeWindow *native_window = vo_ohos_native_window(ctx->vo);
+     EGLint native_visual_id = 0;
+     if (!eglGetConfigAttrib(p->egl_display, config, EGL_NATIVE_VISUAL_ID,
+                             &native_visual_id)) {
+@@ -125,6 +127,10 @@ static bool ohos_init(struct ra_ctx *ctx)
+         goto fail;
+     }
+ 
++    if (!vo_ohos_prepare_output(ctx->vo, native_visual_id))
++        goto fail;
++    OHNativeWindow *native_window = vo_ohos_native_window(ctx->vo);
++
+     // HarmonyOS requires the producer NativeWindow format to match the
+     // EGLConfig before eglCreateWindowSurface(). Some devices accept the
+     // XComponent default by accident, while others reject it with EGL_BAD_MATCH.
+diff --git a/video/out/vulkan/context_ohos.c b/video/out/vulkan/context_ohos.c
+--- a/video/out/vulkan/context_ohos.c
++++ b/video/out/vulkan/context_ohos.c
+@@ -45,6 +45,7 @@ static void ohos_swap_buffers(struct ra_ctx *ctx)
+ static void ohos_uninit(struct ra_ctx *ctx)
+ {
+     struct priv *p = ctx->priv;
++    vo_ohos_stop_output(ctx->vo);
+     ra_vk_ctx_uninit(ctx);
+     mpvk_uninit(&p->vk);
+ 
+@@ -63,6 +64,13 @@ static bool ohos_init(struct ra_ctx *ctx)
+     if (!mpvk_init(vk, ctx, VK_OHOS_SURFACE_EXTENSION_NAME))
+         goto fail;
+ 
++    struct pl_color_space output_color = vo_ohos_preferred_csp(ctx->vo);
++    bool hdr = output_color.transfer == PL_COLOR_TRC_PQ ||
++               output_color.transfer == PL_COLOR_TRC_HLG;
++    if (!vo_ohos_prepare_output(ctx->vo, hdr ? NATIVEBUFFER_PIXEL_FMT_RGBA_1010102
++                                            : NATIVEBUFFER_PIXEL_FMT_RGBA_8888))
++        goto fail;
++
+     VkSurfaceCreateInfoOHOS info = {
+          .sType = VK_STRUCTURE_TYPE_SURFACE_CREATE_INFO_OHOS,
+          .window = vo_ohos_native_window(ctx->vo)
