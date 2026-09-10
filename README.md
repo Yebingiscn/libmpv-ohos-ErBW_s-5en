@@ -57,6 +57,11 @@ software-decoded video is unaffected and may still use temporal interpolation.
 
 ## System video super resolution
 
+SDR-to-HDR takes priority over super resolution. When `ohos-sdr-to-hdr` is
+`pq` or `hlg`, VPE is bypassed even if `ohos-super-resolution=yes`. Changing
+SDR-to-HDR recreates the video output so an existing VPE chain is removed;
+turning it off allows the requested super resolution setting to apply again.
+
 `--ohos-super-resolution=yes` enables VPE detail enhancement at fixed HIGH
 quality. The default is `no`. There are no selectable quality levels. The same
 option covers direct OHCodec Surface output, GPU hardware decoding, and software

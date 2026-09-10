@@ -1,0 +1,49 @@
+diff --git a/options/options.c b/options/options.c
+--- a/options/options.c
++++ b/options/options.c
+@@ -249,7 +249,7 @@ static const m_option_t mp_vo_opt_list[] = {
+     {"ohos-surface-size", OPT_SIZE_BOX(ohos_surface_size)},
+     {"ohos-super-resolution", OPT_BOOL(ohos_super_resolution), .flags = UPDATE_VO},
+     {"ohos-sdr-to-hdr", OPT_CHOICE(ohos_sdr_to_hdr,
+-        {"no", 0}, {"pq", 1}, {"hlg", 2})},
++        {"no", 0}, {"pq", 1}, {"hlg", 2}), .flags = UPDATE_VO},
+ #endif
+ #if HAVE_D3D11
+     {"d3d11-composition-size", OPT_SIZE_BOX(d3d11_composition_size)},
+diff --git a/video/out/ohos_common.c b/video/out/ohos_common.c
+--- a/video/out/ohos_common.c
++++ b/video/out/ohos_common.c
+@@ -196,6 +196,10 @@ bool vo_ohos_prepare_output(struct vo *vo, int pixel_format)
+     struct vo_ohos_state *ctx = vo->ohos;
+     if (!vo->opts->ohos_super_resolution)
+         return true;
++    if (vo->opts->ohos_sdr_to_hdr) {
++        MP_VERBOSE(vo, "[SuperResolution] Bypassed: SDR-to-HDR takes priority\n");
++        return true;
++    }
+     int w, h;
+     if (!vo_ohos_surface_size(vo, &w, &h))
+         return false;
+@@ -367,10 +371,6 @@ void ohos_vpe_check(struct ohos_vpe *vpe, struct vo *vo)
+     // from the VO thread, never from a vendor processing callback.
+     int error = ohos_vpe_take_error(vpe);
+     if (error) {
+-        if (vo->opts->ohos_sdr_to_hdr) {
+-            MP_ERR(vo, "[SuperResolution] HDR+VPE processing failed (%d); keeping both requested options for diagnosis\n", error);
+-            return;
+-        }
+         MP_WARN(vo, "[SuperResolution] Processing failed (%d); restoring normal output\n", error);
+         const char *cmd[] = {"set", "ohos-super-resolution", "no", NULL};
+         mp_input_run_cmd(vo->input_ctx, cmd);
+diff --git a/video/out/vo_ohcodec.c b/video/out/vo_ohcodec.c
+--- a/video/out/vo_ohcodec.c
++++ b/video/out/vo_ohcodec.c
+@@ -198,7 +198,7 @@ static AVBufferRef *create_ohcodec_device_ref(struct vo *vo)
+     if (ret != 0)
+         MP_VERBOSE(vo, "Failed to mark video Surface source type: %d\n", ret);
+ 
+-    if (vo->opts->ohos_super_resolution) {
++    if (vo->opts->ohos_super_resolution && !vo->opts->ohos_sdr_to_hdr) {
+         output->vpe = ohos_vpe_create(vo->log, window,
+             vo->opts->ohos_surface_size.w, vo->opts->ohos_surface_size.h);
+         ohos_vpe_attach(output->vpe, vo);
