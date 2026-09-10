@@ -27,14 +27,10 @@ permissions:
 
 jobs:
   build:
-    name: Build (${{ matrix.arch }})
+    name: Build ARM64
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        arch: [arm64, x86_64]
     env:
-      MPV_BUILD_ARCH: ${{ matrix.arch }}
+      MPV_BUILD_ARCH: arm64
     steps:
       - name: Clone repository
         uses: actions/checkout@v7
@@ -58,33 +54,9 @@ jobs:
       - name: Upload Artifact
         uses: actions/upload-artifact@v7
         with:
-          name: libmpv-${{ matrix.arch }}
-          path: |
-            ./libmpv/${{ matrix.arch }}-build/*.zip
-          if-no-files-found: error
-
-  package:
-    name: Package ARM64 and x86_64
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download architecture artifacts
-        uses: actions/download-artifact@v8
-        with:
-          pattern: libmpv-*
-          merge-multiple: true
-          path: dist
-
-      - name: Check both architectures are present
-        run: |
-          test -s dist/libmpv_aarch64.zip
-          test -s dist/libmpv_x86_64.zip
-
-      - name: Upload combined artifact
-        uses: actions/upload-artifact@v7
-        with:
           name: artifact
-          path: dist/*.zip
+          path: |
+            ./libmpv/arm64-build/libmpv_aarch64.zip
           if-no-files-found: error
 
       - name: Prepare release
@@ -102,4 +74,4 @@ jobs:
           body: |
             **Workflow run**: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           files: |
-            dist/*.zip
+            ./libmpv/arm64-build/libmpv_aarch64.zip

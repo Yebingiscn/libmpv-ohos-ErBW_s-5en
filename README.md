@@ -2,10 +2,8 @@
 
 Build scripts of [libmpv](https://github.com/mpv-player/mpv) for OpenHarmony ARM64 and x86_64.
 
-CI builds both architectures in isolated jobs with the same pinned dependencies
-and patches. The combined `artifact` download contains `libmpv_aarch64.zip`
-(ARM64 devices) and `libmpv_x86_64.zip` (x86_64 emulators), each containing its
-own `libmpv.so`. Architecture-specific downloads remain available if one job fails.
+CI builds ARM64 only. The `artifact` download contains `libmpv_aarch64.zip`
+with its `libmpv.so`; CI does not build or package x86_64.
 
 For a local Linux/macOS build, run `MPV_BUILD_ARCH=arm64 ./bundle.sh` (default) or
 `MPV_BUILD_ARCH=x86_64 ./bundle.sh`. Do not use `TARGET_ARCH`: GNU Make treats

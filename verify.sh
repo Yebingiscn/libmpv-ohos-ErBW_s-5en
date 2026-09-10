@@ -166,7 +166,7 @@ done
 for marker in "[SuperResolution] submitted input=" \
               "[SuperResolution] configured input/output=" \
               "[SuperResolution] VPE high quality started after Surface configuration" \
-              "[SuperResolution] HDR+VPE processing failed" \
+              "[SuperResolution] Bypassed: SDR-to-HDR takes priority" \
               "[SuperResolution] No first output; requesting normal output"; do
   if ! "$STRINGS" "$LIBMPV" | grep -F "$marker" >/dev/null; then
     echo "Missing VPE pipeline marker: $marker" >&2
