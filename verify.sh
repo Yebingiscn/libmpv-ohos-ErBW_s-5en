@@ -188,6 +188,16 @@ if ! "$STRINGS" "$LIBMPV" | grep -F \
   exit 1
 fi
 
+for marker in "[Perf] decode-send" "[Perf] decode-receive" \
+              "[Perf] surface-draw" "[Perf] surface-submit" \
+              "[Perf] audio-clock" "[Perf] codec-policy" \
+              "[Perf] codec-input" "[Perf] codec-output"; do
+  if ! "$STRINGS" "$LIBMPV" | grep -F "$marker" >/dev/null; then
+    echo "Missing runtime performance diagnostics: $marker" >&2
+    exit 1
+  fi
+done
+
 echo "$features"
 echo "$configuration"
 grep -E "NEEDED|SONAME" <<< "$dynamic_section"

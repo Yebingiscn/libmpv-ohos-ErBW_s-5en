@@ -1,0 +1,59 @@
+diff --git a/libavcodec/ohdec.c b/libavcodec/ohdec.c
+--- a/libavcodec/ohdec.c
++++ b/libavcodec/ohdec.c
+@@ -1234,8 +1234,13 @@ static int oh_decode_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+         OHCodecDecQueueItem buffer = {0};
+         int ret;
+ 
++        // Inspect queue lengths only under the corresponding callback mutex.
++        int64_t perf_output_begin = s->diagnostics_enabled ? oh_decode_perf_time_ns() : 0;
++        size_t perf_output_queued = 0;
+         // Try get output
+         ff_mutex_lock(&s->output_mutex);
++        if (s->diagnostics_enabled)
++            perf_output_queued = av_fifo_can_read(s->output_queue);
+         while (!s->decode_status) {
+             if (av_fifo_read(s->output_queue, &buffer, 1) >= 0)
+                 break;
+@@ -1251,6 +1256,14 @@ static int oh_decode_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+ 
+         ret = s->decode_status;
+         ff_mutex_unlock(&s->output_mutex);
++        if (s->diagnostics_enabled && (buffer.buffer || ret < 0 ||
++            oh_decode_perf_time_ns() - perf_output_begin > 2000000))
++            av_log(avctx, AV_LOG_DEBUG,
++                   "[Perf] codec-output monoNs=%lld waitMs=%.3f queuedBefore=%zu got=%d status=%d eos=%d generation=%llu\n",
++                   (long long)perf_output_begin,
++                   (oh_decode_perf_time_ns() - perf_output_begin) / 1e6,
++                   perf_output_queued, !!buffer.buffer, ret, s->eof_sent,
++                   (unsigned long long)buffer.generation);
+ 
+         // Got a frame
+         if (buffer.buffer) {
+@@ -1270,8 +1283,12 @@ static int oh_decode_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+                 return ret;
+         }
+ 
++        int64_t perf_input_begin = s->diagnostics_enabled ? oh_decode_perf_time_ns() : 0;
++        size_t perf_input_queued = 0;
+         // Wait input buffer
+         ff_mutex_lock(&s->input_mutex);
++        if (s->diagnostics_enabled)
++            perf_input_queued = av_fifo_can_read(s->input_queue);
+         while (!s->decode_status) {
+             if (av_fifo_read(s->input_queue, &buffer, 1) >= 0)
+                 break;
+@@ -1282,6 +1299,13 @@ static int oh_decode_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+ 
+         ret = s->decode_status;
+         ff_mutex_unlock(&s->input_mutex);
++        if (s->diagnostics_enabled && (!buffer.buffer || ret < 0 ||
++            oh_decode_perf_time_ns() - perf_input_begin > 2000000))
++            av_log(avctx, AV_LOG_DEBUG,
++                   "[Perf] codec-input monoNs=%lld waitMs=%.3f queuedBefore=%zu got=%d status=%d pendingBytes=%d\n",
++                   (long long)perf_input_begin,
++                   (oh_decode_perf_time_ns() - perf_input_begin) / 1e6,
++                   perf_input_queued, !!buffer.buffer, ret, s->pkt.size);
+ 
+         if (ret < 0)
+             return ret;

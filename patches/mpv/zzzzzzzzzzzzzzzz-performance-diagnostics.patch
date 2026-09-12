@@ -1,0 +1,136 @@
+diff --git a/video/decode/vd_lavc.c b/video/decode/vd_lavc.c
+--- a/video/decode/vd_lavc.c
++++ b/video/decode/vd_lavc.c
+@@ -17,6 +17,7 @@
+ 
+ #include <float.h>
+ #include <stdio.h>
++#include "osdep/timer.h"
+ #include <stdlib.h>
+ #include <assert.h>
+ #include <stdbool.h>
+@@ -1191,7 +1192,14 @@ static int send_packet(struct mp_filter *vd, struct demux_packet *pkt)
+ 
+     mp_set_av_packet(ctx->avpkt, pkt, &ctx->codec_timebase);
+ 
++    const bool perf = mp_msg_test(vd->log, MSGL_DEBUG);
++    int64_t begin = perf ? mp_time_ns() : 0;
+     int ret = avcodec_send_packet(avctx, pkt ? ctx->avpkt : NULL);
++    if (perf)
++        MP_DBG(vd, "[Perf] decode-send monoNs=%lld costMs=%.3f pts=%.6f dts=%.6f bytes=%zu ret=%d delayQueue=%d\n",
++               (long long)begin, (mp_time_ns() - begin) / 1e6,
++               pkt ? pkt->pts : MP_NOPTS_VALUE, pkt ? pkt->dts : MP_NOPTS_VALUE,
++               pkt ? pkt->len : 0, ret, ctx->num_delay_queue);
+     if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+         return ret;
+ 
+@@ -1234,7 +1242,15 @@ static int decode_frame(struct mp_filter *vd)
+     if (ctx->num_requeue_packets)
+         send_queued_packet(vd);
+ 
++    const bool perf = mp_msg_test(vd->log, MSGL_DEBUG);
++    avcodec_ohcodec_set_diagnostics(avctx, perf);
++    int64_t begin = perf ? mp_time_ns() : 0;
+     int ret = avcodec_receive_frame(avctx, ctx->pic);
++    if (perf)
++        MP_DBG(vd, "[Perf] decode-receive monoNs=%lld costMs=%.3f ptsRaw=%lld ret=%d delayQueue=%d format=%d\n",
++               (long long)begin, (mp_time_ns() - begin) / 1e6,
++               (long long)(ret >= 0 ? ctx->pic->pts : AV_NOPTS_VALUE), ret,
++               ctx->num_delay_queue, ret >= 0 ? ctx->pic->format : -1);
+     if (ret < 0) {
+         if (ret == AVERROR_EOF) {
+             // If flushing was initialized earlier and has ended now, make it
+@@ -1401,7 +1417,13 @@ static int control(struct mp_filter *vd, enum dec_ctrl cmd, void *arg)
+         AVCodecContext *avctx = ctx->avctx;
+         if (!avctx)
+             break;
++        const bool perf = mp_msg_test(vd->log, MSGL_DEBUG);
++        avcodec_ohcodec_set_diagnostics(avctx, perf);
++        int64_t begin = perf ? mp_time_ns() : 0;
+         int ret = avcodec_ohcodec_set_playback_speed(avctx, *(double *)arg);
++        if (perf)
++            MP_DBG(vd, "[Perf] decode-speed monoNs=%lld speed=%.3f costMs=%.3f ret=%d\n",
++                   (long long)begin, *(double *)arg, (mp_time_ns() - begin) / 1e6, ret);
+         return ret >= 0 ? CONTROL_TRUE : CONTROL_FALSE;
+     }
+     }
+diff --git a/video/out/vo_ohcodec.c b/video/out/vo_ohcodec.c
+--- a/video/out/vo_ohcodec.c
++++ b/video/out/vo_ohcodec.c
+@@ -869,7 +869,13 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+     mp_image_unrefp(&p->next_image);
+     p->next_image = image;
+ 
++    const bool perf = mp_msg_test(vo->log, MSGL_DEBUG);
++    int64_t begin = perf ? mp_time_ns() : 0;
+     draw_osd(vo, p->last_pts);
++    if (perf)
++        MP_DBG(vo, "[Perf] surface-draw monoNs=%lld pts=%.6f targetNs=%lld redraw=%d repeat=%d osdMs=%.3f\n",
++               (long long)begin, p->last_pts, (long long)frame->pts,
++               frame->redraw, frame->repeat, (mp_time_ns() - begin) / 1e6);
+     return VO_TRUE;
+ }
+ 
+@@ -887,10 +893,17 @@ static void flip_page(struct vo *vo)
+         AVHWDeviceContext *device = (void *)p->hwctx.av_device_ref->data;
+         struct ohcodec_output *output = device->user_opaque;
+         ohos_vpe_note_input(output->vpe);
++        const bool perf = mp_msg_test(vo->log, MSGL_DEBUG);
++        int64_t begin = perf ? mp_time_ns() : 0;
++        int64_t lead = perf ? p->next_render_time_ns - get_surface_time_ns() : 0;
+         int ret = p->next_render_time_ns > 0
+             ? av_ohcodec_release_buffer_at_time(buffer,
+                                                 p->next_render_time_ns)
+             : av_ohcodec_release_buffer(buffer, 1);
++        if (perf)
++            MP_DBG(vo, "[Perf] surface-submit monoNs=%lld pts=%.6f leadMs=%.3f costMs=%.3f ret=%d\n",
++                   (long long)begin, p->next_image->pts, lead / 1e6,
++                   (mp_time_ns() - begin) / 1e6, ret);
+         if (ret < 0 && ret != AVERROR(EALREADY) && ret != AVERROR(ESTALE))
+             MP_ERR(vo, "Failed to present OHCodec Surface frame: %d\n", ret);
+     }
+diff --git a/audio/out/ao_ohaudio.c b/audio/out/ao_ohaudio.c
+--- a/audio/out/ao_ohaudio.c
++++ b/audio/out/ao_ohaudio.c
+@@ -169,6 +169,7 @@ static MP_THREAD_VOID clock_thread(void *arg)
+     struct priv *p = ao->priv;
+     int reported_clock_error = 0;
+     int reported_suite_error = 0;
++    int64_t perf_last_ns = 0;
+ 
+     mp_thread_set_name("ohaudio-clock");
+     mp_mutex_lock(&p->clock_lock);
+@@ -184,6 +185,8 @@ static MP_THREAD_VOID clock_thread(void *arg)
+                                                memory_order_acquire);
+         mp_mutex_unlock(&p->clock_lock);
+ 
++        const bool perf = mp_msg_test(ao->log, MSGL_DEBUG);
++        int64_t perf_begin = perf ? mp_time_ns() : 0;
+         int64_t position = 0;
+         int64_t timestamp = 0;
+         OH_AudioStream_Result res = OH_AudioRenderer_GetAudioTimestampInfo(
+@@ -191,6 +194,7 @@ static MP_THREAD_VOID clock_thread(void *arg)
+         struct timespec mono;
+         bool mono_valid = clock_gettime(CLOCK_MONOTONIC, &mono) == 0;
+         int64_t now = mp_time_ns();
++        int64_t perf_query_end = perf ? mp_time_ns() : 0;
+         int64_t mapped_timestamp = 0;
+         bool valid = res == AUDIOSTREAM_SUCCESS && position >= 0 && mono_valid &&
+                      ohaudio_clock_translate(timestamp,
+@@ -205,6 +209,16 @@ static MP_THREAD_VOID clock_thread(void *arg)
+             });
+         }
+ 
++        if (perf && now - perf_last_ns >= MP_TIME_MS_TO_NS(250)) {
++            uint32_t underflows = 0;
++            OH_AudioStream_Result underflow_ret =
++                OH_AudioRenderer_GetUnderflowCount(p->renderer, &underflows);
++            MP_DBG(ao, "[Perf] audio-clock monoNs=%lld position=%lld timestampNs=%lld valid=%d epoch=%llu queryMs=%.3f underflows=%u underflowRet=%d\n",
++                   (long long)now, (long long)position, (long long)timestamp,
++                   valid, (unsigned long long)epoch, (perf_query_end - perf_begin) / 1e6,
++                   underflows, underflow_ret);
++            perf_last_ns = now;
++        }
+         // Diagnostics run off the real-time callback and only on state changes.
+         bool current_epoch = atomic_load_explicit(&p->clock_running, memory_order_acquire) &&
+             atomic_load_explicit(&p->clock_epoch, memory_order_acquire) == epoch;

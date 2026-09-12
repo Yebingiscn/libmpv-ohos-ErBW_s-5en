@@ -84,6 +84,24 @@ Successful buffer submission is logged once; it does not prove physical display.
 quality, output callbacks, resize, fallback, and failed vendor destruction.
 `verify.sh` requires the final binary to include the option and VPE dependency.
 
+## Runtime performance diagnostics
+
+The performance patches add debug-level `[Perf]` records for packet/frame calls,
+OHCodec queue waits and policy changes, direct Surface submission and OSD work,
+and OHAudio hardware-clock queries/underflows. Request `debug` through
+`mpv_request_log_messages()` to enable them and `info` to disable them without
+rebuilding or restarting the core. FFmpeg instrumentation follows the decoder's
+runtime log level via `avcodec_ohcodec_set_diagnostics()`; no audio callback logs
+or per-callback timing counters are introduced. `verify.sh` checks the markers
+in the built library.
+
+The SweetVideo bridge adds 250ms property summaries and a hidden `mpvDiagnostics`
+boolean Want parameter, with separate bounded frame-log and ordinary-log budgets.
+New instrumentation requires one updated core build; subsequent toggles are
+runtime-only. API call timings measure host-side work and waiting, not physical
+screen presentation or hardware execution time. Missing/limited log records
+must not be interpreted as dropped video frames.
+
 ## Automatic OHCodec playback policy
 
 Both OHCodec output paths automatically pass the source frame rate to the
