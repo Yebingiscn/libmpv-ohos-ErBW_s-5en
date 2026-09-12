@@ -274,7 +274,7 @@ index 017912535fd7cd38797db1ecd4695759d2c74791..cb1a3718128594790567004ca9840a8e
 +    OH_AVErrCode err = valid ? OH_VideoDecoder_SetParameter(s->dec, format)
 +                             : AV_ERR_INVALID_VAL;
 +    if (s->diagnostics_enabled)
-+        av_log(avctx, AV_LOG_DEBUG,
++        av_log(avctx, AV_LOG_VERBOSE,
 +               "[Perf] codec-policy monoNs=%lld speed=%.3f fps=%.3f retention=%d requestAgeMs=%.3f setMs=%.3f ret=%d\n",
 +               (long long)perf_begin, speed, effective_frame_rate, retention_mode,
 +               s->policy_requested_ns ? (perf_begin - s->policy_requested_ns) / 1e6 : -1.0,

@@ -158,6 +158,18 @@ clock availability and AudioSuite errors are reported on state changes by the
 background thread. The patch stage tests timestamp conversion, stale samples,
 stream epochs, and concurrent snapshot publication on the build host.
 
+OHAudio PCM playback tracks each queued audio frame's actual speed and timestamp.
+Both the playback clock and video scheduling use this timeline when a speed
+change leaves old- and new-speed audio in the output queue. This avoids clock
+jumps on acceleration and restoration without flushing buffered audio. Missing
+timestamps and unavailable history retain mpv's existing timing fallback. The
+patch stage runs regression tests for both speed-change directions, rapid
+switching, timestamp gaps, and bounded history.
+
+Runtime debug diagnostics include `[Perf] audio-timeline` every 250 ms. OHCodec
+queue/policy diagnostics use FFmpeg's verbose level, which maps to mpv debug,
+so the existing hidden diagnostics switch also enables these records.
+
 ## Build Dependencies
 
 - git

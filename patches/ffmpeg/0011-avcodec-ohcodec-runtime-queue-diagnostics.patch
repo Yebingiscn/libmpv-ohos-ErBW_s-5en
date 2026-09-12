@@ -21,7 +21,7 @@ diff --git a/libavcodec/ohdec.c b/libavcodec/ohdec.c
          ff_mutex_unlock(&s->output_mutex);
 +        if (s->diagnostics_enabled && (buffer.buffer || ret < 0 ||
 +            oh_decode_perf_time_ns() - perf_output_begin > 2000000))
-+            av_log(avctx, AV_LOG_DEBUG,
++            av_log(avctx, AV_LOG_VERBOSE,
 +                   "[Perf] codec-output monoNs=%lld waitMs=%.3f queuedBefore=%zu got=%d status=%d eos=%d generation=%llu\n",
 +                   (long long)perf_output_begin,
 +                   (oh_decode_perf_time_ns() - perf_output_begin) / 1e6,
@@ -49,7 +49,7 @@ diff --git a/libavcodec/ohdec.c b/libavcodec/ohdec.c
          ff_mutex_unlock(&s->input_mutex);
 +        if (s->diagnostics_enabled && (!buffer.buffer || ret < 0 ||
 +            oh_decode_perf_time_ns() - perf_input_begin > 2000000))
-+            av_log(avctx, AV_LOG_DEBUG,
++            av_log(avctx, AV_LOG_VERBOSE,
 +                   "[Perf] codec-input monoNs=%lld waitMs=%.3f queuedBefore=%zu got=%d status=%d pendingBytes=%d\n",
 +                   (long long)perf_input_begin,
 +                   (oh_decode_perf_time_ns() - perf_input_begin) / 1e6,

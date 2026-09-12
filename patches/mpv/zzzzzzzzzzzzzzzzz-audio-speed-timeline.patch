@@ -1,0 +1,271 @@
+diff --git a/player/core.h b/player/core.h
+--- a/player/core.h
++++ b/player/core.h
+@@ -22,6 +22,7 @@
+ #include <stdbool.h>
+ 
+ #include "audio/aframe.h"
++#include "audio/output_timeline.h"
+ #include "clipboard/clipboard.h"
+ #include "common/common.h"
+ #include "filters/f_output_chain.h"
+@@ -193,6 +194,8 @@ struct ao_chain {
+ 
+     bool out_eof;
+     double last_out_pts;
++    struct audio_output_timeline output_timeline;
++    int64_t timeline_log_ns;
+ 
+     double start_pts;
+     bool start_pts_known;
+@@ -500,6 +503,7 @@ void reinit_audio_chain(struct MPContext *mpctx);
+ int init_audio_decoder(struct MPContext *mpctx, struct track *track);
+ int reinit_audio_filters(struct MPContext *mpctx);
+ double playing_audio_pts(struct MPContext *mpctx);
++bool audio_timeline_frame_wait(struct MPContext *mpctx, double delay, double *wait);
+ void fill_audio_out_buffers(struct MPContext *mpctx);
+ double written_audio_pts(struct MPContext *mpctx);
+ void clear_audio_output_buffers(struct MPContext *mpctx);
+diff --git a/player/audio.c b/player/audio.c
+--- a/player/audio.c
++++ b/player/audio.c
+@@ -226,6 +226,8 @@ static bool has_video_track(struct MPContext *mpctx)
+ static void ao_chain_reset_state(struct ao_chain *ao_c)
+ {
+     ao_c->last_out_pts = MP_NOPTS_VALUE;
++    audio_timeline_reset(&ao_c->output_timeline);
++    ao_c->timeline_log_ns = 0;
+     ao_c->out_eof = false;
+     ao_c->start_pts_known = false;
+     ao_c->start_pts = MP_NOPTS_VALUE;
+@@ -347,6 +349,7 @@ static void ao_chain_set_ao(struct ao_chain *ao_c, struct ao *ao)
+     if (ao_c->ao != ao) {
+         mp_assert(!ao_c->ao);
+         ao_c->ao = ao;
++        audio_timeline_reset(&ao_c->output_timeline);
+         ao_c->ao_queue = ao_get_queue(ao_c->ao);
+         ao_c->queue_filter = mp_async_queue_create_filter(ao_c->ao_filter,
+                                                           MP_PIN_IN, ao_c->ao_queue);
+@@ -626,6 +629,40 @@ double written_audio_pts(struct MPContext *mpctx)
+     return mpctx->ao_chain ? mpctx->ao_chain->last_out_pts : MP_NOPTS_VALUE;
+ }
+ 
++// Keep the change scoped to the timestamped OHAudio PCM path.
++static bool use_output_timeline(struct MPContext *mpctx)
++{
++    if (!mpctx->ao || !mpctx->ao_chain ||
++        mpctx->ao_chain->ao != mpctx->ao ||
++        strcmp(ao_get_name(mpctx->ao), "ohaudio"))
++        return false;
++    int rate, format;
++    struct mp_chmap channels;
++    ao_get_format(mpctx->ao, &rate, &format, &channels);
++    return af_fmt_is_pcm(format);
++}
++
++bool audio_timeline_frame_wait(struct MPContext *mpctx, double delay, double *wait)
++{
++    if (!use_output_timeline(mpctx))
++        return false;
++    struct ao_chain *ao_c = mpctx->ao_chain;
++    bool valid = audio_timeline_wait(&ao_c->output_timeline, delay,
++                                     ao_c->last_out_pts - mpctx->delay, wait);
++    if (mp_msg_test(mpctx->log, MSGL_DEBUG)) {
++        int64_t now = mp_time_ns();
++        if (now - ao_c->timeline_log_ns >= MP_TIME_MS_TO_NS(250)) {
++            double pts = MP_NOPTS_VALUE;
++            audio_timeline_pts(&ao_c->output_timeline, delay, &pts);
++            MP_DBG(mpctx, "[Perf] audio-timeline monoNs=%lld speed=%.3f aoDelay=%.6f writtenPts=%.6f playingPts=%.6f frameWait=%.6f valid=%d segments=%u\n",
++                   (long long)now, mpctx->audio_speed, delay, ao_c->last_out_pts,
++                   pts, valid ? *wait : 0.0, valid, ao_c->output_timeline.count);
++            ao_c->timeline_log_ns = now;
++        }
++    }
++    return valid;
++}
++
+ // Return pts value corresponding to currently playing audio adjusted for AO delay
+ // and playback speed.
+ double playing_audio_pts(struct MPContext *mpctx)
+@@ -633,7 +670,12 @@ double playing_audio_pts(struct MPContext *mpctx)
+     double pts = written_audio_pts(mpctx);
+     if (pts == MP_NOPTS_VALUE || !mpctx->ao)
+         return pts;
+-    return pts - mpctx->audio_speed * ao_get_delay(mpctx->ao);
++    double delay = ao_get_delay(mpctx->ao);
++    double mapped;
++    if (use_output_timeline(mpctx) &&
++        audio_timeline_pts(&mpctx->ao_chain->output_timeline, delay, &mapped))
++        return mapped;
++    return pts - mpctx->audio_speed * delay;
+ }
+ 
+ // This garbage is needed for untimed AOs. These consume audio infinitely fast,
+@@ -738,7 +780,15 @@ static void ao_process(struct mp_filter *f)
+         }
+ 
+         mpctx->shown_aframes += samples;
+-        double real_samplerate = mp_aframe_get_rate(af) / mpctx->audio_speed;
++        double frame_speed = mp_aframe_get_speed(af);
++        double real_samplerate = mp_aframe_get_rate(af) /
++            (use_output_timeline(mpctx) ? frame_speed : mpctx->audio_speed);
++        if (use_output_timeline(mpctx)) {
++            double pts = mp_aframe_get_pts(af);
++            audio_timeline_append(&ao_c->output_timeline,
++                                  samples / (double)mp_aframe_get_rate(af),
++                                  pts == MP_NOPTS_VALUE ? NAN : pts, frame_speed);
++        }
+         if (mpctx->video_status != STATUS_EOF)
+             mpctx->delay += samples / real_samplerate;
+         ao_c->last_out_pts = mp_aframe_end_pts(af);
+diff --git a/player/video.c b/player/video.c
+--- a/player/video.c
++++ b/player/video.c
+@@ -604,6 +604,7 @@ static void update_avsync_before_frame(struct MPContext *mpctx)
+                !ao_untimed(mpctx->ao))
+     {
+         double buffered_audio = ao_get_delay(mpctx->ao);
++        const double output_delay = buffered_audio;
+ 
+         double predicted = mpctx->delay / mpctx->video_speed +
+                            mpctx->time_frame;
+@@ -621,7 +622,15 @@ static void update_avsync_before_frame(struct MPContext *mpctx)
+             buffered_audio = predicted + difference / opts->autosync;
+         }
+ 
+-        mpctx->time_frame = buffered_audio - mpctx->delay / mpctx->video_speed;
++        double timeline_wait;
++        if (audio_timeline_frame_wait(mpctx, output_delay, &timeline_wait)) {
++            // The audio queue can contain both old- and new-speed frames.
++            // Schedule against their actual output times in either direction.
++            mpctx->time_frame = opts->autosync ? mpctx->time_frame +
++                (timeline_wait - mpctx->time_frame) / opts->autosync : timeline_wait;
++        } else {
++            mpctx->time_frame = buffered_audio - mpctx->delay / mpctx->video_speed;
++        }
+     } else {
+         /* If we're more than 200 ms behind the right playback
+          * position, don't try to speed up display of following
+diff --git a/audio/output_timeline.h b/audio/output_timeline.h
+new file mode 100644
+--- /dev/null
++++ b/audio/output_timeline.h
+@@ -0,0 +1,118 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <math.h>
++#include <stdbool.h>
++
++#define AUDIO_TIMELINE_CAPACITY 256
++
++// Core-thread-only mapping from submitted PCM duration to media timestamps.
++// Adjacent frames with identical speed are merged. No callback work/allocation.
++struct audio_timeline_segment {
++    double start, end;
++    double pts, speed;
++};
++
++struct audio_output_timeline {
++    struct audio_timeline_segment segments[AUDIO_TIMELINE_CAPACITY];
++    unsigned first, count;
++    double written;
++};
++
++static inline void audio_timeline_reset(struct audio_output_timeline *t)
++{
++    t->first = t->count = 0;
++    t->written = 0;
++}
++
++static inline void audio_timeline_append(struct audio_output_timeline *t,
++                                         double duration, double pts, double speed)
++{
++    if (!isfinite(duration) || duration <= 0 || !isfinite(pts) ||
++        !isfinite(speed) || speed <= 0) {
++        audio_timeline_reset(t);
++        return;
++    }
++    double end = t->written + duration;
++    if (t->count) {
++        struct audio_timeline_segment *last =
++            &t->segments[(t->first + t->count - 1) % AUDIO_TIMELINE_CAPACITY];
++        double last_pts = last->pts + (last->end - last->start) * last->speed;
++        if (fabs(last->speed - speed) < 1e-12 && fabs(last_pts - pts) < 1e-7) {
++            last->end = end;
++            t->written = end;
++            return;
++        }
++    }
++    if (t->count == AUDIO_TIMELINE_CAPACITY) {
++        t->first = (t->first + 1) % AUDIO_TIMELINE_CAPACITY;
++        --t->count;
++    }
++    struct audio_timeline_segment *s =
++        &t->segments[(t->first + t->count++) % AUDIO_TIMELINE_CAPACITY];
++    s->start = t->written;
++    s->end = end;
++    s->pts = pts;
++    s->speed = speed;
++    t->written = end;
++}
++
++static inline bool audio_timeline_pts(const struct audio_output_timeline *t,
++                                      double delay, double *pts)
++{
++    if (!t->count || !isfinite(delay) || delay < 0)
++        return false;
++    double played = t->written - delay;
++    for (unsigned i = t->count; i > 0; --i) {
++        const struct audio_timeline_segment *s =
++            &t->segments[(t->first + i - 1) % AUDIO_TIMELINE_CAPACITY];
++        if (played >= s->start - 1e-9 && played <= s->end + 1e-9) {
++            *pts = s->pts + (fmax(s->start, fmin(played, s->end)) - s->start) * s->speed;
++            return true;
++        }
++    }
++    // History was evicted, invalid, or belongs to a previous gapless stream.
++    return false;
++}
++
++static inline bool audio_timeline_wait(const struct audio_output_timeline *t,
++                                       double delay, double target_pts, double *wait)
++{
++    double current_pts;
++    if (!isfinite(target_pts) || !audio_timeline_pts(t, delay, &current_pts))
++        return false;
++    double played = t->written - delay;
++    // Resolve against the segment currently being played first; then look
++    // forward/backward only across contiguous PTS. Never bridge a timestamp gap.
++    unsigned current = 0;
++    for (unsigned i = 0; i < t->count; ++i) {
++        const struct audio_timeline_segment *s =
++            &t->segments[(t->first + i) % AUDIO_TIMELINE_CAPACITY];
++        if (played >= s->start - 1e-9)
++            current = i;
++    }
++    int direction = target_pts >= current_pts ? 1 : -1;
++    for (int i = (int)current; i >= 0 && i < (int)t->count; i += direction) {
++        const struct audio_timeline_segment *s =
++            &t->segments[(t->first + i) % AUDIO_TIMELINE_CAPACITY];
++        double end_pts = s->pts + (s->end - s->start) * s->speed;
++        if (target_pts >= s->pts - 1e-9 && target_pts <= end_pts + 1e-9) {
++            *wait = s->start + (target_pts - s->pts) / s->speed - played;
++            return true;
++        }
++        int next = i + direction;
++        if (next < 0 || next >= (int)t->count) {
++            // A nearby video frame may lie just beyond available audio. Use
++            // this edge segment's speed, never the newly requested speed.
++            *wait = s->start + (target_pts - s->pts) / s->speed - played;
++            return true;
++        }
++        const struct audio_timeline_segment *n =
++            &t->segments[(t->first + next) % AUDIO_TIMELINE_CAPACITY];
++        double boundary = direction > 0 ? end_pts - n->pts :
++            n->pts + (n->end - n->start) * n->speed - s->pts;
++        if (fabs(boundary) > 1e-7)
++            return false;
++    }
++    return false;
++}
