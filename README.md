@@ -170,6 +170,14 @@ Runtime debug diagnostics include `[Perf] audio-timeline` every 250 ms. OHCodec
 queue/policy diagnostics use FFmpeg's verbose level, which maps to mpv debug,
 so the existing hidden diagnostics switch also enables these records.
 
+Decoder throughput now stays high until queued faster audio has drained when
+speed is restored. Video sync projections and frame durations also follow the
+queued timeline, avoiding false frame-drop requests during transitions.
+OHCodec prepares the built-in OSD font provider before presenting video; the
+first font scan adds startup preparation time instead of interrupting playback
+and starving audio. Debug records `decode-demand`, `osd-prewarm`, `font-setup`,
+and slow `osd-prepare` calls identify the remaining transition/startup costs.
+
 ## Build Dependencies
 
 - git
