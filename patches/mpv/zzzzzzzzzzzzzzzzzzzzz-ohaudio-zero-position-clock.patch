@@ -1,0 +1,56 @@
+diff --git a/audio/out/ao_ohaudio.c b/audio/out/ao_ohaudio.c
+--- a/audio/out/ao_ohaudio.c
++++ b/audio/out/ao_ohaudio.c
+@@ -28,6 +28,7 @@
+ #include "osdep/threads.h"
+ #include "osdep/timer.h"
+ #include "ohaudio_clock.h"
++#include "ohaudio_playhead.h"
+ 
+ #include <stdatomic.h>
+ #include <string.h>
+@@ -213,9 +214,9 @@ static MP_THREAD_VOID clock_thread(void *arg)
+             uint32_t underflows = 0;
+             OH_AudioStream_Result underflow_ret =
+                 OH_AudioRenderer_GetUnderflowCount(p->renderer, &underflows);
+-            MP_DBG(ao, "[Perf] audio-clock monoNs=%lld position=%lld timestampNs=%lld valid=%d epoch=%llu queryMs=%.3f underflows=%u underflowRet=%d\n",
++            MP_DBG(ao, "[Perf] audio-clock monoNs=%lld position=%lld timestampNs=%lld valid=%d zeroHold=%d epoch=%llu queryMs=%.3f underflows=%u underflowRet=%d\n",
+                    (long long)now, (long long)position, (long long)timestamp,
+-                   valid, (unsigned long long)epoch, (perf_query_end - perf_begin) / 1e6,
++                   valid, valid && position == 0, (unsigned long long)epoch, (perf_query_end - perf_begin) / 1e6,
+                    underflows, underflow_ret);
+             perf_last_ns = now;
+         }
+@@ -805,9 +806,9 @@ static int32_t audio_on_write_callback(
+         p->timestamp_valid = true;
+ 
+         int64_t elapsed = now - timestamp;
+-        int64_t played = position +
+-            elapsed * output_rate / MP_TIME_S_TO_NS(1);
+-        played = MPCLAMP(played, 0, written);
++        // A reset/starting renderer can keep returning an old zero-position
++        // timestamp. It is not evidence that queued PCM has started playing.
++        int64_t played = ohaudio_playhead(position, elapsed, output_rate, written);
+         p->queued_frames = written - played;
+     } else {
+         // Before the hardware clock starts, all previously returned callback
+diff --git a/audio/out/ohaudio_playhead.h b/audio/out/ohaudio_playhead.h
+new file mode 100644
+--- /dev/null
++++ b/audio/out/ohaudio_playhead.h
+@@ -0,0 +1,15 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++#include <stdint.h>
++
++// Call with an already validated hardware sample and nonnegative sample age.
++// Zero positions can be stale across start/flush; extrapolate only once the
++// renderer has actually reported consuming PCM. No locks or clock API calls.
++static inline int64_t ohaudio_playhead(int64_t position, int64_t elapsed_ns,
++                                      int rate, int64_t written)
++{
++    if (position <= 0)
++        return 0;
++    int64_t played = position + elapsed_ns * rate / INT64_C(1000000000);
++    return played > written ? written : played;
++}

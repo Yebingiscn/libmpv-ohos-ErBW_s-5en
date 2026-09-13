@@ -157,6 +157,12 @@ Audio callbacks have no performance timing counters or periodic statistics;
 clock availability and AudioSuite errors are reported on state changes by the
 background thread. The patch stage tests timestamp conversion, stale samples,
 stream epochs, and concurrent snapshot publication on the build host.
+After start/seek, a hardware sample that still reports zero played frames is
+treated as stationary. Its cached timestamp must not be extrapolated into
+fictional playback progress, followed by a video wait when the hardware clock
+starts advancing. Normal interpolation resumes at the first positive frame
+position. The `audio-clock` diagnostic includes `zeroHold` for this state, and
+the patch stage tests stale zero samples and normal advancing samples.
 
 OHAudio PCM playback tracks each queued audio frame's actual speed and timestamp.
 Both the playback clock and video scheduling use this timeline when a speed
