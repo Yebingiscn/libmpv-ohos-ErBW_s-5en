@@ -177,6 +177,13 @@ OHCodec prepares the built-in OSD font provider before presenting video; the
 first font scan adds startup preparation time instead of interrupting playback
 and starving audio. Debug records `decode-demand`, `osd-prewarm`, `font-setup`,
 and slow `osd-prepare` calls identify the remaining transition/startup costs.
+The startup prewarm also reserves one independent renderer for the first
+external ASS overlay. Its ownership transfers to that overlay on creation;
+an unused reserve is released when OSD is destroyed. This covers overlays
+created after playback begins without sharing libass image caches or disabling
+subtitles. It can add another font scan before the first video frame. Debug
+records `osd-font-reuse` and `osd-font-cold` distinguish a reused renderer from
+additional overlays that still require font setup.
 
 ## Build Dependencies
 

@@ -1,0 +1,51 @@
+diff --git a/sub/osd_state.h b/sub/osd_state.h
+--- a/sub/osd_state.h
++++ b/sub/osd_state.h
+@@ -82,6 +82,9 @@ struct osd_state {
+     struct mp_log *log;
+     struct stats_ctx *stats;
+ 
++    // One independently owned renderer for the first external ASS overlay.
++    // Only populated by the OHCodec startup prewarm path.
++    struct ass_state external_preload;
+     struct mp_draw_sub_cache *draw_cache;
+ };
+ 
+diff --git a/sub/osd_libass.c b/sub/osd_libass.c
+--- a/sub/osd_libass.c
++++ b/sub/osd_libass.c
+@@ -68,6 +68,10 @@ void osd_preload_fonts(struct osd_state *osd)
+     mp_mutex_lock(&osd->lock);
+     m_config_cache_update(osd->opts_cache);
+     create_ass_renderer(osd, &osd->objs[OSDTYPE_OSD]->ass);
++    if (!osd->objs[OSDTYPE_EXTERNAL]->num_externals)
++        create_ass_renderer(osd, &osd->external_preload);
++    MP_DBG(osd, "[Perf] osd-font-preload builtin=%d external=%d\n",
++           !!osd->objs[OSDTYPE_OSD]->ass.render, !!osd->external_preload.render);
+     mp_mutex_unlock(&osd->lock);
+ }
+ 
+@@ -94,6 +98,7 @@ static void destroy_external(struct osd_external *ext)
+ 
+ void osd_destroy_backend(struct osd_state *osd)
+ {
++    destroy_ass_renderer(&osd->external_preload);
+     for (int n = 0; n < MAX_OSD_PARTS; n++) {
+         struct osd_object *obj = osd->objs[n];
+         destroy_ass_renderer(&obj->ass);
+@@ -586,6 +591,15 @@ void osd_set_external(struct osd_state *osd, struct osd_external_ass *ov)
+         if (!ov->format)
+             goto done;
+         struct osd_external *new = talloc_zero(NULL, struct osd_external);
++        // Transfer ownership, never share a renderer between overlays:
++        // libass image/cache storage belongs to its renderer.
++        if (osd->external_preload.render) {
++            new->ass = osd->external_preload;
++            osd->external_preload = (struct ass_state){0};
++            MP_DBG(osd, "[Perf] osd-font-reuse external id=%lld\n", (long long)ov->id);
++        } else {
++            MP_DBG(osd, "[Perf] osd-font-cold external id=%lld\n", (long long)ov->id);
++        }
+         new->ov.owner = ov->owner;
+         new->ov.id = ov->id;
+         MP_TARRAY_APPEND(obj, obj->externals, obj->num_externals, new);
