@@ -58,3 +58,4 @@ done
 bash "$ROOT/scripts/verify-vpe-adapter.sh"
 bash "$ROOT/scripts/verify-ohaudio-clock.sh"
 bash "$ROOT/scripts/verify-audio-output-timeline.sh"
+bash "$ROOT/scripts/verify-osd-font-worker.sh"

@@ -194,7 +194,8 @@ for marker in "[Perf] decode-send" "[Perf] decode-receive" \
               "[Perf] codec-input" "[Perf] codec-output" \
               "[Perf] audio-timeline" "[Perf] decode-demand" \
               "[Perf] osd-prewarm" "[Perf] font-setup" "[Perf] osd-prepare" \
-              "[Perf] osd-font-preload" "[Perf] osd-font-reuse"; do
+              "[Perf] osd-font-preload" "[Perf] osd-font-reuse" \
+              "[Perf] osd-font-async"; do
   if ! "$STRINGS" "$LIBMPV" | grep -F "$marker" >/dev/null; then
     echo "Missing runtime performance diagnostics: $marker" >&2
     exit 1

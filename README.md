@@ -173,17 +173,17 @@ so the existing hidden diagnostics switch also enables these records.
 Decoder throughput now stays high until queued faster audio has drained when
 speed is restored. Video sync projections and frame durations also follow the
 queued timeline, avoiding false frame-drop requests during transitions.
-OHCodec prepares the built-in OSD font provider before presenting video; the
-first font scan adds startup preparation time instead of interrupting playback
-and starving audio. Debug records `decode-demand`, `osd-prewarm`, `font-setup`,
-and slow `osd-prepare` calls identify the remaining transition/startup costs.
-The startup prewarm also reserves one independent renderer for the first
-external ASS overlay. Its ownership transfers to that overlay on creation;
-an unused reserve is released when OSD is destroyed. This covers overlays
-created after playback begins without sharing libass image caches or disabling
-subtitles. It can add another font scan before the first video frame. Debug
-records `osd-font-reuse` and `osd-font-cold` distinguish a reused renderer from
-additional overlays that still require font setup.
+OHCodec starts background font preparation for the built-in OSD and first
+external ASS overlay. Video does not wait for these font scans. Until fonts
+are ready, text overlays are deferred and incoming overlay content is retained;
+size queries use provisional metrics. The worker uses a private OSD/config
+snapshot, then transfers independently owned renderers under a short lock.
+OSD destruction joins the worker before releasing its global context.
+Additional external overlays retain their normal on-demand setup.
+Debug records `osd-font-async`, `osd-font-preload async-ready`, `font-setup`,
+and `osd-font-reuse` distinguish preparation from display. The patch stage
+tests that a blocked font provider does not block startup or the playback OSD
+lock, and checks renderer ownership with and without a pending overlay.
 
 ## Build Dependencies
 
