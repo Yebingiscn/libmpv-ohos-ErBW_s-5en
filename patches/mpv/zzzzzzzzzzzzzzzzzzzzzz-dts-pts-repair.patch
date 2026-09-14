@@ -1,0 +1,210 @@
+diff --git a/filters/f_decoder_wrapper.c b/filters/f_decoder_wrapper.c
+--- a/filters/f_decoder_wrapper.c
++++ b/filters/f_decoder_wrapper.c
+@@ -49,6 +49,7 @@
+ 
+ #include "f_async_queue.h"
+ #include "f_decoder_wrapper.h"
++#include "dts_pts_repair.h"
+ #include "f_demux_in.h"
+ #include "filter_internal.h"
+ 
+@@ -97,6 +98,7 @@ struct dec_wrapper_opts {
+     int aspect_method;
+     double fps_override;
+     bool correct_pts;
++    bool repair_dts_pts;
+     int video_rotate;
+     char *audio_decoders;
+     char *video_decoders;
+@@ -113,6 +115,7 @@ static int decoder_list_help(struct mp_log *log, const m_option_t *opt,
+ const struct m_sub_options dec_wrapper_conf = {
+     .opts = (const struct m_option[]){
+         {"correct-pts", OPT_BOOL(correct_pts)},
++        {"video-repair-dts-pts", OPT_BOOL(repair_dts_pts), .flags = UPDATE_VD},
+         {"container-fps-override", OPT_DOUBLE(fps_override), M_RANGE(0, DBL_MAX)},
+         {"ad", OPT_STRING(audio_decoders),
+             .flags = UPDATE_AD,
+@@ -141,6 +144,7 @@ const struct m_sub_options dec_wrapper_conf = {
+     .size = sizeof(struct dec_wrapper_opts),
+     .defaults = &(const struct dec_wrapper_opts){
+         .correct_pts = true,
++        .repair_dts_pts = true,
+         .movie_aspect = -2.,
+         .aspect_method = 2,
+         .video_reverse_size = 1 * 1024 * 1024 * 1024,
+@@ -172,6 +176,7 @@ struct priv {
+ 
+     // Last PTS from decoder (set with each vd_driver->decode() call)
+     double codec_pts;
++    struct mp_dts_pts_repair dts_pts_repair;
+     int num_codec_pts_problems;
+ 
+     // Last packet DTS from decoder (passed through from source packets)
+@@ -302,6 +307,7 @@ static void thread_unlock(struct priv *p)
+ // some of the user-relevant state.
+ static void reset_decoder(struct priv *p)
+ {
++    mp_dts_pts_reset(&p->dts_pts_repair);
+     p->first_packet_pdts = MP_NOPTS_VALUE;
+     p->start_pts = MP_NOPTS_VALUE;
+     p->codec_pts = MP_NOPTS_VALUE;
+@@ -407,6 +413,7 @@ static bool reinit_decoder(struct priv *p)
+         talloc_free(p->decoder->f);
+     p->decoder = NULL;
+ 
++    p->dts_pts_repair = (struct mp_dts_pts_repair){0};
+     reset_decoder(p);
+     p->has_broken_packet_pts = -10; // needs 10 packets to reach decision
+ 
+@@ -731,6 +738,23 @@ static bool process_decoded_frame(struct priv *p, struct mp_frame *frame)
+     if (frame->type == MP_FRAME_VIDEO) {
+         struct mp_image *mpi = frame->data;
+ 
++        if (p->opts->correct_pts && p->opts->repair_dts_pts && p->play_dir > 0) {
++            bool active = p->dts_pts_repair.active;
++            double raw_pts = mpi->pts;
++            mpi->pts = mp_dts_pts_frame(&p->dts_pts_repair, raw_pts,
++                                      raw_pts != MP_NOPTS_VALUE);
++            if (p->dts_pts_repair.active) {
++                // The reconstructed clock must also drive captions and seek
++                // clipping below, before the usual DTS fallback can run.
++                mpi->dts = MP_NOPTS_VALUE;
++                p->has_broken_packet_pts = 1;
++                if (!active)
++                    MP_WARN(p, "[TimestampRepair] enabled fps=%.6f packets=%u "
++                            "regressions=%u raw=%.6f repaired=%.6f\n",
++                            p->fps, p->dts_pts_repair.packets,
++                            p->dts_pts_repair.regressions, raw_pts, mpi->pts);
++            }
++        }
+         crazy_video_pts_stuff(p, mpi);
+ 
+         struct demux_packet *ccpkt = new_demux_packet_from_buf(p->public.f->packet_pool,
+@@ -922,6 +946,19 @@ static void feed_packet(struct priv *p)
+     struct demux_packet *packet =
+         p->packet.type == MP_FRAME_PACKET ? p->packet.data : NULL;
+ 
++    bool repair = p->codec->type == STREAM_VIDEO && p->play_dir > 0 &&
++                  p->opts->correct_pts && p->opts->repair_dts_pts;
++    if (repair && packet) {
++        bool active = p->dts_pts_repair.active;
++        // Inspect the original timestamps before the missing-DTS fallback.
++        mp_dts_pts_packet(&p->dts_pts_repair, packet->pts, packet->dts,
++                          packet->duration, p->fps,
++                          packet->pts != MP_NOPTS_VALUE &&
++                          packet->dts != MP_NOPTS_VALUE);
++        if (active && !p->dts_pts_repair.active)
++            MP_WARN(p, "[TimestampRepair] disabled: packet cadence changed\n");
++    }
++
+     // For video framedropping, including parts of the hr-seek logic.
+     if (p->decoder->control) {
+         double start_pts = p->start_pts;
+@@ -940,6 +977,10 @@ static void feed_packet(struct priv *p)
+             packet->pts < start_pts - .005 && !p->has_broken_packet_pts)
+             framedrop_type = 2;
+ 
++        // Counting decoded frames requires every frame, including seek
++        // preroll. Presentation can still drop late frames after timestamping.
++        if (repair && mp_dts_pts_no_drop(&p->dts_pts_repair))
++            framedrop_type = 0;
+         p->decoder->control(p->decoder->f, VDCTRL_SET_FRAMEDROP, &framedrop_type);
+     }
+ 
+@@ -1035,7 +1076,9 @@ static void read_frame(struct priv *p)
+     mp_mutex_lock(&p->cache_lock);
+     if (p->attached_picture && frame.type == MP_FRAME_VIDEO)
+         p->decoded_coverart = frame;
+-    if (p->attempt_framedrops) {
++    if (p->attempt_framedrops &&
++        !(p->opts->correct_pts && p->opts->repair_dts_pts && p->play_dir > 0 &&
++          mp_dts_pts_no_drop(&p->dts_pts_repair))) {
+         int dropped = MPMAX(0, p->packets_without_output - 1);
+         p->attempt_framedrops = MPMAX(0, p->attempt_framedrops - dropped);
+         p->dropped_frames += dropped;
+diff --git a/filters/dts_pts_repair.h b/filters/dts_pts_repair.h
+new file mode 100644
+--- /dev/null
++++ b/filters/dts_pts_repair.h
+@@ -0,0 +1,80 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++#include <stdbool.h>
++#include <stdint.h>
++#include <math.h>
++
++// Narrow fallback for CFR packets incorrectly muxed with PTS == DTS.
++// Packet evidence alone is not sufficient: normal low-delay video has that
++// property too. Require repeated decoded PTS regressions near the start.
++struct mp_dts_pts_repair {
++    bool active, rejected;
++    unsigned packets, regressions;
++    uint64_t frames;
++    double step, last_packet, first, last_raw;
++};
++
++static inline void mp_dts_pts_reset(struct mp_dts_pts_repair *s)
++{
++    // A seek restarts counting at the first decoded frame, not the seek target.
++    // Keep the diagnosis so preroll is decoded without dropping any frames.
++    bool active = s->active;
++    *s = (struct mp_dts_pts_repair){.active = active};
++}
++
++static inline void mp_dts_pts_packet(struct mp_dts_pts_repair *s,
++                                    double pts, double dts, double duration,
++                                    double fps, bool valid)
++{
++    if (s->rejected)
++        return;
++    double step = fps > 0 ? 1.0 / fps : 0;
++    double tolerance = step * 0.001 + 0.000002;
++    if (!valid || !isfinite(pts) || !isfinite(dts) ||
++        !isfinite(step) || step <= 0 || !isfinite(duration) ||
++        fabs(pts - dts) > tolerance ||
++        fabs(duration - step) > tolerance ||
++        (s->packets && (fabs(step - s->step) > tolerance ||
++                       fabs(dts - s->last_packet - step) > tolerance)))
++    {
++        s->rejected = true;
++        s->active = false;
++        return;
++    }
++    s->step = step;
++    s->last_packet = dts;
++    if (s->packets < 1000000)
++        s->packets++;
++}
++
++static inline bool mp_dts_pts_no_drop(const struct mp_dts_pts_repair *s)
++{
++    return !s->rejected && (s->active || (s->packets && s->frames < 64));
++}
++
++static inline double mp_dts_pts_frame(struct mp_dts_pts_repair *s,
++                                     double pts, bool valid)
++{
++    if (s->rejected)
++        return pts;
++    if (!valid || !isfinite(pts)) {
++        s->rejected = true;
++        s->active = false;
++        return pts;
++    }
++    if (!s->frames)
++        s->first = pts;
++    if (s->frames && pts < s->last_raw - s->step * 0.5)
++        s->regressions++;
++    s->last_raw = pts;
++    if (!s->active && s->frames < 64 && s->packets >= 8 &&
++        s->regressions >= 2)
++        s->active = true;
++    // Keep the original epoch rather than permanently preserving the bad
++    // startup timestamps. Activation may correct backwards once; subsequent
++    // frames have an exact cadence with no accumulated floating-point drift.
++    double result = s->active && s->step > 0
++                  ? s->first + s->frames * s->step : pts;
++    s->frames++;
++    return result;
++}
