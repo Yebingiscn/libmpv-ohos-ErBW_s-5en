@@ -1,0 +1,81 @@
+diff --git a/libavcodec/avcodec.h b/libavcodec/avcodec.h
+--- a/libavcodec/avcodec.h
++++ b/libavcodec/avcodec.h
+@@ -2923,6 +2923,12 @@ int avcodec_default_execute2(AVCodecContext *c, int (*func)(AVCodecContext *c2,
+  * @return zero on success, a negative AVERROR code otherwise
+  */
+ int avcodec_ohcodec_set_playback_speed(AVCodecContext *avctx, double speed);
++/** Decoder-thread hint: accelerate preroll without changing media time.
++ * preserve_frames suppresses adaptive frame retention for timestamp repair.
++ * Other codecs return AVERROR(ENOSYS). Both flags accept zero or one.
++ */
++int avcodec_ohcodec_set_decode_hints(AVCodecContext *avctx, int preroll,
++                                    int preserve_frames);
+ /** Enable runtime OHCodec diagnostics; ignored for other decoders. */
+ void avcodec_ohcodec_set_diagnostics(AVCodecContext *avctx, int enabled);
+ 
+diff --git a/libavcodec/ohdec.c b/libavcodec/ohdec.c
+--- a/libavcodec/ohdec.c
++++ b/libavcodec/ohdec.c
+@@ -128,6 +128,8 @@ typedef struct OHCodecDecContext {
+     double source_frame_rate;
+     double requested_playback_speed;
+     bool playback_policy_pending;
++    bool preroll;
++    bool preserve_frames;
+     bool smart_fluency_active;
+     bool smart_fluency_failed;
+     bool diagnostics_enabled;
+@@ -1132,9 +1134,13 @@ static void oh_decode_update_playback_policy(AVCodecContext *avctx)
+         return;
+     s->playback_policy_pending = false;
+ 
+-    const double effective_frame_rate = s->source_frame_rate *
+-                                        (speed > 1.0 ? speed : 1.0);
+-    const bool enable_smart_fluency = speed > 1.0 + 1e-6;
++    // A performance hint only: output timestamps and playback speed stay
++    // unchanged. Preroll must decode full frames even for repaired streams.
++    const double effective_frame_rate = s->source_frame_rate > 0.0
++        ? fmax(s->source_frame_rate * fmax(speed, 1.0),
++               s->preroll ? 120.0 : 0.0) : 0.0;
++    const bool enable_smart_fluency = speed > 1.0 + 1e-6 &&
++                                     !s->preroll && !s->preserve_frames;
+     const bool update_smart_fluency = !s->smart_fluency_failed &&
+         s->keys.retention_mode && s->keys.decoder_speed &&
+         oh_decode_supports_smart_fluency(avctx) &&
+@@ -1155,6 +1161,11 @@ static void oh_decode_update_playback_policy(AVCodecContext *avctx)
+                                            effective_frame_rate)) {
+                 OH_AVErrCode err = OH_VideoDecoder_SetParameter(s->dec,
+                                                                  rate_format);
++                if (s->diagnostics_enabled)
++                    av_log(avctx, AV_LOG_VERBOSE,
++                           "[Perf] codec-decode-hints preroll=%d preserve=%d "
++                           "fps=%.3f ret=%d\n", s->preroll,
++                           s->preserve_frames, effective_frame_rate, err);
+                 if (err != AV_ERR_OK)
+                     av_log(avctx, AV_LOG_VERBOSE,
+                            "Failed to update OHCodec effective frame rate "
+@@ -1371,6 +1382,23 @@ int avcodec_ohcodec_set_playback_speed(AVCodecContext *avctx, double speed)
+     return 0;
+ }
+ 
++int avcodec_ohcodec_set_decode_hints(AVCodecContext *avctx, int preroll,
++                                    int preserve_frames)
++{
++    if (!avctx || !avctx->codec || !avctx->priv_data ||
++        !avctx->codec->wrapper_name ||
++        strcmp(avctx->codec->wrapper_name, "ohcodec"))
++        return AVERROR(ENOSYS);
++    OHCodecDecContext *s = avctx->priv_data;
++    if (s->preroll == !!preroll && s->preserve_frames == !!preserve_frames)
++        return 0;
++    s->preroll = !!preroll;
++    s->preserve_frames = !!preserve_frames;
++    s->policy_requested_ns = s->diagnostics_enabled ? oh_decode_perf_time_ns() : 0;
++    s->playback_policy_pending = true;
++    return 0;
++}
++
+ static const AVCodecHWConfigInternal *const oh_hw_configs[] = {
+     &(const AVCodecHWConfigInternal) {
+         .public = {

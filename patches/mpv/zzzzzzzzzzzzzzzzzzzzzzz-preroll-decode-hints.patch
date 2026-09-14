@@ -1,0 +1,73 @@
+diff --git a/filters/f_decoder_wrapper.h b/filters/f_decoder_wrapper.h
+--- a/filters/f_decoder_wrapper.h
++++ b/filters/f_decoder_wrapper.h
+@@ -76,6 +76,8 @@ enum dec_ctrl {
+     VDCTRL_SET_FRAMEDROP,
+     VDCTRL_CHECK_FORCED_EOF,
+     VDCTRL_SET_PLAYBACK_SPEED,
++    // int[2]: preroll performance hint, preserve all decoded frames
++    VDCTRL_SET_DECODE_HINTS,
+ };
+ 
+ int mp_decoder_wrapper_control(struct mp_decoder_wrapper *d,
+diff --git a/filters/f_decoder_wrapper.c b/filters/f_decoder_wrapper.c
+--- a/filters/f_decoder_wrapper.c
++++ b/filters/f_decoder_wrapper.c
+@@ -301,6 +301,21 @@ static void thread_unlock(struct priv *p)
+         mp_dispatch_unlock(p->dec_dispatch);
+ }
+ 
++// Called only on the decoder thread. The hint is distinct from playback
++// speed, which may enable adaptive dropping on the platform decoder.
++static void update_decode_hints(struct priv *p)
++{
++    if (p->codec->type != STREAM_VIDEO || !p->decoder || !p->decoder->control)
++        return;
++    int hints[2] = {
++        p->play_dir > 0 && (p->codec_pts == MP_NOPTS_VALUE ||
++                           p->start_pts != MP_NOPTS_VALUE),
++        p->play_dir > 0 && p->opts->correct_pts && p->opts->repair_dts_pts &&
++            mp_dts_pts_no_drop(&p->dts_pts_repair),
++    };
++    p->decoder->control(p->decoder->f, VDCTRL_SET_DECODE_HINTS, hints);
++}
++
+ // This resets only the decoder. Unlike a full reset(), this doesn't imply a
+ // seek reset. This distinction exists only when using timeline stuff (EDL and
+ // ordered chapters). timeline stuff needs to reset the decoder state, but keep
+@@ -769,6 +784,7 @@ static bool process_decoded_frame(struct priv *p, struct mp_frame *frame)
+         // Stop hr-seek logic.
+         if (mpi->pts == MP_NOPTS_VALUE || mpi->pts >= p->start_pts)
+             p->start_pts = MP_NOPTS_VALUE;
++        update_decode_hints(p);
+ 
+         if (mpi->pts != MP_NOPTS_VALUE) {
+             segment_ended = p->end != MP_NOPTS_VALUE && mpi->pts >= p->end;
+@@ -959,6 +975,8 @@ static void feed_packet(struct priv *p)
+             MP_WARN(p, "[TimestampRepair] disabled: packet cadence changed\n");
+     }
+ 
++    update_decode_hints(p);
++
+     // For video framedropping, including parts of the hr-seek logic.
+     if (p->decoder->control) {
+         double start_pts = p->start_pts;
+diff --git a/video/decode/vd_lavc.c b/video/decode/vd_lavc.c
+--- a/video/decode/vd_lavc.c
++++ b/video/decode/vd_lavc.c
+@@ -1413,6 +1413,15 @@ static int control(struct mp_filter *vd, enum dec_ctrl cmd, void *arg)
+     case VDCTRL_REINIT:
+         reinit(vd);
+         return CONTROL_TRUE;
++    case VDCTRL_SET_DECODE_HINTS: {
++        if (!ctx->avctx)
++            return CONTROL_FALSE;
++        int *hints = arg;
++        avcodec_ohcodec_set_diagnostics(ctx->avctx,
++                                        mp_msg_test(vd->log, MSGL_DEBUG));
++        int ret = avcodec_ohcodec_set_decode_hints(ctx->avctx, hints[0], hints[1]);
++        return ret >= 0 ? CONTROL_TRUE : CONTROL_FALSE;
++    }
+     case VDCTRL_SET_PLAYBACK_SPEED: {
+         AVCodecContext *avctx = ctx->avctx;
+         if (!avctx)
