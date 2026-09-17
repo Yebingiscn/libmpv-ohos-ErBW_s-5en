@@ -1,0 +1,344 @@
+diff --git a/audio/out/ao_ohaudio.c b/audio/out/ao_ohaudio.c
+--- a/audio/out/ao_ohaudio.c
++++ b/audio/out/ao_ohaudio.c
+@@ -37,6 +37,7 @@
+ #include <ohaudio/native_audiostreambuilder.h>
+ #include <ohaudiosuite/native_audio_suite_base.h>
+ #include <ohaudiosuite/native_audio_suite_engine.h>
++#include "ohaudio_suite_loader.h"
+ 
+ #define CLOCK_QUERY_INTERVAL_NS MP_TIME_MS_TO_NS(20)
+ #define SUITE_SCRATCH_SIZE (256 * 1024)
+@@ -445,16 +446,16 @@ static bool suite_create_node(struct ao *ao, OH_AudioNodeBuilder *builder,
+                               OH_AudioNode **node)
+ {
+     struct priv *p = ao->priv;
+-    OH_AudioSuite_Result res = OH_AudioSuiteNodeBuilder_Reset(builder);
++    OH_AudioSuite_Result res = suite_api.OH_AudioSuiteNodeBuilder_Reset(builder);
+     if (res == AUDIOSUITE_SUCCESS)
+-        res = OH_AudioSuiteNodeBuilder_SetNodeType(builder, type);
++        res = suite_api.OH_AudioSuiteNodeBuilder_SetNodeType(builder, type);
+     if (res == AUDIOSUITE_SUCCESS && format)
+-        res = OH_AudioSuiteNodeBuilder_SetFormat(builder, *format);
++        res = suite_api.OH_AudioSuiteNodeBuilder_SetFormat(builder, *format);
+     if (res == AUDIOSUITE_SUCCESS && callback)
+-        res = OH_AudioSuiteNodeBuilder_SetRequestDataCallback(builder,
++        res = suite_api.OH_AudioSuiteNodeBuilder_SetRequestDataCallback(builder,
+                                                                callback, ao);
+     if (res == AUDIOSUITE_SUCCESS)
+-        res = OH_AudioSuiteEngine_CreateNode(p->suite_pipeline, builder, node);
++        res = suite_api.OH_AudioSuiteEngine_CreateNode(p->suite_pipeline, builder, node);
+     if (res != AUDIOSUITE_SUCCESS) {
+         MP_WARN(ao, "AudioSuite failed to create node %d: error code %d.\n",
+                 type, res);
+@@ -486,18 +487,18 @@ static OH_AudioSuite_Result configure_suite_effect(struct priv *p)
+                                  (int)MP_ARRAY_SIZE(eq_presets) - 1)]
+             : p->suite_eq_gains;
+         memcpy(gains.gains, source, sizeof(gains.gains));
+-        return OH_AudioSuiteEngine_SetEqualizerFrequencyBandGains(
++        return suite_api.OH_AudioSuiteEngine_SetEqualizerFrequencyBandGains(
+             p->suite_effect_node, gains);
+     }
+     case SUITE_EFFECT_SOUND_FIELD:
+-        return OH_AudioSuiteEngine_SetSoundFieldType(
++        return suite_api.OH_AudioSuiteEngine_SetSoundFieldType(
+             p->suite_effect_node, (OH_SoundFieldType)p->suite_sound_field);
+     case SUITE_EFFECT_VOICE_BEAUTIFIER:
+-        return OH_AudioSuiteEngine_SetVoiceBeautifierType(
++        return suite_api.OH_AudioSuiteEngine_SetVoiceBeautifierType(
+             p->suite_effect_node,
+             (OH_VoiceBeautifierType)p->suite_beautifier);
+     case SUITE_EFFECT_ENVIRONMENT:
+-        return OH_AudioSuiteEngine_SetEnvironmentType(
++        return suite_api.OH_AudioSuiteEngine_SetEnvironmentType(
+             p->suite_effect_node, (OH_EnvironmentType)p->suite_environment);
+     case SUITE_EFFECT_SPACE_RENDER:
+         if (p->suite_space_mode == SUITE_SPACE_ROTATION) {
+@@ -508,14 +509,14 @@ static OH_AudioSuite_Result configure_suite_effect(struct priv *p)
+                 .surroundTime = p->suite_space_time,
+                 .surroundDirection = p->suite_space_direction,
+             };
+-            return OH_AudioSuiteEngine_SetSpaceRenderRotationParams(
++            return suite_api.OH_AudioSuiteEngine_SetSpaceRenderRotationParams(
+                 p->suite_effect_node, params);
+         } else if (p->suite_space_mode == SUITE_SPACE_EXTENSION) {
+             OH_AudioSuite_SpaceRenderExtensionParams params = {
+                 .extRadius = p->suite_space_radius,
+                 .extAngle = p->suite_space_angle,
+             };
+-            return OH_AudioSuiteEngine_SetSpaceRenderExtensionParams(
++            return suite_api.OH_AudioSuiteEngine_SetSpaceRenderExtensionParams(
+                 p->suite_effect_node, params);
+         } else {
+             OH_AudioSuite_SpaceRenderPositionParams params = {
+@@ -523,7 +524,7 @@ static OH_AudioSuite_Result configure_suite_effect(struct priv *p)
+                 .y = p->suite_space_y,
+                 .z = p->suite_space_z,
+             };
+-            return OH_AudioSuiteEngine_SetSpaceRenderPositionParams(
++            return suite_api.OH_AudioSuiteEngine_SetSpaceRenderPositionParams(
+                 p->suite_effect_node, params);
+         }
+     case SUITE_EFFECT_PURE_VOICE_CHANGE: {
+@@ -532,14 +533,14 @@ static OH_AudioSuite_Result configure_suite_effect(struct priv *p)
+             .optionType = p->suite_pure_type,
+             .pitch = p->suite_pure_pitch,
+         };
+-        return OH_AudioSuiteEngine_SetPureVoiceChangeOption(
++        return suite_api.OH_AudioSuiteEngine_SetPureVoiceChangeOption(
+             p->suite_effect_node, option);
+     }
+     case SUITE_EFFECT_GENERAL_VOICE_CHANGE:
+-        return OH_AudioSuiteEngine_SetGeneralVoiceChangeType(
++        return suite_api.OH_AudioSuiteEngine_SetGeneralVoiceChangeType(
+             p->suite_effect_node, p->suite_general_type);
+     case SUITE_EFFECT_TEMPO_PITCH:
+-        return OH_AudioSuiteEngine_SetTempoAndPitch(
++        return suite_api.OH_AudioSuiteEngine_SetTempoAndPitch(
+             p->suite_effect_node, p->suite_tempo, p->suite_pitch);
+     default:
+         return AUDIOSUITE_SUCCESS;
+@@ -549,26 +550,26 @@ static OH_AudioSuite_Result configure_suite_effect(struct priv *p)
+ static void uninit_audio_suite(struct priv *p)
+ {
+     if (p->suite_pipeline)
+-        OH_AudioSuiteEngine_StopPipeline(p->suite_pipeline);
++        suite_api.OH_AudioSuiteEngine_StopPipeline(p->suite_pipeline);
+     p->suite_active = false;
+     if (p->suite_effect_node) {
+-        OH_AudioSuiteEngine_DestroyNode(p->suite_effect_node);
++        suite_api.OH_AudioSuiteEngine_DestroyNode(p->suite_effect_node);
+         p->suite_effect_node = NULL;
+     }
+     if (p->suite_output) {
+-        OH_AudioSuiteEngine_DestroyNode(p->suite_output);
++        suite_api.OH_AudioSuiteEngine_DestroyNode(p->suite_output);
+         p->suite_output = NULL;
+     }
+     if (p->suite_input) {
+-        OH_AudioSuiteEngine_DestroyNode(p->suite_input);
++        suite_api.OH_AudioSuiteEngine_DestroyNode(p->suite_input);
+         p->suite_input = NULL;
+     }
+     if (p->suite_pipeline) {
+-        OH_AudioSuiteEngine_DestroyPipeline(p->suite_pipeline);
++        suite_api.OH_AudioSuiteEngine_DestroyPipeline(p->suite_pipeline);
+         p->suite_pipeline = NULL;
+     }
+     if (p->suite_engine) {
+-        OH_AudioSuiteEngine_Destroy(p->suite_engine);
++        suite_api.OH_AudioSuiteEngine_Destroy(p->suite_engine);
+         p->suite_engine = NULL;
+     }
+     talloc_free(p->suite_scratch);
+@@ -583,18 +584,23 @@ static bool init_audio_suite(struct ao *ao)
+     OH_AudioSuite_Result res;
+     bool supported = false;
+ 
+-    res = OH_AudioSuiteEngine_IsNodeTypeSupported(effect_type, &supported);
++    if (!audio_suite_available()) {
++        MP_WARN(ao, "AudioSuite library or required APIs unavailable; disabling effects.\n");
++        return false;
++    }
++
++    res = suite_api.OH_AudioSuiteEngine_IsNodeTypeSupported(effect_type, &supported);
+     if (res != AUDIOSUITE_SUCCESS || !supported) {
+         MP_WARN(ao, "AudioSuite effect '%s' is not supported on this device.\n",
+                 suite_effect_name(p->suite_effect));
+         return false;
+     }
+-    if (OH_AudioSuiteEngine_Create(&p->suite_engine) != AUDIOSUITE_SUCCESS ||
+-        OH_AudioSuiteEngine_CreatePipeline(p->suite_engine,
++    if (suite_api.OH_AudioSuiteEngine_Create(&p->suite_engine) != AUDIOSUITE_SUCCESS ||
++        suite_api.OH_AudioSuiteEngine_CreatePipeline(p->suite_engine,
+                                            &p->suite_pipeline,
+                                            AUDIOSUITE_PIPELINE_REALTIME_MODE) !=
+             AUDIOSUITE_SUCCESS ||
+-        OH_AudioSuiteNodeBuilder_Create(&builder) != AUDIOSUITE_SUCCESS)
++        suite_api.OH_AudioSuiteNodeBuilder_Create(&builder) != AUDIOSUITE_SUCCESS)
+     {
+         MP_WARN(ao, "AudioSuite failed to create the real-time pipeline.\n");
+         goto error;
+@@ -615,10 +621,10 @@ static bool init_audio_suite(struct ao *ao)
+                 suite_effect_name(p->suite_effect), res);
+         goto error;
+     }
+-    if (OH_AudioSuiteEngine_ConnectNodes(p->suite_input,
++    if (suite_api.OH_AudioSuiteEngine_ConnectNodes(p->suite_input,
+                                          p->suite_effect_node) !=
+             AUDIOSUITE_SUCCESS ||
+-        OH_AudioSuiteEngine_ConnectNodes(p->suite_effect_node,
++        suite_api.OH_AudioSuiteEngine_ConnectNodes(p->suite_effect_node,
+                                          p->suite_output) !=
+             AUDIOSUITE_SUCCESS)
+     {
+@@ -626,7 +632,7 @@ static bool init_audio_suite(struct ao *ao)
+                 suite_effect_name(p->suite_effect));
+         goto error;
+     }
+-    res = OH_AudioSuiteEngine_StartPipeline(p->suite_pipeline);
++    res = suite_api.OH_AudioSuiteEngine_StartPipeline(p->suite_pipeline);
+     if (res != AUDIOSUITE_SUCCESS) {
+         MP_WARN(ao, "AudioSuite failed to start '%s': error code %d.\n",
+                 suite_effect_name(p->suite_effect), res);
+@@ -641,14 +647,14 @@ static bool init_audio_suite(struct ao *ao)
+         }
+     }
+     p->suite_active = true;
+-    OH_AudioSuiteNodeBuilder_Destroy(builder);
++    suite_api.OH_AudioSuiteNodeBuilder_Destroy(builder);
+     MP_INFO(ao, "AudioSuite real-time effect enabled: %s.\n",
+             suite_effect_name(p->suite_effect));
+     return true;
+ 
+ error:
+     if (builder)
+-        OH_AudioSuiteNodeBuilder_Destroy(builder);
++        suite_api.OH_AudioSuiteNodeBuilder_Destroy(builder);
+     uninit_audio_suite(p);
+     return false;
+ }
+@@ -658,9 +664,9 @@ static bool restart_audio_suite(struct ao *ao)
+     struct priv *p = ao->priv;
+     if (!p->suite_active)
+         return true;
+-    OH_AudioSuiteEngine_StopPipeline(p->suite_pipeline);
++    suite_api.OH_AudioSuiteEngine_StopPipeline(p->suite_pipeline);
+     OH_AudioSuite_Result res =
+-        OH_AudioSuiteEngine_StartPipeline(p->suite_pipeline);
++        suite_api.OH_AudioSuiteEngine_StartPipeline(p->suite_pipeline);
+     if (res != AUDIOSUITE_SUCCESS) {
+         MP_ERR(ao, "AudioSuite failed to restart '%s': error code %d.\n",
+                suite_effect_name(p->suite_effect), res);
+@@ -717,7 +723,7 @@ static int render_audio_suite(struct ao *ao, void *audio_data,
+             .arraySize = 2,
+             .requestFrameSize = audio_data_size,
+         };
+-        res = OH_AudioSuiteEngine_MultiRenderFrame(p->suite_pipeline, &array,
++        res = suite_api.OH_AudioSuiteEngine_MultiRenderFrame(p->suite_pipeline, &array,
+                                                    &response_size, &finished);
+         response_size = MPCLAMP(response_size, 0, audio_data_size);
+         if (res == AUDIOSUITE_SUCCESS &&
+@@ -731,7 +737,7 @@ static int render_audio_suite(struct ao *ao, void *audio_data,
+             }
+         }
+     } else {
+-        res = OH_AudioSuiteEngine_RenderFrame(p->suite_pipeline, audio_data,
++        res = suite_api.OH_AudioSuiteEngine_RenderFrame(p->suite_pipeline, audio_data,
+                                               audio_data_size, &response_size,
+                                               &finished);
+     }
+diff --git a/meson.build b/meson.build
+--- a/meson.build
++++ b/meson.build
+@@ -482,7 +482,7 @@ features += {'ohaudiosuite-hoa': features['ohos'] and cc.has_header_symbol(
+     'ohaudiosuite/native_audio_suite_base.h', 'EFFECT_NODE_TYPE_HOA_SPACE_RENDER')}
+ if features['ohos']
+     dependencies += [cc.find_library('ohaudio'),
+-                     cc.find_library('ohaudiosuite'),
++                     cc.find_library('dl'),
+                      cc.find_library('native_media_codecbase'),
+                      cc.find_library('native_media_core'),
+                      cc.find_library('native_media_vdec'),
+diff --git a/audio/out/ohaudio_suite_loader.h b/audio/out/ohaudio_suite_loader.h
+new file mode 100644
+--- /dev/null
++++ b/audio/out/ohaudio_suite_loader.h
+@@ -0,0 +1,97 @@
++/* AudioSuite is optional: keep all SDK references behind runtime lookup. */
++#ifndef MP_OHAUDIO_SUITE_LOADER_H
++#define MP_OHAUDIO_SUITE_LOADER_H
++#include <stdbool.h>
++#include <dlfcn.h>
++#include <pthread.h>
++#include <ohaudiosuite/native_audio_suite_base.h>
++#include <ohaudiosuite/native_audio_suite_engine.h>
++
++struct ohaudio_suite_api {
++    __typeof__(&OH_AudioSuiteEngine_ConnectNodes) OH_AudioSuiteEngine_ConnectNodes;
++    __typeof__(&OH_AudioSuiteEngine_Create) OH_AudioSuiteEngine_Create;
++    __typeof__(&OH_AudioSuiteEngine_CreateNode) OH_AudioSuiteEngine_CreateNode;
++    __typeof__(&OH_AudioSuiteEngine_CreatePipeline) OH_AudioSuiteEngine_CreatePipeline;
++    __typeof__(&OH_AudioSuiteEngine_Destroy) OH_AudioSuiteEngine_Destroy;
++    __typeof__(&OH_AudioSuiteEngine_DestroyNode) OH_AudioSuiteEngine_DestroyNode;
++    __typeof__(&OH_AudioSuiteEngine_DestroyPipeline) OH_AudioSuiteEngine_DestroyPipeline;
++    __typeof__(&OH_AudioSuiteEngine_IsNodeTypeSupported) OH_AudioSuiteEngine_IsNodeTypeSupported;
++    __typeof__(&OH_AudioSuiteEngine_MultiRenderFrame) OH_AudioSuiteEngine_MultiRenderFrame;
++    __typeof__(&OH_AudioSuiteEngine_RenderFrame) OH_AudioSuiteEngine_RenderFrame;
++    __typeof__(&OH_AudioSuiteEngine_SetEnvironmentType) OH_AudioSuiteEngine_SetEnvironmentType;
++    __typeof__(&OH_AudioSuiteEngine_SetEqualizerFrequencyBandGains) OH_AudioSuiteEngine_SetEqualizerFrequencyBandGains;
++    __typeof__(&OH_AudioSuiteEngine_SetGeneralVoiceChangeType) OH_AudioSuiteEngine_SetGeneralVoiceChangeType;
++    __typeof__(&OH_AudioSuiteEngine_SetPureVoiceChangeOption) OH_AudioSuiteEngine_SetPureVoiceChangeOption;
++    __typeof__(&OH_AudioSuiteEngine_SetSoundFieldType) OH_AudioSuiteEngine_SetSoundFieldType;
++    __typeof__(&OH_AudioSuiteEngine_SetSpaceRenderExtensionParams) OH_AudioSuiteEngine_SetSpaceRenderExtensionParams;
++    __typeof__(&OH_AudioSuiteEngine_SetSpaceRenderPositionParams) OH_AudioSuiteEngine_SetSpaceRenderPositionParams;
++    __typeof__(&OH_AudioSuiteEngine_SetSpaceRenderRotationParams) OH_AudioSuiteEngine_SetSpaceRenderRotationParams;
++    __typeof__(&OH_AudioSuiteEngine_SetTempoAndPitch) OH_AudioSuiteEngine_SetTempoAndPitch;
++    __typeof__(&OH_AudioSuiteEngine_SetVoiceBeautifierType) OH_AudioSuiteEngine_SetVoiceBeautifierType;
++    __typeof__(&OH_AudioSuiteEngine_StartPipeline) OH_AudioSuiteEngine_StartPipeline;
++    __typeof__(&OH_AudioSuiteEngine_StopPipeline) OH_AudioSuiteEngine_StopPipeline;
++    __typeof__(&OH_AudioSuiteNodeBuilder_Create) OH_AudioSuiteNodeBuilder_Create;
++    __typeof__(&OH_AudioSuiteNodeBuilder_Destroy) OH_AudioSuiteNodeBuilder_Destroy;
++    __typeof__(&OH_AudioSuiteNodeBuilder_Reset) OH_AudioSuiteNodeBuilder_Reset;
++    __typeof__(&OH_AudioSuiteNodeBuilder_SetFormat) OH_AudioSuiteNodeBuilder_SetFormat;
++    __typeof__(&OH_AudioSuiteNodeBuilder_SetNodeType) OH_AudioSuiteNodeBuilder_SetNodeType;
++    __typeof__(&OH_AudioSuiteNodeBuilder_SetRequestDataCallback) OH_AudioSuiteNodeBuilder_SetRequestDataCallback;
++};
++static struct ohaudio_suite_api suite_api;
++static pthread_once_t suite_load_once = PTHREAD_ONCE_INIT;
++static bool suite_available;
++
++static void load_audio_suite_once(void)
++{
++    void *library = dlopen("libohaudiosuite.so", RTLD_NOW | RTLD_LOCAL);
++    if (!library)
++        return;
++    struct ohaudio_suite_api api = {0};
++#define LOAD_SUITE_SYMBOL(name) do { \
++    api.name = (__typeof__(api.name))dlsym(library, #name); \
++    if (!api.name) goto unavailable; \
++} while (0)
++    LOAD_SUITE_SYMBOL(OH_AudioSuiteEngine_ConnectNodes);
++    LOAD_SUITE_SYMBOL(OH_AudioSuiteEngine_Create);
++    LOAD_SUITE_SYMBOL(OH_AudioSuiteEngine_CreateNode);
++    LOAD_SUITE_SYMBOL(OH_AudioSuiteEngine_CreatePipeline);
++    LOAD_SUITE_SYMBOL(OH_AudioSuiteEngine_Destroy);
++    LOAD_SUITE_SYMBOL(OH_AudioSuiteEngine_DestroyNode);
++    LOAD_SUITE_SYMBOL(OH_AudioSuiteEngine_DestroyPipeline);
++    LOAD_SUITE_SYMBOL(OH_AudioSuiteEngine_IsNodeTypeSupported);
++    LOAD_SUITE_SYMBOL(OH_AudioSuiteEngine_MultiRenderFrame);
++    LOAD_SUITE_SYMBOL(OH_AudioSuiteEngine_RenderFrame);
++    LOAD_SUITE_SYMBOL(OH_AudioSuiteEngine_SetEnvironmentType);
++    LOAD_SUITE_SYMBOL(OH_AudioSuiteEngine_SetEqualizerFrequencyBandGains);
++    LOAD_SUITE_SYMBOL(OH_AudioSuiteEngine_SetGeneralVoiceChangeType);
++    LOAD_SUITE_SYMBOL(OH_AudioSuiteEngine_SetPureVoiceChangeOption);
++    LOAD_SUITE_SYMBOL(OH_AudioSuiteEngine_SetSoundFieldType);
++    LOAD_SUITE_SYMBOL(OH_AudioSuiteEngine_SetSpaceRenderExtensionParams);
++    LOAD_SUITE_SYMBOL(OH_AudioSuiteEngine_SetSpaceRenderPositionParams);
++    LOAD_SUITE_SYMBOL(OH_AudioSuiteEngine_SetSpaceRenderRotationParams);
++    LOAD_SUITE_SYMBOL(OH_AudioSuiteEngine_SetTempoAndPitch);
++    LOAD_SUITE_SYMBOL(OH_AudioSuiteEngine_SetVoiceBeautifierType);
++    LOAD_SUITE_SYMBOL(OH_AudioSuiteEngine_StartPipeline);
++    LOAD_SUITE_SYMBOL(OH_AudioSuiteEngine_StopPipeline);
++    LOAD_SUITE_SYMBOL(OH_AudioSuiteNodeBuilder_Create);
++    LOAD_SUITE_SYMBOL(OH_AudioSuiteNodeBuilder_Destroy);
++    LOAD_SUITE_SYMBOL(OH_AudioSuiteNodeBuilder_Reset);
++    LOAD_SUITE_SYMBOL(OH_AudioSuiteNodeBuilder_SetFormat);
++    LOAD_SUITE_SYMBOL(OH_AudioSuiteNodeBuilder_SetNodeType);
++    LOAD_SUITE_SYMBOL(OH_AudioSuiteNodeBuilder_SetRequestDataCallback);
++#undef LOAD_SUITE_SYMBOL
++    // Publish only a complete table. Keep the library loaded for callbacks
++    // and subsequent AO instances; never unload while audio threads use it.
++    suite_api = api;
++    suite_available = true;
++    return;
++unavailable:
++    dlclose(library);
++}
++
++static bool audio_suite_available(void)
++{
++    pthread_once(&suite_load_once, load_audio_suite_once);
++    return suite_available;
++}
++#endif

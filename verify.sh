@@ -55,8 +55,12 @@ if ! grep -Eq "NEEDED.*libGLESv2\.so" <<< "$dynamic_section"; then
   echo "Direct OSD renderer is not linked to GLESv2" >&2
   exit 1
 fi
-if ! grep -Eq "NEEDED.*libohaudiosuite\.so" <<< "$dynamic_section"; then
-  echo "OHAudio output is not linked to AudioSuite" >&2
+if grep -Eq "NEEDED.*libohaudiosuite\.so" <<< "$dynamic_section"; then
+  echo "AudioSuite must be optional, not a DT_NEEDED dependency" >&2
+  exit 1
+fi
+if "$NM" -D --undefined-only "$LIBMPV" | grep -Eq 'OH_AudioSuite(Engine|NodeBuilder)_'; then
+  echo "AudioSuite calls must use runtime symbol lookup" >&2
   exit 1
 fi
 if grep -Eq "NEEDED.*lib(dvd|bluray|archive)" <<< "$dynamic_section"; then
