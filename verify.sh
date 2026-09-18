@@ -48,7 +48,7 @@ if ! "$STRINGS" "$LIBMPV" | grep -Fx "ohaudio-vivid" >/dev/null; then
   exit 1
 fi
 vivid_imports=$("$NM" -D --undefined-only "$LIBMPV")
-for symbol in OH_AudioStreamBuilder_SetWriteDataWithMetadataCallback OH_MD_KEY_AUDIO_VIVID_METADATA; do
+for symbol in OH_AudioStreamBuilder_SetWriteDataWithMetadataCallback OH_MD_KEY_AUDIO_VIVID_METADATA OH_AudioRenderer_SetSpeed OH_AudioRenderer_GetSpeed; do
   if ! grep -Eq "[[:space:]]$symbol(@.*)?$" <<< "$vivid_imports"; then
     echo "Missing Audio Vivid transport/rendering import: $symbol" >&2
     exit 1

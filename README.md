@@ -25,6 +25,16 @@ Scripts are compatible with macOS, Linux and WSL, Windows is not supported.
 This tree is based on the `20260715` mpv-arkts binary baseline and pins
 `ErBWs/mpv` to commit `6edeee00a07b9b76f197aa71eee3d029fb090de4`.
 
+## Audio Vivid speed policy
+
+The dedicated OHAudio Vivid output retains PCM/metadata frame pairing. Playback
+speed is delegated to the system renderer (0.25–4x), not mpv tempo/resampling
+filters. A rate is accepted only when the setter and readback agree. Rejection
+keeps the old rate and native Vivid; there is no automatic PCM downgrade.
+Readiness failures and device rejection are reported to the caller. Device
+acceptance is still required; API availability alone does not prove Vivid speed
+support. See `tests/audio-native-integration.md` for verification scope.
+
 ## OHCodec Surface output
 
 The `patches/mpv/support-ohcodec-surface-osd.patch` patch adds the

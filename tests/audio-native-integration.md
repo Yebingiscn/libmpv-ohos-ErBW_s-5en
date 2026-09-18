@@ -32,11 +32,16 @@ raise an output error rather than falling back to ordinary PCM. Seek/reset
 release the renderer before dropping frame references. Format/route changes
 recreate the output; hardware timestamps drive delay estimates.
 
-User-selected policy: Vivid takes priority. The player forces 1x speed and
-pitch, bypasses user audio filters, forced sample/channel conversion and the
+User-selected policy: Vivid takes priority. Native OHAudio speed (0.25–4x) is
+applied only after both SetSpeed and GetSpeed confirm acceptance; rejection
+restores/confirms the old rate without PCM fallback. Requests before the
+renderer is ready retain 1x. Seek reapplies an accepted rate before restart.
+The player keeps pitch unchanged, bypasses user audio filters, forced sample/channel conversion and the
 AudioSuite AO. Ordinary PCM retains its existing AO. Gapless reuse cannot
 carry an output across PCM/Vivid boundaries. The app rejects conflicting
-effect/speed requests based on the selected track, not the file's cached badge.
+effect requests based on the selected track, not the file's cached badge.
+The native app speed setter returns the confirmed speed and a rejection reason;
+UI/AVSession must use that result instead of displaying the requested value.
 
 Build checks: the host packet test validates exact frame boundaries, metadata
 size limits and non-mutation of destinations on invalid input. The final ELF

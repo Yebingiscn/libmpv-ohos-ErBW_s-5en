@@ -1,0 +1,253 @@
+diff --git a/audio/out/ao.h b/audio/out/ao.h
+index 6d7e2f7..02abe22 100644
+--- a/audio/out/ao.h
++++ b/audio/out/ao.h
+@@ -26,6 +26,10 @@
+ #include "audio/chmap_sel.h"
+ 
+ enum aocontrol {
++    // struct ao_native_speed*: requested speed in, confirmed speed out.
++    AOCONTROL_SET_NATIVE_SPEED,
++    // struct ao_native_speed*: current native renderer speed, read-only.
++    AOCONTROL_GET_NATIVE_SPEED,
+     // _VOLUME commands take a pointer to float for input/output.
+     AOCONTROL_GET_VOLUME,
+     AOCONTROL_SET_VOLUME,
+@@ -36,6 +40,10 @@ enum aocontrol {
+     AOCONTROL_UPDATE_STREAM_TITLE,
+ };
+ 
++struct ao_native_speed {
++    double speed;
++};
++
+ // If set, then the queued audio data is the last. Note that after a while, new
+ // data might be written again, instead of closing the AO.
+ #define PLAYER_FINAL_CHUNK 1
+diff --git a/audio/out/buffer.c b/audio/out/buffer.c
+index f3d6ca3..b0481ef 100644
+--- a/audio/out/buffer.c
++++ b/audio/out/buffer.c
+@@ -341,11 +341,19 @@ double ao_get_delay(struct ao *ao)
+     }
+ 
+     int64_t pending = mp_async_queue_get_samples(p->queue);
+-    if (p->pending)
++    // Frame-writing drivers already account for the submitted frame in their
++    // own delay; p->pending only keeps its reference alive until the next write.
++    if (p->pending && !ao->driver->write_frames)
+         pending += mp_aframe_get_size(p->pending);
+ 
++    struct ao_native_speed native = {.speed = 1.0};
++    if (ao->driver->write && ao->driver->control) {
++        if (ao->driver->control(ao, AOCONTROL_GET_NATIVE_SPEED, &native) != CONTROL_OK ||
++            !isfinite(native.speed) || native.speed <= 0)
++            native.speed = 1.0;
++    }
+     mp_mutex_unlock(&p->lock);
+-    return driver_delay + pending / (double)ao->samplerate;
++    return driver_delay + pending / ((double)ao->samplerate * native.speed);
+ }
+ 
+ // Fully stop playback; clear buffers, including queue.
+diff --git a/audio/out/ao_ohaudio_vivid.c b/audio/out/ao_ohaudio_vivid.c
+index cc57958..bc3e8f6 100644
+--- a/audio/out/ao_ohaudio_vivid.c
++++ b/audio/out/ao_ohaudio_vivid.c
+@@ -6,6 +6,7 @@
+ #include <stdatomic.h>
+ #include <string.h>
+ #include <time.h>
++#include <math.h>
+ #include <libavutil/frame.h>
+ #include <libavutil/audio_vivid.h>
+ #include <ohaudio/native_audiorenderer.h>
+@@ -19,6 +20,7 @@
+ #include "ohaudio_clock.h"
+ #include "ohaudio_playhead.h"
+ #include "ohaudio_vivid_packet.h"
++#include "ohaudio_vivid_speed.h"
+ 
+ #define VIVID_SLOTS 8
+ struct priv {
+@@ -30,6 +32,7 @@ struct priv {
+     int64_t submitted, position, query_time, mapped_time, played;
+     uint64_t layout;
+     bool started, paused, failed;
++    double speed;
+     atomic_int error;
+ };
+ 
+@@ -68,6 +71,59 @@ static int32_t render(OH_AudioRenderer *renderer, void *opaque, void *audio,
+     return result;
+ }
+ 
++static int sdk_set_speed(void *renderer, float speed)
++{
++    return OH_AudioRenderer_SetSpeed(renderer, speed);
++}
++
++static int sdk_get_speed(void *renderer, float *speed)
++{
++    return OH_AudioRenderer_GetSpeed(renderer, speed);
++}
++
++static bool apply_native_speed(struct ao *ao, double speed)
++{
++    struct priv *p = ao->priv;
++    struct vivid_speed_result result;
++    int accepted = vivid_speed_try(p->renderer, speed, p->speed,
++                                  sdk_set_speed, sdk_get_speed, &result);
++    if (accepted == 1) return true;
++    MP_WARN(ao, "Audio Vivid speed %.3f rejected: set=%d get=%d actual=%.3f; retaining %.3f\n",
++            speed, result.set_status, result.get_status, result.observed, p->speed);
++    if (accepted < 0) {
++        MP_ERR(ao, "Audio Vivid renderer could not restore the previous speed.\n");
++        ao_report_error(ao);
++    }
++    return false;
++}
++
++static int control(struct ao *ao, enum aocontrol cmd, void *arg)
++{
++    struct priv *p = ao->priv;
++    if (cmd == AOCONTROL_GET_NATIVE_SPEED) {
++        ((struct ao_native_speed *)arg)->speed = p->speed;
++        return CONTROL_OK;
++    }
++    if (cmd != AOCONTROL_SET_NATIVE_SPEED) return CONTROL_UNKNOWN;
++    struct ao_native_speed *request = arg;
++    double requested = request->speed;
++    request->speed = p->speed;
++    if (!isfinite(requested) || requested < 0.25 || requested > 4) {
++        MP_WARN(ao, "Audio Vivid speed out of range [0.25, 4]: %.3f\n", requested);
++        return CONTROL_ERROR;
++    }
++    if (fabs(requested - p->speed) < 0.00001) return CONTROL_OK;
++    if (!p->renderer) {
++        MP_WARN(ao, "Audio Vivid renderer not ready; retaining %.3fx\n", p->speed);
++        return CONTROL_ERROR;
++    }
++    if (!apply_native_speed(ao, requested)) return CONTROL_ERROR;
++    p->speed = request->speed = requested;
++    p->mapped_time = p->query_time = 0;
++    MP_INFO(ao, "Audio Vivid native speed accepted: %.3f (metadata retained)\n", requested);
++    return CONTROL_OK;
++}
++
+ static bool open_renderer(struct ao *ao, uint64_t layout)
+ {
+     struct priv *p = ao->priv;
+@@ -90,6 +146,11 @@ static bool open_renderer(struct ao *ao, uint64_t layout)
+         return false;
+     }
+     p->layout = layout;
++    if (p->speed != 1 && !apply_native_speed(ao, p->speed)) {
++        OH_AudioRenderer_Release(p->renderer);
++        p->renderer = NULL;
++        return false;
++    }
+     MP_INFO(ao, "Audio Vivid native metadata output: %d Hz, %d channels, layout=0x%llx\n",
+             ao->samplerate, ao->channels.num, (unsigned long long)layout);
+     return true;
+@@ -104,6 +165,7 @@ static int init(struct ao *ao)
+     if (pthread_mutex_init(&p->lock, NULL))
+         return -1;
+     atomic_init(&p->error, 0);
++    p->speed = 1;
+     ao->device_buffer = ao->samplerate;
+     return 0;
+ }
+@@ -230,13 +292,13 @@ static void get_state(struct ao *ao, struct mp_pcm_state *state)
+     }
+     pthread_mutex_lock(&p->lock);
+     if (p->started && !p->paused && p->mapped_time > 0 && now >= p->mapped_time)
+-        p->played = ohaudio_playhead(p->position, now - p->mapped_time,
++        p->played = ohaudio_playhead(p->position, (now - p->mapped_time) * p->speed,
+                                     ao->samplerate, p->submitted);
+     int64_t pending = MPMAX(0, p->submitted - p->played);
+     *state = (struct mp_pcm_state) {
+         .free_samples = p->failed ? 0 : (VIVID_SLOTS - p->count) * MPMAX(p->frame_samples, 1),
+         .queued_samples = p->queued,
+-        .delay = (pending + p->queued) / (double)ao->samplerate,
++        .delay = (pending + p->queued) / ((double)ao->samplerate * p->speed),
+         .playing = p->started && (pending > 0 || p->count > 0),
+     };
+     pthread_mutex_unlock(&p->lock);
+@@ -253,6 +315,7 @@ const struct ao_driver audio_out_ohaudio_vivid = {
+     .priv_size = sizeof(struct priv),
+     .write_frames = true,
+     .init = init,
++    .control = control,
+     .uninit = uninit,
+     .reset = reset,
+     .write = write_frame,
+diff --git a/audio/out/ohaudio_vivid_speed.h b/audio/out/ohaudio_vivid_speed.h
+new file mode 100644
+--- /dev/null
++++ b/audio/out/ohaudio_vivid_speed.h
+@@ -0,0 +1,27 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++#include <math.h>
++
++struct vivid_speed_result {
++    int set_status, get_status;
++    float observed;
++};
++
++// 1: accepted; 0: rejected and previous speed confirmed; -1: restore failed.
++static inline int vivid_speed_try(void *renderer, float requested, float previous,
++    int (*set)(void *, float), int (*get)(void *, float *), struct vivid_speed_result *result)
++{
++    result->observed = 0;
++    result->set_status = set(renderer, requested);
++    result->get_status = get(renderer, &result->observed);
++    if (!result->set_status && !result->get_status &&
++        isfinite(result->observed) && fabs(result->observed - requested) < 0.001)
++        return 1;
++    if (!result->get_status && isfinite(result->observed) && fabs(result->observed - previous) < 0.001)
++        return 0;
++    float restored = 0;
++    if (set(renderer, previous) || get(renderer, &restored) || !isfinite(restored) ||
++        fabs(restored - previous) >= 0.001)
++        return -1;
++    return 0;
++}
+diff --git a/player/audio.c b/player/audio.c
+index c86c1f5..0e03391 100644
+--- a/player/audio.c
++++ b/player/audio.c
+@@ -211,11 +211,19 @@ void audio_update_volume(struct MPContext *mpctx)
+ void update_playback_speed(struct MPContext *mpctx)
+ {
+     if (audio_vivid_track(mpctx)) {
+-        if (mpctx->opts->playback_speed != 1.0 || mpctx->opts->playback_pitch != 1.0)
+-            MP_WARN(mpctx, "Audio Vivid requires 1x playback and unmodified pitch\n");
+-        mpctx->opts->playback_speed = 1.0;
++        // OHAudio applies speed after native rendering. Never stretch the
++        // decoder frames or their metadata in mpv's filter chain.
+         mpctx->opts->playback_pitch = 1.0;
+         mpctx->speed_factor_a = mpctx->speed_factor_v = 1.0;
++        if (mpctx->ao && !strcmp(ao_get_name(mpctx->ao), "ohaudio-vivid")) {
++            struct ao_native_speed request = {.speed = mpctx->opts->playback_speed};
++            if (ao_control(mpctx->ao, AOCONTROL_SET_NATIVE_SPEED, &request) != CONTROL_OK)
++                MP_WARN(mpctx, "Audio Vivid speed rejected; keeping %.3fx and native metadata.\n", request.speed);
++            mpctx->opts->playback_speed = request.speed;
++        } else {
++            // No renderer has accepted another speed yet.
++            mpctx->opts->playback_speed = 1.0;
++        }
+     }
+     mpctx->audio_speed = mpctx->opts->playback_speed * mpctx->speed_factor_a;
+     mpctx->video_speed = mpctx->opts->playback_speed * mpctx->speed_factor_v;
+@@ -518,6 +526,9 @@ static int reinit_audio_filters_and_output(struct MPContext *mpctx)
+         goto init_error;
+     }
+ 
++    if (audio_vivid_track(mpctx))
++        update_playback_speed(mpctx);
++
+     char tmp[192];
+     MP_INFO(mpctx, "AO: [%s] %s\n", ao_get_name(mpctx->ao),
+             audio_config_to_str_buf(tmp, sizeof(tmp), ao_rate, ao_format,

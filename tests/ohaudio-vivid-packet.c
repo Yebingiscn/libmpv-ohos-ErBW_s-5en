@@ -1,6 +1,26 @@
 #include <assert.h>
 #include <stdlib.h>
 #include "audio/out/ohaudio_vivid_packet.h"
+#include "audio/out/ohaudio_vivid_speed.h"
+
+struct speed_mock { float speed; int mode, sets, gets; };
+static int mock_set(void *ctx, float speed)
+{
+    struct speed_mock *m = ctx;
+    m->sets++;
+    if (m->mode == 1 || (m->mode == 4 && m->sets > 1)) return -2;
+    if (m->mode == 2) return 0; // Success response but silently ignored.
+    m->speed = ((m->mode == 3 || m->mode == 4) && m->sets == 1) ? 1.5f : speed;
+    return 0;
+}
+static int mock_get(void *ctx, float *speed)
+{
+    struct speed_mock *m = ctx;
+    m->gets++;
+    if (m->mode == 5 && m->gets == 1) return -3;
+    *speed = m->speed;
+    return 0;
+}
 
 int main(void)
 {
@@ -35,5 +55,18 @@ int main(void)
     assert(!memcmp(audio, pcm, sizeof(pcm)));
     assert(!memcmp(metadata, "ABCD\0\0\0\0", 8));
     free(v);
+    struct vivid_speed_result result;
+    for (int mode = 0; mode <= 5; mode++) {
+        struct speed_mock mock = {.speed = 1, .mode = mode};
+        int accepted = vivid_speed_try(&mock, 2, 1, mock_set, mock_get, &result);
+        if (mode == 0) {
+            assert(accepted == 1 && mock.speed == 2);
+        } else if (mode == 4) {
+            assert(accepted == -1); // Must not claim the old speed was restored.
+        } else {
+            assert(accepted == 0 && mock.speed == 1);
+        }
+        if (mode == 1 || mode == 2) assert(mock.sets == 1);
+    }
     return 0;
 }
