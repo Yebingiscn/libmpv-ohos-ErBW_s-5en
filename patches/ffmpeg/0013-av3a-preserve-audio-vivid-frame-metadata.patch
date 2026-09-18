@@ -1,0 +1,199 @@
+diff --git a/libavutil/audio_vivid.h b/libavutil/audio_vivid.h
+new file mode 100644
+--- /dev/null
++++ b/libavutil/audio_vivid.h
+@@ -0,0 +1,13 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#ifndef AVUTIL_AUDIO_VIVID_H
++#define AVUTIL_AUDIO_VIVID_H
++#include <stdint.h>
++/* Private OHOS pipeline contract. PCM must retain its original frame size,
++ * sample rate, channel order and S16 format. Metadata is owned by AVFrame. */
++typedef struct AVAudioVividMetadata {
++    uint64_t channel_layout;
++    uint32_t nb_samples;
++    uint32_t metadata_size;
++    uint8_t metadata[];
++} AVAudioVividMetadata;
++#endif
+diff --git a/libavutil/frame.h b/libavutil/frame.h
+index 866ff38..653a0ec 100644
+--- a/libavutil/frame.h
++++ b/libavutil/frame.h
+@@ -260,6 +260,9 @@ enum AVFrameSideDataType {
+      * EXIF metadata, starting with either 49 49 2a 00, or 4d 4d 00 2a.
+      */
+      AV_FRAME_DATA_EXIF,
++
++    /** OHOS Audio Vivid PCM companion data; see audio_vivid.h. */
++    AV_FRAME_DATA_AUDIO_VIVID,
+ };
+ 
+ enum AVActiveFormatDescription {
+diff --git a/libavutil/Makefile b/libavutil/Makefile
+index cd651de..c8234e2 100644
+--- a/libavutil/Makefile
++++ b/libavutil/Makefile
+@@ -7,6 +7,7 @@ HEADERS = adler32.h                                                     \
+           ambient_viewing_environment.h                                 \
+           attributes.h                                                  \
+           audio_fifo.h                                                  \
++          audio_vivid.h                                                 \
+           avassert.h                                                    \
+           avstring.h                                                    \
+           avutil.h                                                      \
+diff --git a/libavutil/side_data.c b/libavutil/side_data.c
+index a1fcc4b..c6e2e84 100644
+--- a/libavutil/side_data.c
++++ b/libavutil/side_data.c
+@@ -25,6 +25,7 @@
+ #include "side_data.h"
+ 
+ static const AVSideDataDescriptor sd_props[] = {
++    [AV_FRAME_DATA_AUDIO_VIVID]                 = { "Audio Vivid spatial metadata", AV_SIDE_DATA_PROP_CHANNEL_DEPENDENT },
+     [AV_FRAME_DATA_PANSCAN]                     = { "AVPanScan",                                    AV_SIDE_DATA_PROP_SIZE_DEPENDENT },
+     [AV_FRAME_DATA_A53_CC]                      = { "ATSC A53 Part 4 Closed Captions" },
+     [AV_FRAME_DATA_MATRIXENCODING]              = { "AVMatrixEncoding",                             AV_SIDE_DATA_PROP_CHANNEL_DEPENDENT },
+diff --git a/libavcodec/ohaudiodec.c b/libavcodec/ohaudiodec.c
+index 2ab1856..118e668 100644
+--- a/libavcodec/ohaudiodec.c
++++ b/libavcodec/ohaudiodec.c
+@@ -19,6 +19,7 @@
+ #include <multimedia/player_framework/native_avcodec_audiocodec.h>
+ 
+ #include "libavutil/channel_layout.h"
++#include "libavutil/audio_vivid.h"
+ #include "libavutil/fifo.h"
+ #include "libavutil/mem.h"
+ #include "libavutil/opt.h"
+@@ -34,6 +35,8 @@
+ typedef struct OHAudioQueueItem {
+     uint32_t index;
+     OH_AVBuffer *buffer;
++    int sample_rate, channels;
++    uint64_t layout;
+ } OHAudioQueueItem;
+ 
+ typedef struct OHAudioDecContext {
+@@ -53,6 +56,8 @@ typedef struct OHAudioDecContext {
+     int decode_status;
+     bool eof_sent;
+     atomic_bool accepting_callbacks;
++    int output_rate, output_channels;
++    uint64_t native_layout; // Protected by output_mutex; snapshotted per frame.
+ } OHAudioDecContext;
+ 
+ #define OFFSET(x) offsetof(OHAudioDecContext, x)
+@@ -95,17 +100,21 @@ static void oh_audio_on_stream_changed(OH_AVCodec *codec, OH_AVFormat *format,
+                                        void *userdata)
+ {
+     AVCodecContext *avctx = userdata;
++    OHAudioDecContext *s = avctx->priv_data;
++    ff_mutex_lock(&s->output_mutex);
++    int64_t layout = 0;
++    if (OH_AVFormat_GetLongValue(format, OH_MD_KEY_CHANNEL_LAYOUT, &layout))
++        s->native_layout = (uint64_t)layout;
+     int32_t value;
+ 
+     if (OH_AVFormat_GetIntValue(format, OH_MD_KEY_AUD_SAMPLE_RATE, &value) &&
+         value > 0)
+-        avctx->sample_rate = value;
++        s->output_rate = value;
+ 
+     if (OH_AVFormat_GetIntValue(format, OH_MD_KEY_AUD_CHANNEL_COUNT, &value) &&
+-        value > 0 && value != avctx->ch_layout.nb_channels) {
+-        av_channel_layout_uninit(&avctx->ch_layout);
+-        av_channel_layout_default(&avctx->ch_layout, value);
+-    }
++        value > 0 && value <= 32)
++        s->output_channels = value;
++    ff_mutex_unlock(&s->output_mutex);
+ }
+ 
+ static void oh_audio_on_input(OH_AVCodec *codec, uint32_t index,
+@@ -138,6 +147,9 @@ static void oh_audio_on_output(OH_AVCodec *codec, uint32_t index,
+         return;
+ 
+     ff_mutex_lock(&s->output_mutex);
++    item.sample_rate = s->output_rate;
++    item.channels = s->output_channels;
++    item.layout = s->native_layout;
+     if (av_fifo_write(s->output_queue, &item, 1) < 0)
+         s->decode_status = AVERROR(ENOMEM);
+     ff_cond_signal(&s->output_cond);
+@@ -211,6 +223,8 @@ static av_cold int oh_audio_decode_init(AVCodecContext *avctx)
+     int ret;
+ 
+     atomic_init(&s->accepting_callbacks, false);
++    s->native_layout = avctx->ch_layout.order == AV_CHANNEL_ORDER_NATIVE
++                                    ? avctx->ch_layout.u.mask : 0;
+     ret = ff_pthread_init(s, mutex_cond_offsets);
+     if (ret < 0)
+         return ret;
+@@ -233,6 +247,8 @@ static av_cold int oh_audio_decode_init(AVCodecContext *avctx)
+     ret = oh_audio_configure(avctx);
+     if (ret < 0)
+         return ret;
++    s->output_rate = avctx->sample_rate;
++    s->output_channels = avctx->ch_layout.nb_channels;
+ 
+     err = OH_AudioCodec_RegisterCallback(s->decoder, callbacks, avctx);
+     if (err != AV_ERR_OK)
+@@ -344,6 +360,13 @@ static int oh_audio_output_frame(AVCodecContext *avctx, AVFrame *frame,
+         return AVERROR_EOF;
+     }
+ 
++    // Stream-change callbacks must not mutate AVCodecContext while queued
++    // frames from the preceding format are still being consumed.
++    avctx->sample_rate = output->sample_rate;
++    if (avctx->ch_layout.nb_channels != output->channels) {
++        av_channel_layout_uninit(&avctx->ch_layout);
++        av_channel_layout_default(&avctx->ch_layout, output->channels);
++    }
+     bytes_per_sample = av_get_bytes_per_sample(AV_SAMPLE_FMT_S16);
+     if (attr.size <= 0 || avctx->ch_layout.nb_channels <= 0 ||
+         attr.size % (bytes_per_sample * avctx->ch_layout.nb_channels)) {
+@@ -369,12 +392,42 @@ static int oh_audio_output_frame(AVCodecContext *avctx, AVFrame *frame,
+         goto release;
+ 
+     src = OH_AVBuffer_GetAddr(output->buffer);
+-    if (!src) {
++    int capacity = OH_AVBuffer_GetCapacity(output->buffer);
++    if (!src || attr.offset < 0 || attr.size > capacity || attr.offset > capacity - attr.size) {
+         ret = AVERROR_EXTERNAL;
+         goto release;
+     }
+     memcpy(frame->data[0], src + attr.offset, attr.size);
+ 
++    // Copy before releasing the codec buffer: parameter memory belongs to it.
++    OH_AVFormat *parameter = OH_AVBuffer_GetParameter(output->buffer);
++    uint8_t *metadata = NULL;
++    size_t metadata_size = 0;
++    int64_t native_layout = output->layout;
++    if (parameter)
++        OH_AVFormat_GetLongValue(parameter, OH_MD_KEY_CHANNEL_LAYOUT, &native_layout);
++    if (!parameter ||
++        !OH_AVFormat_GetBuffer(parameter, OH_MD_KEY_AUDIO_VIVID_METADATA, &metadata, &metadata_size) ||
++        !metadata || metadata_size == 0 || metadata_size > 65536) {
++        if (parameter) OH_AVFormat_Destroy(parameter);
++        av_log(avctx, AV_LOG_ERROR, "Audio Vivid output is missing valid frame metadata\n");
++        ret = AVERROR_INVALIDDATA;
++        goto release;
++    }
++    AVFrameSideData *side = av_frame_new_side_data(frame, AV_FRAME_DATA_AUDIO_VIVID,
++                                   sizeof(AVAudioVividMetadata) + metadata_size);
++    if (!side) {
++        OH_AVFormat_Destroy(parameter);
++        ret = AVERROR(ENOMEM);
++        goto release;
++    }
++    AVAudioVividMetadata *vivid = (void *)side->data;
++    vivid->channel_layout = native_layout;
++    vivid->nb_samples = frame->nb_samples;
++    vivid->metadata_size = metadata_size;
++    memcpy(vivid->metadata, metadata, metadata_size);
++    OH_AVFormat_Destroy(parameter);
++
+     frame->pts = av_rescale_q(attr.pts, AV_TIME_BASE_Q,
+                               avctx->pkt_timebase);
+     ret = 0;

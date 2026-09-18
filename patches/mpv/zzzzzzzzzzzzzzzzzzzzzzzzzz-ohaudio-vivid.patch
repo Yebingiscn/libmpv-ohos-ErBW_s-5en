@@ -1,0 +1,512 @@
+diff --git a/audio/out/ao.h b/audio/out/ao.h
+index 6b6eb6d..6d7e2f7 100644
+--- a/audio/out/ao.h
++++ b/audio/out/ao.h
+@@ -43,6 +43,7 @@ enum aocontrol {
+ enum {
+     AO_EVENT_RELOAD = 1,
+     AO_EVENT_HOTPLUG = 2,
++    AO_EVENT_ERROR = 4,
+ };
+ 
+ enum {
+@@ -57,6 +58,8 @@ enum {
+     AO_INIT_EXCLUSIVE = 1 << 3,
+     // Initialize with music role.
+     AO_INIT_MEDIA_ROLE_MUSIC = 1 << 4,
++    // OHOS Audio Vivid needs intact PCM frames plus decoder metadata.
++    AO_INIT_AUDIO_VIVID = 1 << 5,
+ };
+ 
+ struct ao_device_desc {
+@@ -105,6 +108,7 @@ struct mp_async_queue;
+ struct mp_async_queue *ao_get_queue(struct ao *ao);
+ int ao_query_and_reset_events(struct ao *ao, int events);
+ void ao_request_reload(struct ao *ao);
++void ao_report_error(struct ao *ao);
+ void ao_hotplug_event(struct ao *ao);
+ 
+ struct ao_hotplug;
+diff --git a/audio/out/ao.c b/audio/out/ao.c
+index 654da0f..85f1a09 100644
+--- a/audio/out/ao.c
++++ b/audio/out/ao.c
+@@ -49,6 +49,7 @@ extern const struct ao_driver audio_out_jack;
+ extern const struct ao_driver audio_out_openal;
+ extern const struct ao_driver audio_out_opensles;
+ extern const struct ao_driver audio_out_ohaudio;
++extern const struct ao_driver audio_out_ohaudio_vivid;
+ extern const struct ao_driver audio_out_null;
+ extern const struct ao_driver audio_out_alsa;
+ extern const struct ao_driver audio_out_wasapi;
+@@ -101,6 +102,7 @@ static const struct ao_driver * const audio_out_drivers[] = {
+ #endif
+ #if HAVE_OHOS
+     &audio_out_ohaudio,
++    &audio_out_ohaudio_vivid,
+ #endif
+ #if HAVE_SDL2_AUDIO
+     &audio_out_sdl,
+@@ -305,6 +307,16 @@ struct ao *ao_init_best(struct mpv_global *global,
+     struct m_obj_settings *ao_list = NULL;
+     int ao_num = 0;
+ 
++#if HAVE_OHOS
++    if (init_flags & AO_INIT_AUDIO_VIVID) {
++        // Never silently reinterpret object PCM as ordinary speaker channels.
++        ao = ao_init(false, global, wakeup_cb, wakeup_ctx, encode_lavc_ctx,
++                     init_flags, samplerate, format, channels, NULL, "ohaudio-vivid");
++        talloc_free(tmp);
++        return ao;
++    }
++#endif
++
+     for (int n = 0; opts->audio_driver_list && opts->audio_driver_list[n].name; n++)
+         MP_TARRAY_APPEND(tmp, ao_list, ao_num, opts->audio_driver_list[n]);
+ 
+@@ -388,6 +400,11 @@ void ao_request_reload(struct ao *ao)
+     ao_add_events(ao, AO_EVENT_RELOAD);
+ }
+ 
++void ao_report_error(struct ao *ao)
++{
++    ao_add_events(ao, AO_EVENT_ERROR);
++}
++
+ // Notify the player that the device list changed. Fully thread-safe.
+ void ao_hotplug_event(struct ao *ao)
+ {
+diff --git a/player/audio.c b/player/audio.c
+index f9c0132..c86c1f5 100644
+--- a/player/audio.c
++++ b/player/audio.c
+@@ -48,12 +48,25 @@ enum {
+ 
+ static void ao_process(struct mp_filter *f);
+ 
++static bool audio_vivid_track(struct MPContext *mpctx)
++{
++    struct ao_chain *c = mpctx->ao_chain;
++    return c && c->track && c->track->stream && c->track->stream->codec &&
++           c->track->stream->codec->codec &&
++           !strcmp(c->track->stream->codec->codec, "av3a");
++}
++
+ static void update_speed_filters(struct MPContext *mpctx)
+ {
+     struct ao_chain *ao_c = mpctx->ao_chain;
+     if (!ao_c)
+         return;
+ 
++    if (audio_vivid_track(mpctx)) {
++        mp_output_chain_set_audio_speed(ao_c->filter, 1.0, 1.0, 1.0);
++        return;
++    }
++
+     double pitch = mpctx->opts->playback_pitch;
+     double speed = mpctx->opts->playback_speed;
+     double resample = mpctx->speed_factor_a;
+@@ -90,7 +103,8 @@ static int recreate_audio_filters(struct MPContext *mpctx)
+     struct ao_chain *ao_c = mpctx->ao_chain;
+     mp_assert(ao_c);
+ 
+-    if (!mp_output_chain_update_filters(ao_c->filter, mpctx->opts->af_settings))
++    if (!mp_output_chain_update_filters(ao_c->filter,
++            audio_vivid_track(mpctx) ? NULL : mpctx->opts->af_settings))
+         goto fail;
+ 
+     update_speed_filters(mpctx);
+@@ -196,6 +210,13 @@ void audio_update_volume(struct MPContext *mpctx)
+ // Call this if opts->playback_speed or mpctx->speed_factor_* change.
+ void update_playback_speed(struct MPContext *mpctx)
+ {
++    if (audio_vivid_track(mpctx)) {
++        if (mpctx->opts->playback_speed != 1.0 || mpctx->opts->playback_pitch != 1.0)
++            MP_WARN(mpctx, "Audio Vivid requires 1x playback and unmodified pitch\n");
++        mpctx->opts->playback_speed = 1.0;
++        mpctx->opts->playback_pitch = 1.0;
++        mpctx->speed_factor_a = mpctx->speed_factor_v = 1.0;
++    }
+     mpctx->audio_speed = mpctx->opts->playback_speed * mpctx->speed_factor_a;
+     mpctx->video_speed = mpctx->opts->playback_speed * mpctx->speed_factor_v;
+ 
+@@ -378,7 +399,7 @@ static int reinit_audio_filters_and_output(struct MPContext *mpctx)
+         goto init_error;
+     }
+ 
+-    if (af_fmt_is_pcm(mp_aframe_get_format(out_fmt))) {
++    if (af_fmt_is_pcm(mp_aframe_get_format(out_fmt)) && !audio_vivid_track(mpctx)) {
+         if (opts->force_srate)
+             mp_aframe_set_rate(out_fmt, opts->force_srate);
+         if (opts->audio_output_format)
+@@ -390,9 +411,12 @@ static int reinit_audio_filters_and_output(struct MPContext *mpctx)
+     // Weak gapless audio: if the filter output format is the same as the
+     // previous one, keep the AO and don't reinit anything.
+     // Strong gapless: always keep the AO
+-    if ((mpctx->ao_filter_fmt && mpctx->ao && opts->gapless_audio < 0 &&
++    bool vivid_ao_matches = !mpctx->ao ||
++        audio_vivid_track(mpctx) == !strcmp(ao_get_name(mpctx->ao), "ohaudio-vivid");
++    if (vivid_ao_matches && !audio_vivid_track(mpctx) &&
++        ((mpctx->ao_filter_fmt && mpctx->ao && opts->gapless_audio < 0 &&
+          keep_weak_gapless_format(mpctx->ao_filter_fmt, out_fmt)) ||
+-        (mpctx->ao && opts->gapless_audio > 0))
++        (mpctx->ao && opts->gapless_audio > 0)))
+     {
+         ao_chain_set_ao(ao_c, mpctx->ao);
+         talloc_free(out_fmt);
+@@ -433,7 +457,7 @@ static int reinit_audio_filters_and_output(struct MPContext *mpctx)
+     if (opts->audio_exclusive)
+         ao_flags |= AO_INIT_EXCLUSIVE;
+ 
+-    if (af_fmt_is_pcm(out_format)) {
++    if (af_fmt_is_pcm(out_format) && !audio_vivid_track(mpctx)) {
+         if (!opts->audio_output_channels.set ||
+             opts->audio_output_channels.auto_safe)
+             ao_flags |= AO_INIT_SAFE_MULTICHANNEL_ONLY;
+@@ -446,6 +470,11 @@ static int reinit_audio_filters_and_output(struct MPContext *mpctx)
+     if (!has_video_track(mpctx))
+         ao_flags |= AO_INIT_MEDIA_ROLE_MUSIC;
+ 
++    if (audio_vivid_track(mpctx)) {
++        ao_flags |= AO_INIT_AUDIO_VIVID;
++        update_playback_speed(mpctx);
++    }
++
+     mpctx->ao_filter_fmt = out_fmt;
+ 
+     mpctx->ao = ao_init_best(mpctx->global, ao_flags, mp_wakeup_core_cb,
+@@ -964,6 +993,15 @@ void fill_audio_out_buffers(struct MPContext *mpctx)
+ {
+     struct MPOpts *opts = mpctx->opts;
+ 
++    if (mpctx->ao && ao_query_and_reset_events(mpctx->ao, AO_EVENT_ERROR)) {
++        struct track *track = mpctx->ao_chain ? mpctx->ao_chain->track : NULL;
++        mpctx->error_playing = MPV_ERROR_AO_INIT_FAILED;
++        uninit_audio_chain(mpctx);
++        uninit_audio_out(mpctx);
++        if (track) error_on_track(mpctx, track);
++        return;
++    }
++
+     if (mpctx->ao && ao_query_and_reset_events(mpctx->ao, AO_EVENT_RELOAD))
+         reload_audio_output(mpctx);
+ 
+diff --git a/meson.build b/meson.build
+index 1f9006b..cbdd883 100644
+--- a/meson.build
++++ b/meson.build
+@@ -492,6 +492,7 @@ if features['ohos']
+                      cc.find_library('video_processing'),
+                      cc.find_library('GLESv2')]
+     sources += files('audio/out/ao_ohaudio.c',
++                     'audio/out/ao_ohaudio_vivid.c',
+                      'video/out/ohos_common.c',
+                      'video/out/ohos_vpe.c',
+                      'video/out/hwdec/hwdec_ohcodec.c',
+diff --git a/audio/out/ao_ohaudio_vivid.c b/audio/out/ao_ohaudio_vivid.c
+new file mode 100644
+--- /dev/null
++++ b/audio/out/ao_ohaudio_vivid.c
+@@ -0,0 +1,262 @@
++/* Audio Vivid: retain decoder frame boundaries and their spatial metadata.
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ */
++#include "config.h"
++#include <pthread.h>
++#include <stdatomic.h>
++#include <string.h>
++#include <time.h>
++#include <libavutil/frame.h>
++#include <libavutil/audio_vivid.h>
++#include <ohaudio/native_audiorenderer.h>
++#include <ohaudio/native_audiostreambuilder.h>
++#include "ao.h"
++#include "internal.h"
++#include "audio/aframe.h"
++#include "audio/format.h"
++#include "common/msg.h"
++#include "osdep/timer.h"
++#include "ohaudio_clock.h"
++#include "ohaudio_playhead.h"
++#include "ohaudio_vivid_packet.h"
++
++#define VIVID_SLOTS 8
++struct priv {
++    OH_AudioRenderer *renderer;
++    pthread_mutex_t lock;
++    AVFrame *frames[VIVID_SLOTS];
++    unsigned head, count;
++    int queued, frame_samples;
++    int64_t submitted, position, query_time, mapped_time, played;
++    uint64_t layout;
++    bool started, paused, failed;
++    atomic_int error;
++};
++
++static const AVAudioVividMetadata *frame_metadata(const AVFrame *f)
++{
++    AVFrameSideData *s = av_frame_get_side_data(f, AV_FRAME_DATA_AUDIO_VIVID);
++    return s ? ohaudio_vivid_metadata(s->data, s->size) : NULL;
++}
++
++static int32_t render(OH_AudioRenderer *renderer, void *opaque, void *audio,
++                      int32_t audio_size, void *metadata, int32_t metadata_size)
++{
++    struct ao *ao = opaque;
++    struct priv *p = ao->priv;
++    // No allocations, codec calls or blocking device operations on this thread.
++    if (pthread_mutex_trylock(&p->lock))
++        return -1;
++    int result = -1;
++    if (p->count) {
++        AVFrame *f = p->frames[p->head];
++        const AVAudioVividMetadata *v = frame_metadata(f);
++        if (ohaudio_vivid_copy(v, f->data[0], f->nb_samples, ao->channels.num,
++                              audio, audio_size, metadata, metadata_size)) {
++            p->submitted += f->nb_samples;
++            p->queued -= f->nb_samples;
++            p->head = (p->head + 1) % VIVID_SLOTS;
++            p->count--;
++            // Retain the reference until this slot is reused on the AO thread.
++            result = 0;
++        } else {
++            atomic_store(&p->error, 1);
++        }
++    }
++    pthread_mutex_unlock(&p->lock);
++    ao_wakeup(ao);
++    return result;
++}
++
++static bool open_renderer(struct ao *ao, uint64_t layout)
++{
++    struct priv *p = ao->priv;
++    OH_AudioStreamBuilder *b = NULL;
++    OH_AudioStream_Result ret = OH_AudioStreamBuilder_Create(&b, AUDIOSTREAM_TYPE_RENDERER);
++#define SET(call) do { if (ret == AUDIOSTREAM_SUCCESS) ret = (call); } while (0)
++    SET(OH_AudioStreamBuilder_SetSamplingRate(b, ao->samplerate));
++    SET(OH_AudioStreamBuilder_SetChannelCount(b, ao->channels.num));
++    SET(OH_AudioStreamBuilder_SetChannelLayout(b, layout));
++    SET(OH_AudioStreamBuilder_SetSampleFormat(b, AUDIOSTREAM_SAMPLE_S16LE));
++    SET(OH_AudioStreamBuilder_SetEncodingType(b, AUDIOSTREAM_ENCODING_TYPE_AUDIOVIVID));
++    SET(OH_AudioStreamBuilder_SetRendererInfo(b,
++        (ao->init_flags & AO_INIT_MEDIA_ROLE_MUSIC) ? AUDIOSTREAM_USAGE_MUSIC : AUDIOSTREAM_USAGE_MOVIE));
++    SET(OH_AudioStreamBuilder_SetWriteDataWithMetadataCallback(b, render, ao));
++    SET(OH_AudioStreamBuilder_GenerateRenderer(b, &p->renderer));
++#undef SET
++    if (b) OH_AudioStreamBuilder_Destroy(b);
++    if (ret != AUDIOSTREAM_SUCCESS) {
++        MP_ERR(ao, "Audio Vivid renderer initialization failed: %d\n", ret);
++        return false;
++    }
++    p->layout = layout;
++    MP_INFO(ao, "Audio Vivid native metadata output: %d Hz, %d channels, layout=0x%llx\n",
++            ao->samplerate, ao->channels.num, (unsigned long long)layout);
++    return true;
++}
++
++static int init(struct ao *ao)
++{
++    if (!(ao->init_flags & AO_INIT_AUDIO_VIVID) || ao->format != AF_FORMAT_S16 ||
++        ao->channels.num < 1 || ao->channels.num > 32 || ao->samplerate <= 0)
++        return -1;
++    struct priv *p = ao->priv;
++    if (pthread_mutex_init(&p->lock, NULL))
++        return -1;
++    atomic_init(&p->error, 0);
++    ao->device_buffer = ao->samplerate;
++    return 0;
++}
++
++static void reset(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++    // Release joins callbacks; never hold our mutex while calling the SDK.
++    if (p->renderer) {
++        OH_AudioRenderer_Stop(p->renderer);
++        OH_AudioRenderer_Release(p->renderer);
++        p->renderer = NULL;
++    }
++    for (int n = 0; n < VIVID_SLOTS; n++) av_frame_free(&p->frames[n]);
++    p->head = p->count = p->queued = 0;
++    p->submitted = p->position = p->query_time = p->mapped_time = p->played = 0;
++    p->started = p->paused = false;
++    p->failed = false;
++    p->frame_samples = 0;
++    atomic_store(&p->error, 0);
++}
++
++static void uninit(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++    reset(ao);
++    pthread_mutex_destroy(&p->lock);
++}
++
++static bool write_frame(struct ao *ao, void **data, int samples)
++{
++    struct priv *p = ao->priv;
++    AVFrame *f = mp_aframe_get_raw_avframe(*(struct mp_aframe **)data);
++    const AVAudioVividMetadata *v = frame_metadata(f);
++    if (!v || f->format != AV_SAMPLE_FMT_S16 || f->sample_rate != ao->samplerate ||
++        f->ch_layout.nb_channels != ao->channels.num) {
++        MP_ERR(ao, "Audio Vivid frame metadata/PCM format is invalid; refusing PCM fallback.\n");
++        p->failed = true;
++        ao_report_error(ao);
++        return false;
++    }
++    if (f->nb_samples != v->nb_samples) {
++        MP_VERBOSE(ao, "Dropping trimmed Audio Vivid frame (%d/%u samples).\n", f->nb_samples, v->nb_samples);
++        return true;
++    }
++    if (!p->renderer && !open_renderer(ao, v->channel_layout)) {
++        p->failed = true;
++        ao_report_error(ao);
++        return false;
++    }
++    if (v->channel_layout != p->layout ||
++        (p->frame_samples && p->frame_samples != f->nb_samples)) {
++        MP_ERR(ao, "Audio Vivid layout/frame size changed; requesting output reconfiguration.\n");
++        ao_request_reload(ao);
++        return false;
++    }
++    AVFrame *ref = av_frame_clone(f);
++    if (!ref) {
++        ao_report_error(ao);
++        return false;
++    }
++    pthread_mutex_lock(&p->lock);
++    if (p->count == VIVID_SLOTS) {
++        pthread_mutex_unlock(&p->lock);
++        av_frame_free(&ref);
++        return false;
++    }
++    unsigned slot = (p->head + p->count) % VIVID_SLOTS;
++    AVFrame *old = p->frames[slot];
++    p->frames[slot] = ref;
++    p->count++;
++    p->queued += f->nb_samples;
++    p->frame_samples = f->nb_samples;
++    pthread_mutex_unlock(&p->lock);
++    av_frame_free(&old);
++    return true;
++}
++
++static void start(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++    if (p->renderer) {
++        p->started = OH_AudioRenderer_Start(p->renderer) == AUDIOSTREAM_SUCCESS;
++        if (!p->started) {
++            MP_ERR(ao, "Audio Vivid renderer failed to start.\n");
++            ao_report_error(ao);
++        }
++    }
++}
++
++static bool set_pause(struct ao *ao, bool paused)
++{
++    struct priv *p = ao->priv;
++    if (!p->renderer) return true;
++    int ret = paused ? OH_AudioRenderer_Pause(p->renderer) : OH_AudioRenderer_Start(p->renderer);
++    if (ret != AUDIOSTREAM_SUCCESS) return false;
++    p->paused = paused;
++    if (!paused) p->query_time = p->mapped_time = 0;
++    return true;
++}
++
++static void get_state(struct ao *ao, struct mp_pcm_state *state)
++{
++    struct priv *p = ao->priv;
++    int64_t now = mp_time_ns();
++    int interval = (ao->init_flags & AO_INIT_MEDIA_ROLE_MUSIC) ? 250 : 20;
++    if (p->renderer && p->started && !p->paused &&
++        now - p->query_time >= MP_TIME_MS_TO_NS(interval)) {
++        int64_t position = 0, timestamp = 0;
++        if (OH_AudioRenderer_GetAudioTimestampInfo(p->renderer, &position, &timestamp) == AUDIOSTREAM_SUCCESS) {
++            struct timespec mono;
++            if (position < p->position) {
++                // Route changes can reset the hardware counter. Recreate the
++                // complete output, including its queue and clock, as one epoch.
++                ao_request_reload(ao);
++            } else if (clock_gettime(CLOCK_MONOTONIC, &mono) == 0 &&
++                       ohaudio_clock_translate(timestamp,
++                           (int64_t)mono.tv_sec * 1000000000 + mono.tv_nsec,
++                           now, &p->mapped_time)) {
++                p->position = position;
++            }
++        }
++        p->query_time = now;
++    }
++    pthread_mutex_lock(&p->lock);
++    if (p->started && !p->paused && p->mapped_time > 0 && now >= p->mapped_time)
++        p->played = ohaudio_playhead(p->position, now - p->mapped_time,
++                                    ao->samplerate, p->submitted);
++    int64_t pending = MPMAX(0, p->submitted - p->played);
++    *state = (struct mp_pcm_state) {
++        .free_samples = p->failed ? 0 : (VIVID_SLOTS - p->count) * MPMAX(p->frame_samples, 1),
++        .queued_samples = p->queued,
++        .delay = (pending + p->queued) / (double)ao->samplerate,
++        .playing = p->started && (pending > 0 || p->count > 0),
++    };
++    pthread_mutex_unlock(&p->lock);
++    if (atomic_exchange(&p->error, 0)) {
++        MP_ERR(ao, "Audio Vivid callback buffer sizes do not match the decoder frame.\n");
++        p->failed = true;
++        ao_report_error(ao);
++    }
++}
++
++const struct ao_driver audio_out_ohaudio_vivid = {
++    .name = "ohaudio-vivid",
++    .description = "OHAudio Audio Vivid PCM plus spatial metadata",
++    .priv_size = sizeof(struct priv),
++    .write_frames = true,
++    .init = init,
++    .uninit = uninit,
++    .reset = reset,
++    .write = write_frame,
++    .start = start,
++    .set_pause = set_pause,
++    .get_state = get_state,
++};
+diff --git a/audio/out/ohaudio_vivid_packet.h b/audio/out/ohaudio_vivid_packet.h
+new file mode 100644
+--- /dev/null
++++ b/audio/out/ohaudio_vivid_packet.h
+@@ -0,0 +1,35 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++#include <limits.h>
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <string.h>
++#include <libavutil/audio_vivid.h>
++
++static inline const AVAudioVividMetadata *ohaudio_vivid_metadata(const void *data, size_t size)
++{
++    if (!data || size < sizeof(AVAudioVividMetadata)) return NULL;
++    const AVAudioVividMetadata *v = data;
++    if (!v->channel_layout || !v->nb_samples || !v->metadata_size ||
++        v->metadata_size > 65536 || v->metadata_size != size - sizeof(*v))
++        return NULL;
++    return v;
++}
++
++// Validate the entire pair before touching either destination. A partial PCM
++// write would associate object metadata with the wrong samples.
++static inline bool ohaudio_vivid_copy(const AVAudioVividMetadata *v,
++    const void *pcm, int samples, int channels, void *audio, int audio_size,
++    void *metadata, int metadata_size)
++{
++    if (!v || !pcm || !audio || !metadata || channels < 1 || channels > 32 ||
++        samples <= 0 || samples > INT_MAX / (channels * 2) ||
++        v->nb_samples != (unsigned)samples || audio_size != samples * channels * 2 ||
++        metadata_size <= 0 || v->metadata_size > (unsigned)metadata_size)
++        return false;
++    memcpy(audio, pcm, audio_size);
++    memcpy(metadata, v->metadata, v->metadata_size);
++    memset((uint8_t *)metadata + v->metadata_size, 0, metadata_size - v->metadata_size);
++    return true;
++}

@@ -43,6 +43,17 @@ for symbol in mpv_create ohos_osd_set_global_surface; do
 done
 
 dynamic_section=$("$READELF" -d "$LIBMPV")
+if ! "$STRINGS" "$LIBMPV" | grep -Fx "ohaudio-vivid" >/dev/null; then
+  echo "Missing native Audio Vivid output" >&2
+  exit 1
+fi
+vivid_imports=$("$NM" -D --undefined-only "$LIBMPV")
+for symbol in OH_AudioStreamBuilder_SetWriteDataWithMetadataCallback OH_MD_KEY_AUDIO_VIVID_METADATA; do
+  if ! grep -Eq "[[:space:]]$symbol(@.*)?$" <<< "$vivid_imports"; then
+    echo "Missing Audio Vivid transport/rendering import: $symbol" >&2
+    exit 1
+  fi
+done
 if ! grep -Eq "NEEDED.*libvideo_processing\.so" <<< "$dynamic_section"; then
   echo "Super resolution is not linked to the video processing engine" >&2
   exit 1

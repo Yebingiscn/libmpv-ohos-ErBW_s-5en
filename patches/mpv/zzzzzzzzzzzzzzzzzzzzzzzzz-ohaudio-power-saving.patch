@@ -1,0 +1,37 @@
+diff --git a/audio/out/ao_ohaudio.c b/audio/out/ao_ohaudio.c
+index 2f2ab6d..9d3f276 100644
+--- a/audio/out/ao_ohaudio.c
++++ b/audio/out/ao_ohaudio.c
+@@ -232,6 +232,8 @@ static MP_THREAD_VOID clock_thread(void *arg)
+             atomic_load_explicit(&p->clock_running, memory_order_acquire))
+         {
+             mp_cond_timedwait(&p->clock_wakeup, &p->clock_lock,
++                              (ao->init_flags & AO_INIT_MEDIA_ROLE_MUSIC) &&
++                              !p->suite_active ? MP_TIME_MS_TO_NS(250) :
+                               CLOCK_QUERY_INTERVAL_NS);
+         }
+     }
+@@ -913,7 +915,8 @@ static int init(struct ao* ao)
+                                         : p->encoding_type);
+     if (res == AUDIOSTREAM_SUCCESS)
+         res = OH_AudioStreamBuilder_SetRendererInfo(p->builder,
+-                                                     AUDIOSTREAM_USAGE_MOVIE);
++            (ao->init_flags & AO_INIT_MEDIA_ROLE_MUSIC) && !p->suite_active
++                ? AUDIOSTREAM_USAGE_MUSIC : AUDIOSTREAM_USAGE_MOVIE);
+     if (res == AUDIOSTREAM_SUCCESS)
+         res = OH_AudioStreamBuilder_SetSampleFormat(
+             p->builder, stream_sample_format(renderer_format));
+@@ -932,6 +935,13 @@ static int init(struct ao* ao)
+ 
+     res = OH_AudioStreamBuilder_GenerateRenderer(p->builder, &p->renderer);
+ 
++    if (res == AUDIOSTREAM_SUCCESS) {
++        MP_INFO(ao, "OHAudio route policy: %s; offload selection is device-managed.\n",
++            (ao->init_flags & AO_INIT_MEDIA_ROLE_MUSIC) && !p->suite_active
++                ? "music (power-saving eligible, 250ms clock polling)"
++                : "movie (video/effects timing)");
++    }
++
+     if (res != AUDIOSTREAM_SUCCESS) {
+         MP_ERR(ao, "Fail to generate audio renderer: error code %d.\n", res);
+         goto error;
