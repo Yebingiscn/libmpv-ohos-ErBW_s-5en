@@ -43,6 +43,21 @@ for symbol in mpv_create ohos_osd_set_global_surface; do
 done
 
 dynamic_section=$("$READELF" -d "$LIBMPV")
+if ! "$STRINGS" "$LIBMPV" | grep -Fx "ohaudio-eac3" >/dev/null; then
+  echo "Missing experimental E-AC3 output" >&2
+  exit 1
+fi
+if ! "$STRINGS" "$LIBMPV" | grep -F -- "--enable-muxer=spdif" >/dev/null; then
+  echo "Missing FFmpeg SPDIF muxer build configuration" >&2
+  exit 1
+fi
+eac3_imports=$("$NM" -D --undefined-only "$LIBMPV")
+for symbol in OH_AudioManager_GetAudioStreamManager OH_AudioStreamManager_GetDirectPlaybackSupport; do
+  if grep -Eq "[[:space:]]$symbol(@.*)?$" <<< "$eac3_imports"; then
+    echo "Optional E-AC3 capability query must be dynamically resolved: $symbol" >&2
+    exit 1
+  fi
+done
 if ! "$STRINGS" "$LIBMPV" | grep -Fx "ohaudio-vivid" >/dev/null; then
   echo "Missing native Audio Vivid output" >&2
   exit 1

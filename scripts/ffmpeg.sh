@@ -43,6 +43,7 @@ cd .build
   --disable-devices \
   --disable-avdevice \
   --disable-muxers \
+  --enable-muxer=spdif \
   --disable-encoders \
   --enable-decoder=cavs \
   --enable-ohcodec \

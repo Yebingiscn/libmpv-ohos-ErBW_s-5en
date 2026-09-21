@@ -1,0 +1,465 @@
+diff --git a/audio/out/ao.c b/audio/out/ao.c
+index be36c7e6b9..2200afa581 100644
+--- a/audio/out/ao.c
++++ b/audio/out/ao.c
+@@ -50,6 +50,7 @@ extern const struct ao_driver audio_out_openal;
+ extern const struct ao_driver audio_out_opensles;
+ extern const struct ao_driver audio_out_ohaudio;
+ extern const struct ao_driver audio_out_ohaudio_vivid;
++extern const struct ao_driver audio_out_ohaudio_eac3;
+ extern const struct ao_driver audio_out_null;
+ extern const struct ao_driver audio_out_alsa;
+ extern const struct ao_driver audio_out_wasapi;
+@@ -103,6 +104,7 @@ static const struct ao_driver * const audio_out_drivers[] = {
+ #if HAVE_OHOS
+     &audio_out_ohaudio,
+     &audio_out_ohaudio_vivid,
++    &audio_out_ohaudio_eac3,
+ #endif
+ #if HAVE_SDL2_AUDIO
+     &audio_out_sdl,
+@@ -308,6 +310,14 @@ struct ao *ao_init_best(struct mpv_global *global,
+     int ao_num = 0;
+ 
+ #if HAVE_OHOS
++    if (af_fmt_is_spdif(format)) {
++        // A rejected bitstream must reach the player's PCM decoder fallback;
++        // never pass compressed bytes through the ordinary PCM AO list.
++        ao = ao_init(false, global, wakeup_cb, wakeup_ctx, encode_lavc_ctx,
++                     init_flags, samplerate, format, channels, NULL, "ohaudio-eac3");
++        talloc_free(tmp);
++        return ao;
++    }
+     if (init_flags & AO_INIT_AUDIO_VIVID) {
+         // Never silently reinterpret object PCM as ordinary speaker channels.
+         ao = ao_init(false, global, wakeup_cb, wakeup_ctx, encode_lavc_ctx,
+@@ -405,6 +415,11 @@ void ao_report_error(struct ao *ao)
+     ao_add_events(ao, AO_EVENT_ERROR);
+ }
+ 
++void ao_request_passthrough_fallback(struct ao *ao)
++{
++    ao_add_events(ao, AO_EVENT_PASSTHROUGH_FALLBACK);
++}
++
+ // Notify the player that the device list changed. Fully thread-safe.
+ void ao_hotplug_event(struct ao *ao)
+ {
+diff --git a/audio/out/ao.h b/audio/out/ao.h
+index 762a915349..da9b853381 100644
+--- a/audio/out/ao.h
++++ b/audio/out/ao.h
+@@ -52,6 +52,7 @@ enum {
+     AO_EVENT_RELOAD = 1,
+     AO_EVENT_HOTPLUG = 2,
+     AO_EVENT_ERROR = 4,
++    AO_EVENT_PASSTHROUGH_FALLBACK = 8,
+ };
+ 
+ enum {
+@@ -117,6 +118,7 @@ struct mp_async_queue *ao_get_queue(struct ao *ao);
+ int ao_query_and_reset_events(struct ao *ao, int events);
+ void ao_request_reload(struct ao *ao);
+ void ao_report_error(struct ao *ao);
++void ao_request_passthrough_fallback(struct ao *ao);
+ void ao_hotplug_event(struct ao *ao);
+ 
+ struct ao_hotplug;
+diff --git a/audio/out/ao_ohaudio.c b/audio/out/ao_ohaudio.c
+index 70d8080976..2def0b2c67 100644
+--- a/audio/out/ao_ohaudio.c
++++ b/audio/out/ao_ohaudio.c
+@@ -843,6 +843,9 @@ static int32_t audio_on_write_callback(
+ 
+ static int init(struct ao* ao)
+ {
++    // The E-AC3 backend owns compressed output. This AO only consumes PCM.
++    if (!af_fmt_is_pcm(ao->format))
++        return -1;
+     struct priv* p = ao->priv;
+     OH_AudioStream_Result res = 0;
+     int renderer_rate;
+diff --git a/audio/out/ao_ohaudio_eac3.c b/audio/out/ao_ohaudio_eac3.c
+new file mode 100644
+index 0000000000..ed414637fc
+--- /dev/null
++++ b/audio/out/ao_ohaudio_eac3.c
+@@ -0,0 +1,285 @@
++/* Experimental raw E-AC3 output. SPDX-License-Identifier: LGPL-2.1-or-later */
++#include "config.h"
++#include <dlfcn.h>
++#include <pthread.h>
++#include <stdatomic.h>
++#include <string.h>
++#include <time.h>
++#include <ohaudio/native_audio_stream_manager.h>
++#include <ohaudio/native_audiorenderer.h>
++#include <ohaudio/native_audiostreambuilder.h>
++#include "ao.h"
++#include "internal.h"
++#include "audio/aframe.h"
++#include "audio/format.h"
++#include "common/msg.h"
++#include "options/m_option.h"
++#include "osdep/timer.h"
++#include "ohaudio_clock.h"
++#include "ohaudio_playhead.h"
++#include "ohaudio_eac3_packet.h"
++
++#define SLOTS 8
++#define CARRIER_SAMPLES (OHAUDIO_EAC3_BURST / 4)
++struct priv {
++    bool enabled;
++    OH_AudioRenderer *renderer;
++    void *library;
++    pthread_mutex_t lock;
++    uint8_t packets[SLOTS][OHAUDIO_EAC3_BURST];
++    int lengths[SLOTS];
++    unsigned head, count;
++    int64_t submitted, played, position, mapped_time, query_time, progress_time;
++    bool started, paused;
++    atomic_bool failed;
++};
++
++static void fail(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++    atomic_store(&p->failed, true);
++    ao_request_passthrough_fallback(ao);
++}
++
++static int32_t render(OH_AudioRenderer *renderer, void *opaque, void *data, int32_t size)
++{
++    struct ao *ao = opaque;
++    struct priv *p = ao->priv;
++    (void)renderer;
++    if (atomic_load(&p->failed) || pthread_mutex_trylock(&p->lock)) return 0;
++    int bytes = 0;
++    if (p->count) {
++        bytes = p->lengths[p->head];
++        if (!data || size < bytes) {
++            bytes = 0;
++            fail(ao);
++        } else {
++            memcpy(data, p->packets[p->head], bytes);
++            p->head = (p->head + 1) % SLOTS;
++            p->count--;
++            p->submitted += OHAUDIO_EAC3_SAMPLES;
++        }
++    }
++    pthread_mutex_unlock(&p->lock);
++    ao_wakeup(ao);
++    return bytes;
++}
++
++static void device_changed(OH_AudioRenderer *renderer, void *opaque,
++                           OH_AudioStream_DeviceChangeReason reason)
++{
++    (void)renderer;
++    (void)reason;
++    // Do not let a compressed stream migrate to a PCM-only output route.
++    fail(opaque);
++}
++
++static void renderer_error(OH_AudioRenderer *renderer, void *opaque,
++                           OH_AudioStream_Result error)
++{
++    (void)renderer;
++    (void)error;
++    fail(opaque);
++}
++
++static bool supported(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++    p->library = dlopen("libohaudio.so", RTLD_NOW | RTLD_LOCAL);
++    if (!p->library) return false;
++    OH_AudioCommon_Result (*get_manager)(OH_AudioStreamManager **) =
++        dlsym(p->library, "OH_AudioManager_GetAudioStreamManager");
++    OH_AudioCommon_Result (*query)(OH_AudioStreamManager *, OH_AudioStreamInfo *,
++        OH_AudioStream_Usage, OH_AudioStream_DirectPlaybackMode *) =
++        dlsym(p->library, "OH_AudioStreamManager_GetDirectPlaybackSupport");
++    OH_AudioStreamManager *manager = NULL;
++    OH_AudioStream_DirectPlaybackMode mode = AUDIOSTREAM_DIRECT_PLAYBACK_NOT_SUPPORTED;
++    OH_AudioStreamInfo info = {
++        .samplingRate = 48000,
++        .channelLayout = CH_LAYOUT_STEREO,
++        .encodingType = AUDIOSTREAM_ENCODING_TYPE_E_AC3,
++        .sampleFormat = AUDIOSTREAM_SAMPLE_S16LE,
++    };
++    return get_manager && query && get_manager(&manager) == AUDIOCOMMON_RESULT_SUCCESS &&
++        manager && query(manager, &info, AUDIOSTREAM_USAGE_MOVIE, &mode) ==
++        AUDIOCOMMON_RESULT_SUCCESS && mode == AUDIOSTREAM_DIRECT_PLAYBACK_BITSTREAM_SUPPORTED;
++}
++
++static void close_renderer(struct priv *p)
++{
++    // Release joins SDK callbacks. Never hold the queue mutex here.
++    if (p->renderer) {
++        OH_AudioRenderer_Stop(p->renderer);
++        OH_AudioRenderer_Release(p->renderer);
++        p->renderer = NULL;
++    }
++}
++
++static int init(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++    if (!p->enabled || ao->format != AF_FORMAT_S_EAC3 || ao->samplerate != 192000 || ao->channels.num != 2)
++        return -1;
++    if (pthread_mutex_init(&p->lock, NULL)) return -1;
++    atomic_init(&p->failed, false);
++    if (!supported(ao)) {
++        MP_VERBOSE(ao, "E-AC3 bitstream unavailable on this route; using PCM.\n");
++        goto error;
++    }
++    OH_AudioStreamBuilder *builder = NULL;
++    OH_AudioStream_Result ret = OH_AudioStreamBuilder_Create(&builder, AUDIOSTREAM_TYPE_RENDERER);
++#define SET(call) do { if (ret == AUDIOSTREAM_SUCCESS) ret = (call); } while (0)
++    SET(OH_AudioStreamBuilder_SetSamplingRate(builder, 48000));
++    SET(OH_AudioStreamBuilder_SetChannelCount(builder, 2));
++    SET(OH_AudioStreamBuilder_SetChannelLayout(builder, CH_LAYOUT_STEREO));
++    SET(OH_AudioStreamBuilder_SetSampleFormat(builder, AUDIOSTREAM_SAMPLE_S16LE));
++    SET(OH_AudioStreamBuilder_SetEncodingType(builder, AUDIOSTREAM_ENCODING_TYPE_E_AC3));
++    SET(OH_AudioStreamBuilder_SetRendererInfo(builder, AUDIOSTREAM_USAGE_MOVIE));
++    SET(OH_AudioStreamBuilder_SetRendererWriteDataCallbackAdvanced(builder, render, ao));
++    SET(OH_AudioStreamBuilder_SetRendererOutputDeviceChangeCallback(builder, device_changed, ao));
++    SET(OH_AudioStreamBuilder_SetRendererErrorCallback(builder, renderer_error, ao));
++    SET(OH_AudioStreamBuilder_GenerateRenderer(builder, &p->renderer));
++#undef SET
++    if (builder) OH_AudioStreamBuilder_Destroy(builder);
++    if (ret != AUDIOSTREAM_SUCCESS) goto error;
++    ao->device_buffer = SLOTS * CARRIER_SAMPLES;
++    MP_INFO(ao, "Experimental E-AC3 output accepted by OHAudio (48 kHz).\n");
++    return 0;
++error:
++    close_renderer(p);
++    if (p->library) dlclose(p->library);
++    p->library = NULL;
++    pthread_mutex_destroy(&p->lock);
++    return -1;
++}
++
++static void reset(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++    // Stop quiesces rendering before the queue/clock epoch is cleared.
++    if (p->started && (OH_AudioRenderer_Stop(p->renderer) != AUDIOSTREAM_SUCCESS ||
++        OH_AudioRenderer_Flush(p->renderer) != AUDIOSTREAM_SUCCESS)) {
++        fail(ao);
++    }
++    pthread_mutex_lock(&p->lock);
++    p->head = p->count = 0;
++    p->submitted = p->played = p->position = p->mapped_time = p->query_time = 0;
++    p->started = p->paused = false;
++    pthread_mutex_unlock(&p->lock);
++}
++
++static void uninit(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++    atomic_store(&p->failed, true);
++    close_renderer(p);
++    pthread_mutex_destroy(&p->lock);
++    if (p->library) dlclose(p->library);
++}
++
++static bool write_frame(struct ao *ao, void **data, int samples)
++{
++    struct priv *p = ao->priv;
++    struct mp_aframe *frame = *(struct mp_aframe **)data;
++    if (atomic_load(&p->failed)) return false;
++    // Timestamp trimming must not turn a compressed burst into a partial packet.
++    if (samples != CARRIER_SAMPLES || mp_aframe_get_size(frame) != CARRIER_SAMPLES) {
++        fail(ao);
++        return false;
++    }
++    pthread_mutex_lock(&p->lock);
++    if (p->count == SLOTS) {
++        pthread_mutex_unlock(&p->lock);
++        return false;
++    }
++    unsigned slot = (p->head + p->count) % SLOTS;
++    uint8_t **planes = mp_aframe_get_data_ro(frame);
++    int bytes = ohaudio_eac3_unpack(planes ? planes[0] : NULL, OHAUDIO_EAC3_BURST,
++                                   p->packets[slot], sizeof(p->packets[slot]));
++    if (bytes > 0) {
++        p->lengths[slot] = bytes;
++        p->count++;
++    }
++    pthread_mutex_unlock(&p->lock);
++    if (bytes < 0) fail(ao);
++    return bytes > 0;
++}
++
++static void start(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++    if (atomic_load(&p->failed)) return;
++    p->started = OH_AudioRenderer_Start(p->renderer) == AUDIOSTREAM_SUCCESS;
++    p->progress_time = mp_time_ns();
++    if (!p->started) fail(ao);
++}
++
++static bool set_pause(struct ao *ao, bool paused)
++{
++    struct priv *p = ao->priv;
++    int ret = paused ? OH_AudioRenderer_Pause(p->renderer) : OH_AudioRenderer_Start(p->renderer);
++    if (ret != AUDIOSTREAM_SUCCESS) { fail(ao); return false; }
++    p->paused = paused;
++    if (!paused) {
++        p->query_time = p->mapped_time = 0;
++        p->progress_time = mp_time_ns();
++    }
++    return true;
++}
++
++static void get_state(struct ao *ao, struct mp_pcm_state *state)
++{
++    struct priv *p = ao->priv;
++    int64_t now = mp_time_ns();
++    if (p->started && !p->paused && now - p->query_time >= MP_TIME_MS_TO_NS(20)) {
++        int64_t position = 0, timestamp = 0;
++        struct timespec mono;
++        if (OH_AudioRenderer_GetAudioTimestampInfo(p->renderer, &position, &timestamp) ==
++            AUDIOSTREAM_SUCCESS && clock_gettime(CLOCK_MONOTONIC, &mono) == 0) {
++            if (position < p->position) {
++                fail(ao);
++            } else if (ohaudio_clock_translate(timestamp,
++                (int64_t)mono.tv_sec * 1000000000 + mono.tv_nsec, now, &p->mapped_time)) {
++                p->position = position;
++            }
++        }
++        p->query_time = now;
++    }
++    pthread_mutex_lock(&p->lock);
++    int64_t previous = p->played;
++    if (p->started && !p->paused && p->mapped_time > 0 && now >= p->mapped_time)
++        p->played = ohaudio_playhead(p->position, now - p->mapped_time, 48000, p->submitted);
++    int64_t pending = MPMAX(0, p->submitted - p->played);
++    if (p->played > previous || (pending == 0 && p->count == 0))
++        p->progress_time = now;
++    if (p->started && !p->paused && (pending > 0 || p->count > 0) &&
++        now - p->progress_time > MP_TIME_S_TO_NS(2))
++        fail(ao);
++    *state = (struct mp_pcm_state) {
++        .free_samples = atomic_load(&p->failed) ? 0 : (SLOTS - p->count) * CARRIER_SAMPLES,
++        .queued_samples = p->count * CARRIER_SAMPLES,
++        .delay = (pending + p->count * OHAUDIO_EAC3_SAMPLES) / 48000.0,
++        .playing = p->started && (pending > 0 || p->count > 0),
++    };
++    pthread_mutex_unlock(&p->lock);
++}
++
++#define OPT_BASE_STRUCT struct priv
++const struct ao_driver audio_out_ohaudio_eac3 = {
++    .name = "ohaudio-eac3",
++    .description = "Experimental OHAudio raw E-AC3 bitstream output",
++    .priv_size = sizeof(struct priv),
++    .write_frames = true,
++    .init = init,
++    .uninit = uninit,
++    .reset = reset,
++    .write = write_frame,
++    .start = start,
++    .set_pause = set_pause,
++    .get_state = get_state,
++    .options = (const struct m_option[]) {
++        {"enabled", OPT_BOOL(enabled)},
++        {0}
++    },
++    .options_prefix = "ohaudio-eac3",
++};
+diff --git a/audio/out/ohaudio_eac3_packet.h b/audio/out/ohaudio_eac3_packet.h
+new file mode 100644
+index 0000000000..37337e62e6
+--- /dev/null
++++ b/audio/out/ohaudio_eac3_packet.h
+@@ -0,0 +1,46 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#define OHAUDIO_EAC3_BURST 24576
++#define OHAUDIO_EAC3_SAMPLES 1536
++
++/* mpv/FFmpeg supplies little-endian IEC 61937 bursts. The experimental
++ * E_AC3 renderer consumes codec bytes, not the IEC preamble or zero padding.
++ * Limit this initial adapter to complete 48 kHz, six-block access units.
++ */
++static inline int ohaudio_eac3_unpack(const uint8_t *src, size_t size,
++                                    uint8_t *dst, size_t capacity)
++{
++    if (!src || !dst || size != OHAUDIO_EAC3_BURST ||
++        src[0] != 0x72 || src[1] != 0xf8 || src[2] != 0x1f || src[3] != 0x4e ||
++        src[4] != 0x15 || src[5] != 0)
++        return -1;
++    size_t bytes = src[6] | ((unsigned)src[7] << 8);
++    if (bytes < 6 || (bytes & 1) || bytes > size - 8 || bytes > capacity)
++        return -1;
++    for (size_t n = 0; n < bytes; n += 2) {
++        dst[n] = src[8 + n + 1];
++        dst[n + 1] = src[8 + n];
++    }
++    int blocks = 0;
++    for (size_t n = 0; n < bytes;) {
++        if (bytes - n < 6 || dst[n] != 0x0b || dst[n + 1] != 0x77)
++            return -1;
++        unsigned stream = dst[n + 2] >> 6;
++        unsigned substream = (dst[n + 2] >> 3) & 7;
++        size_t length = ((((unsigned)dst[n + 2] & 7) << 8) | dst[n + 3]) * 2 + 2;
++        unsigned bsid = dst[n + 5] >> 3;
++        if (stream > 1 || substream != 0 || length < 6 || length > bytes - n ||
++            (dst[n + 4] >> 6) != 0 || bsid < 11 || bsid > 16)
++            return -1;
++        if (stream == 0) {
++            static const int counts[] = {1, 2, 3, 6};
++            blocks += counts[(dst[n + 4] >> 4) & 3];
++        }
++        n += length;
++    }
++    return blocks == 6 ? (int)bytes : -1;
++}
+diff --git a/meson.build b/meson.build
+index eecfd62364..49aef42ad1 100644
+--- a/meson.build
++++ b/meson.build
+@@ -493,6 +493,7 @@ if features['ohos']
+                      cc.find_library('GLESv2')]
+     sources += files('audio/out/ao_ohaudio.c',
+                      'audio/out/ao_ohaudio_vivid.c',
++                     'audio/out/ao_ohaudio_eac3.c',
+                      'video/out/ohos_common.c',
+                      'video/out/ohos_vpe.c',
+                      'video/out/hwdec/hwdec_ohcodec.c',
+diff --git a/player/audio.c b/player/audio.c
+index 5b2a0c4e89..a23ddad9c8 100644
+--- a/player/audio.c
++++ b/player/audio.c
+@@ -1004,6 +1004,24 @@ void fill_audio_out_buffers(struct MPContext *mpctx)
+ {
+     struct MPOpts *opts = mpctx->opts;
+ 
++    if (mpctx->ao && ao_query_and_reset_events(mpctx->ao, AO_EVENT_PASSTHROUGH_FALLBACK)) {
++        struct ao_chain *c = mpctx->ao_chain;
++        MP_WARN(mpctx, "Compressed output failed or route changed; falling back to PCM.\n");
++        uninit_audio_out(mpctx);
++        if (c && c->track && c->track->dec) {
++            c->spdif_passthrough = false;
++            c->spdif_failed = true;
++            mp_decoder_wrapper_set_spdif_flag(c->track->dec, false);
++            if (!mp_decoder_wrapper_reinit(c->track->dec)) {
++                error_on_track(mpctx, c->track);
++                return;
++            }
++            reset_audio_state(mpctx);
++            mp_output_chain_reset_harder(c->filter);
++        }
++        mp_wakeup_core(mpctx);
++        return;
++    }
+     if (mpctx->ao && ao_query_and_reset_events(mpctx->ao, AO_EVENT_ERROR)) {
+         struct track *track = mpctx->ao_chain ? mpctx->ao_chain->track : NULL;
+         mpctx->error_playing = MPV_ERROR_AO_INIT_FAILED;

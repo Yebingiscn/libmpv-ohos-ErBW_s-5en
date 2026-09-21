@@ -201,6 +201,23 @@ and `osd-font-reuse` distinguish preparation from display. The patch stage
 tests that a blocked font provider does not block startup or the playback OSD
 lock, and checks renderer ownership with and without a pending overlay.
 
+## Experimental E-AC3 passthrough
+
+The optional `ohaudio-eac3` backend is disabled by default. Applications must
+set `ohaudio-eac3-enabled=yes` before requesting `audio-spdif=eac3`. Only complete
+48 kHz E-AC3 access units are accepted; the active route must report bitstream
+support. Missing capability APIs, initialization errors, route changes and
+transport errors fall back to PCM. Capability functions are resolved dynamically
+from `libohaudio.so`; no additional system library dependency is introduced.
+FFmpeg's `spdif` muxer is enabled for this path. Ordinary OHAudio rejects
+compressed formats instead of treating them as PCM.
+
+This is an unverified experimental transport, not a device compatibility claim.
+Its raw E-AC3 callback framing and timestamp assumptions still require vendor or
+device confirmation. See [scope, assumptions and device checks](tests/audio-passthrough-integration.md).
+The patch stage runs `scripts/verify-ohaudio-eac3.sh`; packet tests and local
+compilation do not establish actual receiver passthrough.
+
 ## Build Dependencies
 
 - git
