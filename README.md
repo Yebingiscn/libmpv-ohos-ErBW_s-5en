@@ -218,6 +218,30 @@ device confirmation. See [scope, assumptions and device checks](tests/audio-pass
 The patch stage runs `scripts/verify-ohaudio-eac3.sh`; packet tests and local
 compilation do not establish actual receiver passthrough.
 
+## Experimental USB exclusive audio
+
+`ao=usb-exclusive` accepts a USBManager-authorized descriptor using
+`usb-exclusive-fd`. It bypasses OHAudio/system mixing and never changes system
+volume. Supported UAC1/UAC2 DACs negotiate the source rate with lossless integer
+PCM packing; unsupported formats stop rather than resample. `ao-volume` controls
+the DAC's master Feature Unit where available.
+
+`audio-spdif=dop` preserves raw DSD packets as DoP; transmission also requires
+`usb-exclusive-dop=yes` and a DAC explicitly known to support DoP. Native DSD
+vendor protocols are not implemented. The current implementation supports mono
+and stereo integer PCM, direct UAC2 clocks and explicit asynchronous feedback;
+float decoded audio, implicit feedback and complex clock topologies are rejected.
+
+The application must probe backend options before opening USB output, disable
+effects/rate conversion, retain its authorized descriptor during playback, and
+keep normal AVSession/background playback management. No additional system
+shared-library dependency is introduced. USBManager availability does not imply
+usbfs transfer permission on every commercial device.
+
+See [USB acceptance tests and limitations](tests/usb-audio-integration.md).
+Protocol tests and cross-compilation do not establish bit-perfect device playback
+or screen-off reliability; both require real DAC testing.
+
 ## Build Dependencies
 
 - git

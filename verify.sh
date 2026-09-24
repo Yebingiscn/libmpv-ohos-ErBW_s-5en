@@ -43,6 +43,12 @@ for symbol in mpv_create ohos_osd_set_global_surface; do
 done
 
 dynamic_section=$("$READELF" -d "$LIBMPV")
+for marker in usb-exclusive dsd-dop; do
+  if ! "$STRINGS" "$LIBMPV" | grep -Fx "$marker" >/dev/null; then
+    echo "Missing USB exclusive/DoP implementation: $marker" >&2
+    exit 1
+  fi
+done
 if ! "$STRINGS" "$LIBMPV" | grep -Fx "ohaudio-eac3" >/dev/null; then
   echo "Missing experimental E-AC3 output" >&2
   exit 1
