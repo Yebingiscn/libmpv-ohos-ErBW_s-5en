@@ -226,9 +226,17 @@ volume. Supported UAC1/UAC2 DACs negotiate the source rate with lossless integer
 PCM packing; unsupported formats stop rather than resample. `ao-volume` controls
 the DAC's master Feature Unit where available.
 
-`audio-spdif=dop` preserves raw DSD packets as DoP; transmission also requires
-`usb-exclusive-dop=yes` and a DAC explicitly known to support DoP. Native DSD
-vendor protocols are not implemented. The current implementation supports mono
+`audio-spdif=dop` plus `usb-exclusive-dsd-mode=dop` preserves raw DSD, DST and
+DSD WavPack as DoP; the DAC must explicitly support DoP. The legacy
+`usb-exclusive-dop=yes` option remains compatible. `audio-spdif=native-dsd` plus
+`usb-exclusive-dsd-mode=native` enables experimental native U32 DSD for known
+USB device IDs/alternate settings (including the listed XMOS devices and known
+Amanero firmware revisions). Unknown devices/revisions are rejected. This does
+not implement every vendor-specific mode switch or U8/U16 native transport.
+DST/WavPack use an opt-in FFmpeg `dsd_raw` decoder option; normal playback keeps
+its existing PCM decoder output. Compressed DSD is unpacked losslessly before
+DoP/native framing, without a DSD-to-PCM step. PCM WavPack remains PCM.
+The current implementation supports mono
 and stereo integer PCM, direct UAC2 clocks and explicit asynchronous feedback;
 float decoded audio, implicit feedback and complex clock topologies are rejected.
 
@@ -239,6 +247,8 @@ shared-library dependency is introduced. USBManager availability does not imply
 usbfs transfer permission on every commercial device.
 
 See [USB acceptance tests and limitations](tests/usb-audio-integration.md).
+The patch stage runs host-only DST/WavPack byte-exact decoder tests in a separate
+temporary build; target build caches and dependency versions are not changed.
 Protocol tests and cross-compilation do not establish bit-perfect device playback
 or screen-off reliability; both require real DAC testing.
 

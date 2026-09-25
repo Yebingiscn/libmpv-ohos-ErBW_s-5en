@@ -1,0 +1,297 @@
+diff --git a/libavcodec/dstdec.c b/libavcodec/dstdec.c
+index d747670..7f22027 100644
+--- a/libavcodec/dstdec.c
++++ b/libavcodec/dstdec.c
+@@ -34,6 +34,7 @@
+ #include "avcodec.h"
+ #include "golomb.h"
+ #include "dsd.h"
++#include "libavutil/opt.h"
+ 
+ #define DST_MAX_CHANNELS 6
+ #define DST_MAX_ELEMENTS (2 * DST_MAX_CHANNELS)
+@@ -66,7 +67,8 @@ typedef struct Table {
+ } Table;
+ 
+ typedef struct DSTContext {
+-    AVClass *class;
++    const AVClass *class;
++    int dsd_raw;
+ 
+     GetBitContext gb;
+     ArithCoder ac;
+@@ -96,7 +98,7 @@ static av_cold int decode_init(AVCodecContext *avctx)
+         return AVERROR_PATCHWELCOME;
+     }
+ 
+-    avctx->sample_fmt = AV_SAMPLE_FMT_FLT;
++    avctx->sample_fmt = s->dsd_raw ? AV_SAMPLE_FMT_U8 : AV_SAMPLE_FMT_FLT;
+ 
+     for (i = 0; i < avctx->ch_layout.nb_channels; i++)
+         memset(s->dsdctx[i].buf, 0x69, sizeof(s->dsdctx[i].buf));
+@@ -249,6 +251,7 @@ static int decode_frame(AVCodecContext *avctx, AVFrame *frame,
+     unsigned half_prob[DST_MAX_CHANNELS];
+     const int channels = avctx->ch_layout.nb_channels;
+     DSTContext *s = avctx->priv_data;
++    const unsigned stride = s->dsd_raw ? 1 : 4;
+     GetBitContext *gb = &s->gb;
+     ArithCoder *ac = &s->ac;
+     uint8_t *dsd;
+@@ -271,7 +274,10 @@ static int decode_frame(AVCodecContext *avctx, AVFrame *frame,
+         skip_bits1(gb);
+         if (get_bits(gb, 6))
+             return AVERROR_INVALIDDATA;
+-        memcpy(frame->data[0], avpkt->data + 1, FFMIN(avpkt->size - 1, frame->nb_samples * channels));
++        if (avpkt->size - 1 < frame->nb_samples * channels)
++            return AVERROR_INVALIDDATA;
++        for (i = 0; i < frame->nb_samples * channels; i++)
++            dsd[i * stride] = avpkt->data[i + 1];
+         goto dsd;
+     }
+ 
+@@ -336,7 +342,7 @@ static int decode_frame(AVCodecContext *avctx, AVFrame *frame,
+         return ret;
+ 
+     memset(s->status, 0xAA, sizeof(s->status));
+-    memset(dsd, 0, frame->nb_samples * 4 * channels);
++    memset(dsd, 0, frame->nb_samples * stride * channels);
+ 
+     ac_get(ac, gb, prob_dst_x_bit(s->fsets.coeff[0][0]), &dst_x_bit);
+ 
+@@ -364,7 +370,7 @@ static int decode_frame(AVCodecContext *avctx, AVFrame *frame,
+ 
+             ac_get(ac, gb, prob, &residual);
+             v = ((predict >> 15) ^ residual) & 1;
+-            dsd[((i >> 3) * channels + ch) << 2] |= v << (7 - (i & 0x7 ));
++            dsd[((i >> 3) * channels + ch) * stride] |= v << (7 - (i & 0x7 ));
+ 
+             AV_WL64A(status + 8, (AV_RL64A(status + 8) << 1) | ((AV_RL64A(status) >> 63) & 1));
+             AV_WL64A(status, (AV_RL64A(status) << 1) | v);
+@@ -372,7 +378,12 @@ static int decode_frame(AVCodecContext *avctx, AVFrame *frame,
+     }
+ 
+ dsd:
+-    for (i = 0; i < channels; i++) {
++    if (s->dsd_raw) {
++        ret = av_dict_set(&frame->metadata, "sweetvideo.dsd_raw", "msb-u8-v1", 0);
++        if (ret < 0)
++            return ret;
++    }
++    for (i = 0; !s->dsd_raw && i < channels; i++) {
+         ff_dsd2pcm_translate(&s->dsdctx[i], frame->nb_samples, 0,
+                              frame->data[0] + i * 4,
+                              channels * 4, pcm + i, channels);
+@@ -383,8 +394,21 @@ dsd:
+     return avpkt->size;
+ }
+ 
++
++static const AVOption dst_options[] = {
++    { "dsd_raw", "Output lossless MSB-first DSD bytes instead of PCM",
++      offsetof(DSTContext, dsd_raw), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1,
++      AV_OPT_FLAG_AUDIO_PARAM | AV_OPT_FLAG_DECODING_PARAM },
++    { NULL }
++};
++static const AVClass dst_class = {
++    .class_name = "dst", .item_name = av_default_item_name,
++    .option = dst_options, .version = LIBAVUTIL_VERSION_INT,
++};
++
+ const FFCodec ff_dst_decoder = {
+     .p.name         = "dst",
++    .p.priv_class   = &dst_class,
+     CODEC_LONG_NAME("DST (Digital Stream Transfer)"),
+     .p.type         = AVMEDIA_TYPE_AUDIO,
+     .p.id           = AV_CODEC_ID_DST,
+diff --git a/libavcodec/wavpack.c b/libavcodec/wavpack.c
+index 3413153..9208abd 100644
+--- a/libavcodec/wavpack.c
++++ b/libavcodec/wavpack.c
+@@ -34,6 +34,7 @@
+ #include "unary.h"
+ #include "wavpack.h"
+ #include "dsd.h"
++#include "libavutil/opt.h"
+ 
+ /**
+  * @file
+@@ -98,6 +99,8 @@ typedef struct WavpackFrameContext {
+ } WavpackFrameContext;
+ 
+ typedef struct WavpackContext {
++    const AVClass *class;
++    int dsd_raw;
+     AVCodecContext *avctx;
+ 
+     WavpackFrameContext **fdec;
+@@ -434,6 +437,7 @@ typedef struct {
+ 
+ static int wv_unpack_dsd_high(WavpackFrameContext *s, uint8_t *dst_left, uint8_t *dst_right)
+ {
++    const int stride = s->avctx->sample_fmt == AV_SAMPLE_FMT_U8P ? 1 : 4;
+     uint32_t checksum = 0xFFFFFFFF;
+     uint8_t *dst_l = dst_left, *dst_r = dst_right;
+     int total_samples = s->samples, stereo = dst_r ? 1 : 0;
+@@ -553,23 +557,23 @@ static int wv_unpack_dsd_high(WavpackFrameContext *s, uint8_t *dst_left, uint8_t
+ 
+         checksum += (checksum << 1) + (*dst_l = sp[0].byte & 0xff);
+         sp[0].factor -= (sp[0].factor + 512) >> 10;
+-        dst_l += 4;
++        dst_l += stride;
+ 
+         if (stereo) {
+             checksum += (checksum << 1) + (*dst_r = filters[1].byte & 0xff);
+             filters[1].factor -= (filters[1].factor + 512) >> 10;
+-            dst_r += 4;
++            dst_r += stride;
+         }
+     }
+ 
+     if (wv_check_crc(s, checksum, 0)) {
+-        if (s->avctx->err_recognition & AV_EF_CRCCHECK)
++        if (stride == 1 || (s->avctx->err_recognition & AV_EF_CRCCHECK))
+             return AVERROR_INVALIDDATA;
+ 
+-        memset(dst_left, 0x69, s->samples * 4);
++        memset(dst_left, 0x69, s->samples * stride);
+ 
+         if (dst_r)
+-            memset(dst_right, 0x69, s->samples * 4);
++            memset(dst_right, 0x69, s->samples * stride);
+     }
+ 
+     return 0;
+@@ -577,6 +581,7 @@ static int wv_unpack_dsd_high(WavpackFrameContext *s, uint8_t *dst_left, uint8_t
+ 
+ static int wv_unpack_dsd_fast(WavpackFrameContext *s, uint8_t *dst_left, uint8_t *dst_right)
+ {
++    const int stride = s->avctx->sample_fmt == AV_SAMPLE_FMT_U8P ? 1 : 4;
+     uint8_t *dst_l = dst_left, *dst_r = dst_right;
+     uint8_t history_bits, max_probability;
+     int total_summed_probabilities  = 0;
+@@ -689,18 +694,18 @@ static int wv_unpack_dsd_fast(WavpackFrameContext *s, uint8_t *dst_left, uint8_t
+             if ((*dst_l = code = s->value_lookup[p0][index]))
+                 low += s->summed_probabilities[p0][code-1] * mult;
+ 
+-            dst_l += 4;
++            dst_l += stride;
+         } else {
+             if ((code = s->value_lookup[p0][index]))
+                 low += s->summed_probabilities[p0][code-1] * mult;
+ 
+             if (chan) {
+                 *dst_r = code;
+-                dst_r += 4;
++                dst_r += stride;
+             }
+             else {
+                 *dst_l = code;
+-                dst_l += 4;
++                dst_l += stride;
+             }
+ 
+             chan ^= 1;
+@@ -724,13 +729,13 @@ static int wv_unpack_dsd_fast(WavpackFrameContext *s, uint8_t *dst_left, uint8_t
+     }
+ 
+     if (wv_check_crc(s, checksum, 0)) {
+-        if (s->avctx->err_recognition & AV_EF_CRCCHECK)
++        if (stride == 1 || (s->avctx->err_recognition & AV_EF_CRCCHECK))
+             return AVERROR_INVALIDDATA;
+ 
+-        memset(dst_left, 0x69, s->samples * 4);
++        memset(dst_left, 0x69, s->samples * stride);
+ 
+         if (dst_r)
+-            memset(dst_right, 0x69, s->samples * 4);
++            memset(dst_right, 0x69, s->samples * stride);
+     }
+ 
+     return 0;
+@@ -738,6 +743,7 @@ static int wv_unpack_dsd_fast(WavpackFrameContext *s, uint8_t *dst_left, uint8_t
+ 
+ static int wv_unpack_dsd_copy(WavpackFrameContext *s, uint8_t *dst_left, uint8_t *dst_right)
+ {
++    const int stride = s->avctx->sample_fmt == AV_SAMPLE_FMT_U8P ? 1 : 4;
+     uint8_t *dst_l = dst_left, *dst_r = dst_right;
+     int total_samples           = s->samples;
+     uint32_t checksum           = 0xFFFFFFFF;
+@@ -747,22 +753,22 @@ static int wv_unpack_dsd_copy(WavpackFrameContext *s, uint8_t *dst_left, uint8_t
+ 
+     while (total_samples--) {
+         checksum += (checksum << 1) + (*dst_l = bytestream2_get_byte(&s->gbyte));
+-        dst_l += 4;
++        dst_l += stride;
+ 
+         if (dst_r) {
+             checksum += (checksum << 1) + (*dst_r = bytestream2_get_byte(&s->gbyte));
+-            dst_r += 4;
++            dst_r += stride;
+         }
+     }
+ 
+     if (wv_check_crc(s, checksum, 0)) {
+-        if (s->avctx->err_recognition & AV_EF_CRCCHECK)
++        if (stride == 1 || (s->avctx->err_recognition & AV_EF_CRCCHECK))
+             return AVERROR_INVALIDDATA;
+ 
+-        memset(dst_left, 0x69, s->samples * 4);
++        memset(dst_left, 0x69, s->samples * stride);
+ 
+         if (dst_r)
+-            memset(dst_right, 0x69, s->samples * 4);
++            memset(dst_right, 0x69, s->samples * stride);
+     }
+ 
+     return 0;
+@@ -1127,7 +1133,8 @@ static int wavpack_decode_block(AVCodecContext *avctx, AVFrame *frame, int block
+     s->frame_flags = bytestream2_get_le32(&gb);
+ 
+     if (s->frame_flags & (WV_FLOAT_DATA | WV_DSD_DATA))
+-        sample_fmt = AV_SAMPLE_FMT_FLTP;
++        sample_fmt = (s->frame_flags & WV_DSD_DATA) && wc->dsd_raw ?
++                     AV_SAMPLE_FMT_U8P : AV_SAMPLE_FMT_FLTP;
+     else if ((s->frame_flags & 0x03) <= 1)
+         sample_fmt = AV_SAMPLE_FMT_S16P;
+     else
+@@ -1686,11 +1693,17 @@ static int wavpack_decode_frame(AVCodecContext *avctx, AVFrame *frame,
+     if (s->dsdctx) {
+         if (s->prev_progress)
+             ff_thread_progress_await(s->prev_progress, INT_MAX);
+-        avctx->execute2(avctx, dsd_channel, frame, NULL, avctx->ch_layout.nb_channels);
++        if (!s->dsd_raw)
++            avctx->execute2(avctx, dsd_channel, frame, NULL, avctx->ch_layout.nb_channels);
+         if (s->curr_progress)
+             ff_thread_progress_report(s->curr_progress, INT_MAX);
+     }
+ 
++    if (s->dsdctx && s->dsd_raw) {
++        ret = av_dict_set(&frame->metadata, "sweetvideo.dsd_raw", "msb-u8-v1", 0);
++        if (ret < 0)
++            goto error;
++    }
+     *got_frame_ptr = 1;
+ 
+     return avpkt->size;
+@@ -1705,8 +1718,21 @@ error:
+     return ret;
+ }
+ 
++
++static const AVOption wavpack_options[] = {
++    { "dsd_raw", "Output lossless MSB-first DSD bytes instead of PCM",
++      offsetof(WavpackContext, dsd_raw), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1,
++      AV_OPT_FLAG_AUDIO_PARAM | AV_OPT_FLAG_DECODING_PARAM },
++    { NULL }
++};
++static const AVClass wavpack_class = {
++    .class_name = "wavpack", .item_name = av_default_item_name,
++    .option = wavpack_options, .version = LIBAVUTIL_VERSION_INT,
++};
++
+ const FFCodec ff_wavpack_decoder = {
+     .p.name         = "wavpack",
++    .p.priv_class   = &wavpack_class,
+     CODEC_LONG_NAME("WavPack"),
+     .p.type         = AVMEDIA_TYPE_AUDIO,
+     .p.id           = AV_CODEC_ID_WAVPACK,

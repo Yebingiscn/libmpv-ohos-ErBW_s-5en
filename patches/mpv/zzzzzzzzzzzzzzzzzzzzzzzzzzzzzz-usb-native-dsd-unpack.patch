@@ -1,0 +1,539 @@
+diff --git a/audio/aframe.c b/audio/aframe.c
+index 16fb46e390..642e5d62f7 100644
+--- a/audio/aframe.c
++++ b/audio/aframe.c
+@@ -308,7 +308,7 @@ bool mp_aframe_set_format(struct mp_aframe *frame, int format)
+     if (av_format == AV_SAMPLE_FMT_NONE && format) {
+         if (!af_fmt_is_spdif(format))
+             return false;
+-        av_format = format == AF_FORMAT_S_DOP ? AV_SAMPLE_FMT_S32 : AV_SAMPLE_FMT_S16;
++        av_format = (format == AF_FORMAT_S_DOP || format == AF_FORMAT_S_DSD) ? AV_SAMPLE_FMT_S32 : AV_SAMPLE_FMT_S16;
+     }
+     frame->format = format;
+     frame->av_frame->format = av_format;
+diff --git a/audio/decode/ad_dop.c b/audio/decode/ad_dop.c
+index 95fec25028..7a71e2497c 100644
+--- a/audio/decode/ad_dop.c
++++ b/audio/decode/ad_dop.c
+@@ -1,92 +1,190 @@
+-/* Lossless DSD packet -> DoP carrier. SPDX-License-Identifier: LGPL-2.1-or-later */
++/* Lossless raw / DST / WavPack DSD output. SPDX-License-Identifier: LGPL-2.1-or-later */
+ #include <limits.h>
++#include <libavcodec/avcodec.h>
++#include <libavutil/opt.h>
+ #include "audio/aframe.h"
++#include "audio/chmap_avchannel.h"
+ #include "audio/format.h"
+-#include "audio/out/usb_audio_protocol.h"
++#include "common/av_common.h"
+ #include "common/msg.h"
+ #include "demux/packet.h"
+ #include "demux/stheader.h"
+ #include "filters/f_decoder_wrapper.h"
+ #include "filters/filter_internal.h"
++#include "dsd_packer.h"
+ 
+ struct dop {
+     struct mp_decoder public;
+     struct mp_codec_params *codec;
+     struct mp_aframe_pool *pool;
+-    bool planar, lsb, pending;
+-    uint8_t marker, carry[2];
++    struct dsd_packer pack;
++    bool planar, lsb, native, draining;
+     double carry_pts;
++    int rate, channels;
++    AVCodecContext *avctx;
++    AVFrame *frame;
++    AVPacket *packet;
++    AVRational timebase;
+ };
+ static void reset(struct mp_filter *f)
+ {
+     struct dop *p = f->priv;
+-    p->pending = false; p->marker = 0x05;
++    dsd_packer_reset(&p->pack);
++    p->draining = false;
++    p->carry_pts = MP_NOPTS_VALUE;
++    if (p->avctx) avcodec_flush_buffers(p->avctx);
++    if (p->frame) av_frame_unref(p->frame);
++}
++static void destroy(struct mp_filter *f)
++{
++    struct dop *p = f->priv;
++    avcodec_free_context(&p->avctx);
++    av_frame_free(&p->frame);
++    mp_free_av_packet(&p->packet);
++}
++static bool pack_frame(struct mp_filter *f, const uint8_t *const data[2],
++                       int bytes, int rate, struct mp_chmap channels,
++                       bool planar, bool lsb, double pts)
++{
++    struct dop *p = f->priv;
++    unsigned group = p->native ? 4 : 2, carry = p->pack.count;
++    if (bytes < 0 || bytes > INT_MAX - 4 || rate <= 0 || rate % group ||
++        channels.num < 1 || channels.num > 2 ||
++        (carry && (p->rate != rate || p->channels != channels.num))) return false;
++    p->rate = rate; p->channels = channels.num;
++    int frames = (bytes + carry) / group;
++    struct mp_aframe *out = mp_aframe_create();
++    mp_aframe_set_format(out, p->native ? AF_FORMAT_S_DSD : AF_FORMAT_S_DOP);
++    mp_aframe_set_rate(out, rate / group);
++    mp_aframe_set_chmap(out, &channels);
++    double start = carry ? p->carry_pts : pts;
++    mp_aframe_set_pts(out, start);
++    if (frames && mp_aframe_pool_allocate(p->pool, out, frames) < 0) {
++        talloc_free(out); return false;
++    }
++    dsd_pack(&p->pack, frames ? mp_aframe_get_data_rw(out)[0] : NULL,
++             data, bytes, channels.num, planar, lsb, p->native);
++    p->carry_pts = start == MP_NOPTS_VALUE ? MP_NOPTS_VALUE :
++                   start + (double)frames * group / rate;
++    if (frames) mp_pin_in_write(f->ppins[1], MAKE_FRAME(MP_FRAME_AUDIO, out));
++    else { talloc_free(out); mp_filter_internal_mark_progress(f); }
++    return true;
++}
++static void eof(struct mp_filter *f)
++{
++    struct dop *p = f->priv;
++    if (p->pack.count) {
++        MP_ERR(f, "Incomplete DSD carrier at EOF; refusing to drop or pad source bits.\n");
++        mp_filter_internal_mark_failed(f);
++    } else {
++        mp_pin_in_write(f->ppins[1], MP_EOF_FRAME);
++    }
+ }
+ static void process(struct mp_filter *f)
+ {
+     struct dop *p = f->priv;
+-    if (!mp_pin_can_transfer_data(f->ppins[1], f->ppins[0])) return;
+-    struct mp_frame input = mp_pin_out_read(f->ppins[0]);
+-    if (input.type == MP_FRAME_EOF) {
+-        if (p->pending) { /* Never silently discard the final DSD byte. */
+-            MP_ERR(f, "Odd DSD byte count cannot form an exact DoP frame.\n");
+-            mp_filter_internal_mark_failed(f); return;
++    if (!mp_pin_in_needs_data(f->ppins[1])) return;
++    if (p->avctx) {
++        int ret = avcodec_receive_frame(p->avctx, p->frame);
++        if (ret == AVERROR_EOF) { eof(f); return; }
++        if (ret >= 0) {
++            AVFrame *v = p->frame;
++            if (v->flags & AV_FRAME_FLAG_CORRUPT) {
++                av_frame_unref(v); goto error;
++            }
++            AVDictionaryEntry *tag = av_dict_get(v->metadata, "sweetvideo.dsd_raw", NULL, 0);
++            double pts = mp_pts_from_av(v->pts, &p->timebase);
++            bool ok = false;
++            if (tag && !strcmp(tag->value, "msb-u8-v1") &&
++                (v->format == AV_SAMPLE_FMT_U8 || v->format == AV_SAMPLE_FMT_U8P)) {
++                struct mp_chmap channels;
++                mp_chmap_from_av_layout(&channels, &v->ch_layout);
++                const uint8_t *data[2] = {v->extended_data[0],
++                    v->ch_layout.nb_channels > 1 && v->format == AV_SAMPLE_FMT_U8P ? v->extended_data[1] : NULL};
++                ok = pack_frame(f, data, v->nb_samples, v->sample_rate, channels,
++                                v->format == AV_SAMPLE_FMT_U8P, false, pts);
++            } else if (!tag && p->avctx->codec_id == AV_CODEC_ID_WAVPACK &&
++                       v->format != AV_SAMPLE_FMT_U8 && v->format != AV_SAMPLE_FMT_U8P && !p->pack.count) {
++                /* Ordinary PCM WavPack remains PCM, never interpreted as DSD. */
++                struct mp_aframe *out = mp_aframe_from_avframe(v);
++                if (out) {
++                    mp_aframe_set_pts(out, pts);
++                    mp_pin_in_write(f->ppins[1], MAKE_FRAME(MP_FRAME_AUDIO, out));
++                    ok = true;
++                }
++            }
++            av_frame_unref(v);
++            if (!ok) goto error;
++            return;
+         }
+-        mp_pin_in_write(f->ppins[1], input); return;
++        if (ret != AVERROR(EAGAIN) || p->draining) goto error;
+     }
+-    if (input.type != MP_FRAME_PACKET) {
+-        if (input.type) { mp_frame_unref(&input); mp_filter_internal_mark_failed(f); }
++    struct mp_frame input = mp_pin_out_read(f->ppins[0]);
++    if (!input.type) return;
++    if (input.type != MP_FRAME_PACKET && input.type != MP_FRAME_EOF) {
++        mp_frame_unref(&input); goto error;
++    }
++    if (p->avctx) {
++        struct demux_packet *pkt = input.type == MP_FRAME_PACKET ? input.data : NULL;
++        mp_set_av_packet(p->packet, pkt, &p->timebase);
++        int ret = avcodec_send_packet(p->avctx, pkt ? p->packet : NULL);
++        p->draining = !pkt;
++        mp_frame_unref(&input);
++        if (ret < 0) goto error;
++        mp_filter_internal_mark_progress(f);
+         return;
+     }
++    if (input.type == MP_FRAME_EOF) { eof(f); return; }
+     struct demux_packet *pkt = input.data;
+     int channels = p->codec->channels.num;
+-    if (pkt->len > INT_MAX || pkt->len % channels) goto error;
+-    int bytes = pkt->len / channels, carry = p->pending ? 1 : 0;
+-    int frames = (bytes + carry) / 2;
+-    struct mp_aframe *out = mp_aframe_create();
+-    mp_aframe_set_format(out, AF_FORMAT_S_DOP);
+-    mp_aframe_set_rate(out, p->codec->samplerate / 2);
+-    mp_aframe_set_chmap(out, &p->codec->channels);
+-    mp_aframe_set_pts(out, carry ? p->carry_pts : pkt->pts);
+-    if (frames && mp_aframe_pool_allocate(p->pool, out, frames) < 0) { talloc_free(out); goto error; }
+-    uint8_t *dst = frames ? mp_aframe_get_data_rw(out)[0] : NULL;
+-    for (int s = 0; s < frames; s++) {
+-        for (int c = 0; c < channels; c++) {
+-            int a = 2 * s - carry, b = a + 1;
+-            uint8_t first = a < 0 ? p->carry[c] : pkt->buffer[p->planar ? c * bytes + a : a * channels + c];
+-            uint8_t second = pkt->buffer[p->planar ? c * bytes + b : b * channels + c];
+-            ua_dop(dst + (s * channels + c) * 4, first, second, p->lsb, p->marker);
+-        }
+-        p->marker ^= 0xff;
+-    }
+-    p->pending = (bytes + carry) % 2;
+-    if (p->pending && bytes) {
+-        for (int c = 0; c < channels; c++)
+-            p->carry[c] = pkt->buffer[p->planar ? (c + 1) * bytes - 1 : (bytes - 1) * channels + c];
+-        p->carry_pts = pkt->pts == MP_NOPTS_VALUE ? MP_NOPTS_VALUE : pkt->pts + (double)(bytes - 1) / p->codec->samplerate;
++    bool ok = pkt->len <= INT_MAX && pkt->len % channels == 0;
++    if (ok) {
++        int bytes = pkt->len / channels;
++        const uint8_t *data[2] = {pkt->buffer, pkt->buffer + bytes};
++        ok = pack_frame(f, data, bytes, p->codec->samplerate, p->codec->channels,
++                        p->planar, p->lsb, pkt->pts);
+     }
+-    talloc_free(pkt);
+-    if (frames) mp_pin_in_write(f->ppins[1], MAKE_FRAME(MP_FRAME_AUDIO, out));
+-    else { talloc_free(out); mp_filter_internal_mark_progress(f); }
+-    return;
++    mp_frame_unref(&input);
++    if (ok) return;
+ error:
+-    talloc_free(pkt); mp_filter_internal_mark_failed(f);
++    MP_ERR(f, "Lossless DSD decode failed; no PCM fallback.\n");
++    mp_filter_internal_mark_failed(f);
+ }
+ static const struct mp_filter_info info = {
+-    .name = "ad_dop", .priv_size = sizeof(struct dop), .process = process, .reset = reset,
++    .name = "ad_dop", .priv_size = sizeof(struct dop), .process = process,
++    .reset = reset, .destroy = destroy,
+ };
+ static struct mp_decoder *create(struct mp_filter *parent, struct mp_codec_params *codec, const char *decoder)
+ {
+-    if (!codec->codec || strncmp(codec->codec, "dsd_", 4) || codec->channels.num < 1 ||
+-        codec->channels.num > 2 || codec->samplerate <= 0 || codec->samplerate % 2) return NULL;
++    if (!codec->codec) return NULL;
++    bool raw = !strncmp(codec->codec, "dsd_", 4);
++    if (!raw && strcmp(codec->codec, "dst") && strcmp(codec->codec, "wavpack")) return NULL;
++    if (raw && (codec->channels.num < 1 || codec->channels.num > 2 || codec->samplerate <= 0)) return NULL;
+     struct mp_filter *f = mp_filter_create(parent, &info);
+     if (!f) return NULL;
+     mp_filter_add_pin(f, MP_PIN_IN, "in"); mp_filter_add_pin(f, MP_PIN_OUT, "out");
+     struct dop *p = f->priv;
+     p->public.f = f; p->codec = codec; p->pool = mp_aframe_pool_create(p);
++    p->native = !strcmp(decoder, "native-dsd");
+     p->planar = strstr(codec->codec, "planar") != NULL;
+     p->lsb = strstr(codec->codec, "lsbf") != NULL;
++    p->timebase = mp_get_codec_timebase(codec);
++    if (!raw) {
++        const AVCodec *c = avcodec_find_decoder_by_name(codec->codec);
++        p->avctx = c ? avcodec_alloc_context3(c) : NULL;
++        p->frame = av_frame_alloc(); p->packet = av_packet_alloc();
++        if (!p->avctx || !p->frame || !p->packet || mp_set_avctx_codec_headers(p->avctx, codec) < 0 ||
++            av_opt_set(p->avctx->priv_data, "dsd_raw", "1", 0) < 0) goto error;
++        p->avctx->pkt_timebase = p->timebase;
++        p->avctx->thread_count = 1;
++        p->avctx->err_recognition = AV_EF_CRCCHECK | AV_EF_EXPLODE;
++        if (avcodec_open2(p->avctx, c, NULL) < 0) goto error;
++    }
+     reset(f);
+     return &p->public;
++error:
++    MP_ERR(f, "This FFmpeg cannot provide lossless DSD unpacking.\n");
++    talloc_free(f);
++    return NULL;
+ }
+ const struct mp_decoder_fns ad_dop = {.create = create};
+diff --git a/audio/decode/dsd_packer.h b/audio/decode/dsd_packer.h
+new file mode 100644
+index 0000000000..aa1ac7212f
+--- /dev/null
++++ b/audio/decode/dsd_packer.h
+@@ -0,0 +1,31 @@
++/* Lossless DSD framing. SPDX-License-Identifier: LGPL-2.1-or-later */
++#ifndef MP_DSD_PACKER_H
++#define MP_DSD_PACKER_H
++#include "audio/out/usb_audio_protocol.h"
++struct dsd_packer { uint8_t carry[2][4], marker; unsigned count; };
++static inline void dsd_packer_reset(struct dsd_packer *p)
++{
++    memset(p, 0, sizeof(*p)); p->marker = 0x05;
++}
++/* Native carrier: four chronological MSB-first bytes per channel. */
++static inline unsigned dsd_pack(struct dsd_packer *p, uint8_t *out,
++    const uint8_t *const data[2], unsigned bytes, unsigned channels,
++    bool planar, bool lsb, bool native)
++{
++    unsigned frames = 0, group = native ? 4 : 2;
++    for (unsigned i = 0; i < bytes; i++) {
++        for (unsigned c = 0; c < channels; c++) {
++            uint8_t v = planar ? data[c][i] : data[0][i * channels + c];
++            p->carry[c][p->count] = lsb ? ua_reverse(v) : v;
++        }
++        if (++p->count != group) continue;
++        for (unsigned c = 0; c < channels; c++) {
++            uint8_t *dst = out + (frames * channels + c) * 4;
++            if (native) memcpy(dst, p->carry[c], 4);
++            else ua_dop(dst, p->carry[c][0], p->carry[c][1], false, p->marker);
++        }
++        p->count = 0; p->marker ^= 0xff; frames++;
++    }
++    return frames;
++}
++#endif
+diff --git a/audio/format.c b/audio/format.c
+index 4d9d0e3ca8..087a17e8b2 100644
+--- a/audio/format.c
++++ b/audio/format.c
+@@ -25,7 +25,7 @@
+ // number of bytes per sample, 0 if invalid/unknown
+ int af_fmt_to_bytes(int format)
+ {
+-    if (format == AF_FORMAT_S_DOP) return 4;
++    if ((format == AF_FORMAT_S_DOP || format == AF_FORMAT_S_DSD)) return 4;
+     switch (af_fmt_from_planar(format)) {
+     case AF_FORMAT_U8:      return 1;
+     case AF_FORMAT_S16:     return 2;
+@@ -59,7 +59,7 @@ bool af_fmt_is_int(int format)
+ 
+ bool af_fmt_is_spdif(int format)
+ {
+-    return format == AF_FORMAT_S_DOP || af_format_sample_alignment(format) > 1;
++    return (format == AF_FORMAT_S_DOP || format == AF_FORMAT_S_DSD) || af_format_sample_alignment(format) > 1;
+ }
+ 
+ bool af_fmt_is_pcm(int format)
+@@ -136,6 +136,7 @@ const char *af_fmt_to_str(int format)
+     case AF_FORMAT_S_EAC3:      return "spdif-eac3";
+     case AF_FORMAT_S_MP3:       return "spdif-mp3";
+     case AF_FORMAT_S_TRUEHD:    return "spdif-truehd";
++    case AF_FORMAT_S_DSD:       return "dsd-native";
+     case AF_FORMAT_S_DOP:       return "dsd-dop";
+     }
+     return "??";
+diff --git a/audio/format.h b/audio/format.h
+index 2ed89f33aa..6b05442a38 100644
+--- a/audio/format.h
++++ b/audio/format.h
+@@ -50,6 +50,8 @@ enum af_format {
+ 
+     AF_FORMAT_S_DOP, // Opaque DoP in a left-aligned 32-bit carrier.
+ 
++    AF_FORMAT_S_DSD, // Opaque four-byte MSB-first native DSD carrier.
++
+     AF_FORMAT_COUNT
+ };
+ 
+diff --git a/audio/out/ao.c b/audio/out/ao.c
+index f37c751510..a825a514d8 100644
+--- a/audio/out/ao.c
++++ b/audio/out/ao.c
+@@ -319,7 +319,7 @@ struct ao *ao_init_best(struct mpv_global *global,
+         talloc_free(tmp);
+         return ao;
+     }
+-    if (format == AF_FORMAT_S_DOP) { talloc_free(tmp); return NULL; }
++    if (format == AF_FORMAT_S_DOP || format == AF_FORMAT_S_DSD) { talloc_free(tmp); return NULL; }
+     if (af_fmt_is_spdif(format)) {
+         // A rejected bitstream must reach the player's PCM decoder fallback;
+         // never pass compressed bytes through the ordinary PCM AO list.
+diff --git a/audio/out/ao_usb_exclusive.c b/audio/out/ao_usb_exclusive.c
+index a7439339a6..494ec29a55 100644
+--- a/audio/out/ao_usb_exclusive.c
++++ b/audio/out/ao_usb_exclusive.c
+@@ -16,12 +16,14 @@
+ #include "options/m_option.h"
+ #include "osdep/timer.h"
+ #include "usb_audio_protocol.h"
++#include "usb_audio_dsd.h"
+ 
+ #define SLOTS 8
+ #define PACKETS 8
+ struct slot { struct usbdevfs_urb *urb; uint8_t *data; unsigned frames; bool pending; };
+ struct priv {
+-    int source_fd, fd;
++    int source_fd, fd, dsd_mode;
++    enum ua_dsd_order dsd_order;
+     bool allow_dop, claimed, control_claimed, thread_live, mutex_live;
+     struct ua_mode mode;
+     struct slot slots[SLOTS], feedback;
+@@ -270,15 +272,21 @@ static int init(struct ao *ao)
+     p->fd = -1;
+     atomic_init(&p->stop, false); atomic_init(&p->failed, false);
+     int fmt = af_fmt_from_planar(ao->format);
+-    bool dop = fmt == AF_FORMAT_S_DOP;
++    bool dop = fmt == AF_FORMAT_S_DOP, native = fmt == AF_FORMAT_S_DSD;
+     if (ao->samplerate < 8000 || ao->samplerate > 1536000) return -1;
+-    if (p->source_fd < 0 || (fmt != AF_FORMAT_S16 && fmt != AF_FORMAT_S32 && !dop) ||
+-        (dop && !p->allow_dop) || ao->channels.num < 1 || ao->channels.num > 2) {
+-        MP_ERR(ao, "USB bit-perfect requires integer PCM mono/stereo or explicitly enabled DoP.\n");
++    if (p->source_fd < 0 || (fmt != AF_FORMAT_S16 && fmt != AF_FORMAT_S32 && !dop && !native) ||
++        (dop && !(p->dsd_mode == 1 || (p->dsd_mode == 0 && p->allow_dop))) ||
++        (native && p->dsd_mode != 2) || ao->channels.num < 1 || ao->channels.num > 2) {
++        MP_ERR(ao, "USB bit-perfect requires integer PCM mono/stereo or explicitly enabled DSD transport.\n");
+         return -1;
+     }
+     p->fd = fcntl(p->source_fd, F_DUPFD_CLOEXEC, 0);
+     if (p->fd < 0) return -1;
++    uint8_t device[18];
++    if (transfer(p, 0x80, 6, 0x100, 0, device, sizeof(device)) != sizeof(device) ||
++        device[0] != 18 || device[1] != 1) goto error;
++    uint16_t vendor = ua_le(device + 8, 2), product = ua_le(device + 10, 2);
++    uint16_t revision = ua_le(device + 12, 2);
+     uint8_t config[65535], head[9], active = 0;
+     if (transfer(p, 0x80, 8, 0, 0, &active, 1) != 1) goto error;
+     bool found = false;
+@@ -292,7 +300,10 @@ static int init(struct ao *ao)
+         int best = -1;
+         for (unsigned j = 0; j < caps.count; j++) {
+             struct ua_mode *m = &caps.modes[j];
+-            if (!m->pcm || !m->endpoint || m->channels != ao->channels.num || m->interval < 1 || m->interval > 4 ||
++            enum ua_dsd_order order = ua_dsd_mode(vendor, product, revision, m);
++            if (native ? order == UA_DSD_NONE :
++                (!m->pcm || m->alternate == ua_dsd_alt(vendor, product))) continue;
++            if (!m->endpoint || m->channels != ao->channels.num || m->interval < 1 || m->interval > 4 ||
+                 m->bytes < 2 || m->bytes > 4 ||
+                 (m->bits != m->bytes * 8 && !(m->bytes == 4 && m->bits == 24)) ||
+                 (fmt == AF_FORMAT_S32 && m->bits < 24) || (dop && m->bits < 24) ||
+@@ -300,8 +311,14 @@ static int init(struct ao *ao)
+                 !rate_supported(p, m, ao->samplerate)) continue;
+             if (best < 0 || (fmt == AF_FORMAT_S16 ? m->bits < caps.modes[best].bits : m->bits > caps.modes[best].bits)) best = j;
+         }
+-        if (best < 0) goto error;
+-        p->mode = caps.modes[best]; found = true; break;
++        if (best < 0) {
++            if (native) MP_ERR(ao, "Native DSD: no compatible exact-rate mode for %04x:%04x firmware %04x.\n",
++                               vendor, product, revision);
++            goto error;
++        }
++        p->mode = caps.modes[best];
++        p->dsd_order = native ? ua_dsd_mode(vendor, product, revision, &p->mode) : UA_DSD_NONE;
++        found = true; break;
+     }
+     if (!found) goto error;
+     int speed = ioctl(p->fd, USBDEVFS_GET_SPEED, NULL);
+@@ -328,7 +345,7 @@ static int init(struct ao *ao)
+     p->mutex_live = true;
+     ao->format = fmt; ao->device_buffer = p->capacity;
+     MP_INFO(ao, "USB exclusive %d Hz / %u-bit / %s; hardware volume %s\n", ao->samplerate,
+-        p->mode.bits, dop ? "DoP" : "PCM", p->volume_available ? "available" : "unavailable");
++        p->mode.bits, native ? "Native DSD" : dop ? "DoP" : "PCM", p->volume_available ? "available" : "unavailable");
+     return 0;
+ error:
+     MP_ERR(ao, "DAC does not support this exact format, or USB access failed.\n");
+@@ -357,6 +374,10 @@ static bool write_data(struct ao *ao, void **data, int samples)
+         uint8_t *dst = p->ring + ((p->head + p->count + f) % p->capacity) * p->stride;
+         for (unsigned c = 0; c < p->mode.channels; c++) {
+             const uint8_t *src = (uint8_t *)data[0] + (f * p->mode.channels + c) * src_bytes;
++            if (ao->format == AF_FORMAT_S_DSD) {
++                ua_dsd_wire(dst + c * 4, src, p->dsd_order);
++                continue;
++            }
+             uint32_t word = ua_le(src, src_bytes);
+             if (src_bytes == 2) word <<= 16;
+             if (ao->format != AF_FORMAT_S_DOP && p->mode.bits == 24 && (word & 255)) {
+@@ -394,6 +415,7 @@ const struct ao_driver audio_out_usb_exclusive = {
+     .priv_size = sizeof(struct priv), .priv_defaults = &(const struct priv){.source_fd = -1, .fd = -1},
+     .options = (const struct m_option[]){
+         {"fd", OPT_INT(source_fd), M_RANGE(-1, INT_MAX)},
+-        {"dop", OPT_BOOL(allow_dop)}, {0}
++        {"dop", OPT_BOOL(allow_dop)},
++        {"dsd-mode", OPT_CHOICE(dsd_mode, {"no", 0}, {"dop", 1}, {"native", 2})}, {0}
+     }, .options_prefix = "usb-exclusive",
+ };
+diff --git a/audio/out/usb_audio_dsd.h b/audio/out/usb_audio_dsd.h
+new file mode 100644
+index 0000000000..61de4bb51b
+--- /dev/null
++++ b/audio/out/usb_audio_dsd.h
+@@ -0,0 +1,48 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later
++ * Device facts from Linux sound/usb/quirks.c,
++ * snd_usb_interface_dsd_format_quirks (consulted 2026-09-25).
++ * https://github.com/torvalds/linux/blob/master/sound/usb/quirks.c
++ * Only known U32 transports are enabled; no chipset/vendor wildcard.
++ */
++#ifndef MP_USB_AUDIO_DSD_H
++#define MP_USB_AUDIO_DSD_H
++#include "usb_audio_protocol.h"
++enum ua_dsd_order { UA_DSD_NONE, UA_DSD_U32_BE, UA_DSD_U32_LE };
++static inline unsigned ua_dsd_alt(uint16_t vendor, uint16_t product)
++{
++    uint32_t id = ((uint32_t)vendor << 16) | product;
++    static const uint32_t alt2[] = {
++        0x139f5504, 0x20b13089, 0x25220007, 0x25220009,
++        0x25220012, 0x27720230, 0x16d0071a, 0x16d00a23,
++    };
++    static const uint32_t alt3[] = {
++        0x0d8c0316, 0x10cb0103, 0x16d006b2, 0x16d006b4,
++        0x16d00733, 0x16d009d8, 0x16d009db, 0x16d009dd,
++        0x16d00ab1, 0x16d0eca1, 0x1db50003, 0x20a04143,
++        0x22e1ca01, 0x249c9326, 0x26160106, 0x26220041,
++        0x26220061, 0x278b5100, 0x27f73002, 0x29a20086,
++        0x6b420042,
++    };
++    for (unsigned i = 0; i < sizeof(alt2) / sizeof(alt2[0]); i++)
++        if (id == alt2[i]) return 2;
++    for (unsigned i = 0; i < sizeof(alt3) / sizeof(alt3[0]); i++)
++        if (id == alt3[i]) return 3;
++    return 0;
++}
++static inline enum ua_dsd_order ua_dsd_mode(uint16_t vendor, uint16_t product,
++                                          uint16_t revision, const struct ua_mode *m)
++{
++    unsigned alt = ua_dsd_alt(vendor, product);
++    if (!alt || m->alternate != alt || m->protocol != 0x20 ||
++        m->bytes != 4 || m->bits != 32) return UA_DSD_NONE;
++    if (vendor == 0x16d0 && product == 0x071a) {
++        if (revision == 0x0199) return UA_DSD_U32_LE;
++        if (revision != 0x019b && revision != 0x0203) return UA_DSD_NONE;
++    }
++    return UA_DSD_U32_BE;
++}
++static inline void ua_dsd_wire(uint8_t dst[4], const uint8_t src[4], enum ua_dsd_order order)
++{
++    for (unsigned i = 0; i < 4; i++) dst[i] = src[order == UA_DSD_U32_LE ? 3 - i : i];
++}
++#endif
+diff --git a/filters/f_decoder_wrapper.c b/filters/f_decoder_wrapper.c
+index 6fd47e0b72..d0943b54e6 100644
+--- a/filters/f_decoder_wrapper.c
++++ b/filters/f_decoder_wrapper.c
+@@ -450,11 +450,13 @@ static bool reinit_decoder(struct priv *p)
+         bool try_spdif = p->try_spdif;
+         mp_mutex_unlock(&p->cache_lock);
+ 
+-        if (p->codec->codec && strncmp(p->codec->codec, "dsd_", 4) == 0 &&
+-            p->opts->audio_spdif && strcmp(p->opts->audio_spdif, "dop") == 0) {
++        if (p->codec->codec && (!strncmp(p->codec->codec, "dsd_", 4) ||
++            !strcmp(p->codec->codec, "dst") || !strcmp(p->codec->codec, "wavpack")) &&
++            p->opts->audio_spdif && (!strcmp(p->opts->audio_spdif, "dop") ||
++                                   !strcmp(p->opts->audio_spdif, "native-dsd"))) {
+             driver = &ad_dop;
+             list = talloc_zero(NULL, struct mp_decoder_list);
+-            mp_add_decoder(list, p->codec->codec, "dop", "Lossless DSD over PCM");
++            mp_add_decoder(list, p->codec->codec, p->opts->audio_spdif, "Lossless DSD output");
+         } else if (try_spdif && p->codec->codec) {
+             struct mp_decoder_list *spdif =
+                 select_spdif_codec(p->codec->codec, p->opts->audio_spdif);
+diff --git a/player/audio.c b/player/audio.c
+index 10465cdedd..b1b2919d5c 100644
+--- a/player/audio.c
++++ b/player/audio.c
+@@ -508,7 +508,7 @@ static int reinit_audio_filters_and_output(struct MPContext *mpctx)
+ 
+     if (!mpctx->ao) {
+         // If spdif was used, try to fallback to PCM.
+-        if (spdif_fallback && out_format != AF_FORMAT_S_DOP && ao_c->track && ao_c->track->dec) {
++        if (spdif_fallback && out_format != AF_FORMAT_S_DOP && out_format != AF_FORMAT_S_DSD && ao_c->track && ao_c->track->dec) {
+             MP_VERBOSE(mpctx, "Falling back to PCM output.\n");
+             ao_c->spdif_passthrough = false;
+             ao_c->spdif_failed = true;

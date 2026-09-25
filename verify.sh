@@ -43,9 +43,9 @@ for symbol in mpv_create ohos_osd_set_global_surface; do
 done
 
 dynamic_section=$("$READELF" -d "$LIBMPV")
-for marker in usb-exclusive dsd-dop; do
+for marker in usb-exclusive dsd-dop dsd-native dsd-mode sweetvideo.dsd_raw; do
   if ! "$STRINGS" "$LIBMPV" | grep -Fx "$marker" >/dev/null; then
-    echo "Missing USB exclusive/DoP implementation: $marker" >&2
+    echo "Missing USB exclusive/DSD implementation: $marker" >&2
     exit 1
   fi
 done
