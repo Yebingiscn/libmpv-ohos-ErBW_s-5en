@@ -1,0 +1,945 @@
+diff --git a/configure b/configure
+index 2bc5c6f..3532f01 100755
+--- a/configure
++++ b/configure
+@@ -330,6 +330,7 @@ External library support:
+   --disable-metal          disable Apple Metal framework [autodetect]
+   --enable-libmysofa       enable libmysofa, needed for sofalizer filter [no]
+   --enable-ohcodec         enable OpenHarmony Codec support [no]
++  --enable-ohos-http3      enable optional HarmonyOS RCP QUIC transport [no]
+   --enable-openal          enable OpenAL 1.1 capture support [no]
+   --enable-opencl          enable OpenCL processing [no]
+   --enable-opengl          enable OpenGL rendering [no]
+@@ -2114,6 +2115,7 @@ EXTERNAL_LIBRARY_LIST="
+     lv2
+     mediacodec
+     ohcodec
++    ohos_http3
+     openal
+     opengl
+     openssl
+@@ -4045,6 +4047,7 @@ httpproxy_protocol_select="tcp_protocol"
+ httpproxy_protocol_suggest="zlib"
+ https_protocol_select="tls_protocol"
+ https_protocol_suggest="zlib"
++ohos_http3_deps="pthreads libdl mbedtls https_protocol"
+ icecast_protocol_select="http_protocol"
+ mmsh_protocol_select="http_protocol"
+ mmst_protocol_select="network"
+@@ -7268,6 +7271,7 @@ enabled libcelt           && require libcelt celt/celt.h celt_decode -lcelt0 &&
+ enabled libcaca           && require_pkg_config libcaca caca caca.h caca_create_canvas
+ enabled libcodec2         && require libcodec2 codec2/codec2.h codec2_create -lcodec2
+ enabled libdav1d          && require_pkg_config libdav1d "dav1d >= 1.0.0" "dav1d/dav1d.h" dav1d_version
++enabled ohos_http3        && require_pkg_config ohos_http3 "libnghttp3 >= 1.18.0" "nghttp3/nghttp3.h" nghttp3_conn_read_stream2
+ enabled libdavs2          && require_pkg_config libdavs2 "davs2 >= 1.6.0" davs2.h davs2_decoder_open
+ enabled libdc1394         && require_pkg_config libdc1394 libdc1394-2 dc1394/dc1394.h dc1394_new
+ enabled libdrm            && check_pkg_config libdrm libdrm xf86drm.h drmGetVersion
+diff --git a/libavformat/Makefile b/libavformat/Makefile
+index 1d42474..6a49da0 100644
+--- a/libavformat/Makefile
++++ b/libavformat/Makefile
+@@ -1,4 +1,5 @@
+ NAME = avformat
++OBJS-$(CONFIG_OHOS_HTTP3)                  += ohos_http3.o
+ DESC = FFmpeg container format library
+ 
+ HEADERS = avformat.h                                                    \
+diff --git a/libavformat/http.c b/libavformat/http.c
+index b56ef5e..b71eea1 100644
+--- a/libavformat/http.c
++++ b/libavformat/http.c
+@@ -48,6 +48,9 @@
+ #include "os_support.h"
+ #include "url.h"
+ #include "version.h"
++#if CONFIG_OHOS_HTTP3
++#include "ohos_http3.h"
++#endif
+ 
+ /* XXX: POST protocol is not completely implemented because ffmpeg uses
+  * only a subset of it. */
+@@ -313,15 +316,46 @@ static int http_open_cnx_internal(URLContext *h, AVDictionary **options)
+ 
+     if (!s->hd) {
+         s->nb_connections++;
++#if CONFIG_OHOS_HTTP3
++        if (!strcmp(lower_proto, "tls") && !(h->flags & AVIO_FLAG_WRITE) &&
++            !s->post_data && !s->listen && (!s->method || !strcmp(s->method, "GET")) &&
++            !proxy_path) {
++            err = ff_ohos_http3_open(&s->hd, h, hostname, port, *options);
++            if (err == AVERROR_EXIT)
++                goto end;
++        }
++        if (!s->hd)
++#endif
+         err = ffurl_open_whitelist(&s->hd, buf, AVIO_FLAG_READ_WRITE,
+                                    &h->interrupt_callback, options,
+                                    h->protocol_whitelist, h->protocol_blacklist, h);
+     }
+ 
++    if (err >= 0) {
++#if CONFIG_OHOS_HTTP3
++        uint64_t request_off = s->off;
++        if (ff_ohos_http3_is(s->hd))
++            s->http_code = 0;
++#endif
++        err = http_connect(h, path, local_path, hoststr, auth, proxyauth);
++#if CONFIG_OHOS_HTTP3
++        if (err < 0 && err != AVERROR_EXIT && ff_ohos_http3_is(s->hd) &&
++            !(s->http_code >= 400 && s->http_code <= 599)) {
++            ff_ohos_http3_failed(hostname, port);
++            ffurl_closep(&s->hd);
++            av_log(h, AV_LOG_INFO, "[OHHTTP3] transport failed; falling back to TCP/TLS\n");
++            err = ffurl_open_whitelist(&s->hd, buf, AVIO_FLAG_READ_WRITE,
++                                      &h->interrupt_callback, options,
++                                      h->protocol_whitelist, h->protocol_blacklist, h);
++            s->off = request_off;
++            if (err >= 0)
++                err = http_connect(h, path, local_path, hoststr, auth, proxyauth);
++        }
++#endif
++    }
+ end:
+     freeenv_utf8(env_http_proxy);
+-    return err < 0 ? err : http_connect(
+-        h, path, local_path, hoststr, auth, proxyauth);
++    return err;
+ }
+ 
+ static int http_should_reconnect(HTTPContext *s, int err)
+@@ -1303,6 +1337,10 @@ static int process_line(URLContext *h, char *line, int line_count, int *parsed_h
+         } else if (!av_strcasecmp(tag, "Content-Type")) {
+             av_free(s->mime_type);
+             s->mime_type = av_get_token((const char **)&p, ";");
++#if CONFIG_OHOS_HTTP3
++        } else if (!av_strcasecmp(tag, "Alt-Svc")) {
++            ff_ohos_http3_observe(s->location, p);
++#endif
+         } else if (!av_strcasecmp(tag, "Set-Cookie")) {
+             if (parse_cookie(s, p, &s->cookie_dict))
+                 av_log(h, AV_LOG_WARNING, "Unable to parse '%s'\n", p);
+diff --git a/libavformat/ohos_http3.c b/libavformat/ohos_http3.c
+new file mode 100644
+index 0000000..05585f4
+--- /dev/null
++++ b/libavformat/ohos_http3.c
+@@ -0,0 +1,741 @@
++/*
++ * Optional HarmonyOS QUIC / HTTP/3 bridge for the existing HTTP parser.
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ *
++ * RCP callbacks only copy bounded raw QUIC data. nghttp3 runs exclusively on
++ * the FFmpeg reader thread. No playback frame, decoder, or VO changes.
++ */
++#include <dlfcn.h>
++#include <pthread.h>
++#include <stdlib.h>
++#include <string.h>
++#include <mbedtls/x509_crt.h>
++#include <nghttp3/nghttp3.h>
++#include "libavutil/avstring.h"
++#include "libavutil/bprint.h"
++#include "libavutil/error.h"
++#include "libavutil/mem.h"
++#include "libavutil/time.h"
++#include "avformat.h"
++#include "ohos_http3.h"
++#include "ohos_rcp_quic.h"
++#include "tls.h"
++
++#define H3_SLOTS 64
++#define H3_BLOCK 4096
++#define H3_OUTPUT (256 * 1024)
++#define H3_STREAMS 32
++#define H3_INITIAL_US 1000000
++#define H3_BACKOFF_US (300LL * 1000000)
++
++typedef struct H3Origin {
++    char host[1024];
++    int port, announced;
++    int64_t expires, blocked;
++} H3Origin;
++static H3Origin origins[64];
++static unsigned origin_next;
++static pthread_mutex_t origin_lock = PTHREAD_MUTEX_INITIALIZER;
++
++static H3Origin *origin_find(const char *host, int port, int create)
++{
++    unsigned i;
++    for (i = 0; i < FF_ARRAY_ELEMS(origins); i++)
++        if (origins[i].port == port && !av_strcasecmp(origins[i].host, host))
++            return &origins[i];
++    if (!create || strlen(host) >= sizeof(origins[0].host))
++        return NULL;
++    i = origin_next++ % FF_ARRAY_ELEMS(origins);
++    memset(&origins[i], 0, sizeof(origins[i]));
++    av_strlcpy(origins[i].host, host, sizeof(origins[i].host));
++    origins[i].port = port;
++    return &origins[i];
++}
++
++/* Deliberately support only h3 on the original authority/port. Alternative
++ * hosts, draft ALPNs and alternative ports require additional TLS/route policy.
++ * Nothing learned from a plaintext HTTP response is eligible for upgrade. */
++void ff_ohos_http3_observe(const char *url, const char *alt)
++{
++    char scheme[10], host[1024], auth[1024];
++    int port, enabled = 0;
++    int64_t age = 3600;
++    const char *p = alt;
++    H3Origin *entry;
++    av_url_split(scheme, sizeof(scheme), auth, sizeof(auth), host, sizeof(host),
++                 &port, NULL, 0, url);
++    if (strcmp(scheme, "https") || !host[0])
++        return;
++    if (port < 0)
++        port = 443;
++    if (!port || port > 65535)
++        return;
++    if (!av_strcasecmp(alt, "clear"))
++        age = 0;
++    else {
++        while (*p) {
++            char *end;
++            long advertised;
++            while (*p == ' ' || *p == '\t' || *p == ',') p++;
++            if (!strncmp(p, "h3=\":", 5)) {
++                advertised = strtol(p + 5, &end, 10);
++                if (end != p + 5 && *end == '"' && advertised == port) {
++                    enabled = 1;
++                    p = end + 1;
++                    while (*p && *p != ',') {
++                        if (*p == ';') {
++                            const char *key = p + 1, *v;
++                            while (*key == ' ' || *key == '\t') key++;
++                            if (av_strncasecmp(key, "ma", 2)) { p++; continue; }
++                            v = key + 2;
++                            while (*v == ' ' || *v == '\t') v++;
++                            if (*v != '=') { p++; continue; }
++                            v++;
++                            while (*v == ' ' || *v == '\t') v++;
++                            if (*v < '0' || *v > '9') return;
++                            unsigned long long n = strtoull(v, &end, 10);
++                            if (end == v || (*end && *end != ';' && *end != ',' && *end != ' '))
++                                return;
++                            age = FFMIN(n, 3600);
++                            break;
++                        }
++                        p++;
++                    }
++                    break;
++                }
++            }
++            p = strchr(p, ',');
++            if (!p) break;
++            p++;
++        }
++    }
++    if (!enabled && age)
++        return;
++    pthread_mutex_lock(&origin_lock);
++    entry = origin_find(host, port, 1);
++    if (entry)
++        entry->expires = age ? av_gettime_relative() + age * 1000000 : 0;
++    pthread_mutex_unlock(&origin_lock);
++}
++
++void ff_ohos_http3_failed(const char *host, int port)
++{
++    H3Origin *entry;
++    pthread_mutex_lock(&origin_lock);
++    entry = origin_find(host, port, 0);
++    if (entry) entry->blocked = av_gettime_relative() + H3_BACKOFF_US;
++    pthread_mutex_unlock(&origin_lock);
++}
++
++static OhosQuicAPI quic;
++static pthread_once_t quic_once = PTHREAD_ONCE_INIT;
++static int quic_available, quic_disabled;
++static void *quic_library;
++
++static void load_quic(void)
++{
++    /* Header and SDK stub names differ between HMS releases. Never copy a
++     * system library into the application or use private absolute paths. */
++    const char *names[] = { "librcp_quic_c.so", "librcp_quic.so" };
++    unsigned i;
++    for (i = 0; i < FF_ARRAY_ELEMS(names); i++) {
++        void *lib = dlopen(names[i], RTLD_NOW | RTLD_LOCAL);
++        if (!lib) continue;
++#define RESOLVE(field, symbol) do { *(void **)(&quic.field) = dlsym(lib, symbol); if (!quic.field) goto missing; } while (0)
++        RESOLVE(CreateSession, "HMS_Rcp_QuicCreateSession");
++        RESOLVE(DestroySession, "HMS_Rcp_QuicDestroySession");
++        RESOLVE(ConnCreate, "HMS_Rcp_QuicConnCreate");
++        RESOLVE(ConnSetOpt, "HMS_Rcp_QuicConnSetOpt");
++        RESOLVE(ConnConnect, "HMS_Rcp_QuicConnConnect");
++        RESOLVE(ConnDestroy, "HMS_Rcp_QuicConnDestroy");
++        RESOLVE(StreamOpen, "HMS_Rcp_QuicConnStreamOpen");
++        RESOLVE(StreamSetOpt, "HMS_Rcp_QuicStreamSetOpt");
++        RESOLVE(StreamSend, "HMS_Rcp_QuicConnStreamSend");
++        RESOLVE(StreamWantRead, "HMS_Rcp_QuicConnStreamWantRead");
++        RESOLVE(StreamShutdown, "HMS_Rcp_QuicConnStreamShutdown");
++#undef RESOLVE
++        quic_library = lib; /* Pinned for the process lifetime: callbacks use it. */
++        quic_available = 1;
++        return;
++missing:
++        memset(&quic, 0, sizeof(quic));
++        dlclose(lib); /* No session or callback exists yet. */
++    }
++}
++
++typedef struct H3Packet {
++    uint64_t stream;
++    size_t len;
++    int fin;
++    uint8_t data[H3_BLOCK];
++} H3Packet;
++typedef struct H3Context {
++    struct H3Context *next;
++    pthread_mutex_t lock;
++    Rcp_QuicSession *session;
++    Rcp_QuicConn *conn;
++    nghttp3_conn *http;
++    H3Packet input[H3_SLOTS];
++    unsigned head, count;
++    uint64_t streams[H3_STREAMS];
++    unsigned nb_streams;
++    uint64_t local_uni[3];
++    unsigned nb_local_uni;
++    int connected, closed, closing, error, active;
++    uint64_t request_stream;
++    char host[1024];
++    int port, verify;
++    mbedtls_x509_crt ca;
++    AVBPrint headers;
++    int status, headers_done, eof, request_sent, requests, keepalive;
++    uint8_t output[H3_OUTPUT];
++    size_t output_pos, output_len;
++    int64_t initial_deadline, last_activity, idle_us;
++} H3Context;
++static H3Context *active_connections; /* Protected by origin_lock. */
++
++static void unregister_connection(H3Context *s)
++{
++    H3Context **p;
++    pthread_mutex_lock(&origin_lock);
++    for (p = &active_connections; *p; p = &(*p)->next)
++        if (*p == s) { *p = s->next; break; }
++    pthread_mutex_unlock(&origin_lock);
++}
++
++static void connected_cb(Rcp_QuicConn *conn, void *opaque)
++{
++    H3Context *s = opaque;
++    pthread_mutex_lock(&s->lock);
++    s->connected = 1;
++    pthread_mutex_unlock(&s->lock);
++}
++static void error_cb(Rcp_QuicConn *conn, void *opaque, int code, const char *detail)
++{
++    H3Context *s = opaque;
++    pthread_mutex_lock(&s->lock);
++    s->error = AVERROR(EIO);
++    pthread_mutex_unlock(&s->lock);
++}
++static void closed_cb(Rcp_QuicConn *conn, void *opaque)
++{
++    H3Context *s = opaque;
++    pthread_mutex_lock(&s->lock);
++    s->closed = 1;
++    if (!s->closing) s->error = AVERROR(EIO);
++    pthread_mutex_unlock(&s->lock);
++}
++static int cert_cb(Rcp_QuicConn *conn, void *opaque,
++                   const unsigned char *const *certs, const size_t *lens, size_t count)
++{
++    H3Context *s = opaque;
++    mbedtls_x509_crt chain;
++    uint32_t flags = 0;
++    int ret = -1;
++    size_t i;
++    pthread_mutex_lock(&s->lock);
++    if (s->closing) { pthread_mutex_unlock(&s->lock); return 1007920012; }
++    s->active++;
++    pthread_mutex_unlock(&s->lock);
++    if (!s->verify) { ret = 0; goto finish; } /* Mirrors existing TLS policy. */
++    mbedtls_x509_crt_init(&chain);
++    if (!count || count > 16) goto done;
++    for (i = 0; i < count; i++)
++        if (lens[i] > 65536 || mbedtls_x509_crt_parse_der(&chain, certs[i], lens[i]))
++            goto done;
++    ret = mbedtls_x509_crt_verify(&chain, &s->ca, NULL, s->host, &flags, NULL, NULL);
++done:
++    mbedtls_x509_crt_free(&chain);
++finish:
++    pthread_mutex_lock(&s->lock);
++    s->active--;
++    pthread_mutex_unlock(&s->lock);
++    return ret || flags ? 1007920012 : 0;
++}
++
++static uint64_t data_cb(Rcp_QuicConn *conn, void *opaque, uint64_t stream,
++                        const Rcp_QuicStreamData *data)
++{
++    H3Context *s;
++    uint64_t consumed = 0;
++    unsigned i;
++    /* Server-created streams need not carry the ConnCreate user object.
++     * Look up by connection rather than relying on undocumented optVal rules. */
++    pthread_mutex_lock(&origin_lock);
++    for (s = active_connections; s && s->conn != conn; s = s->next) {}
++    if (!s) { pthread_mutex_unlock(&origin_lock); return 0; }
++    pthread_mutex_lock(&s->lock);
++    pthread_mutex_unlock(&origin_lock);
++    if (s->closing) goto done;
++    for (i = 0; i < data->iovLen; i++) {
++        uint64_t off = 0;
++        while (off < data->iov[i].length) {
++            H3Packet *p;
++            if (s->count == H3_SLOTS) goto done;
++            p = &s->input[(s->head + s->count++) % H3_SLOTS];
++            p->stream = stream;
++            p->len = FFMIN(data->iov[i].length - off, H3_BLOCK);
++            p->fin = data->fin && i + 1 == data->iovLen && off + p->len == data->iov[i].length;
++            memcpy(p->data, data->iov[i].data + off, p->len);
++            off += p->len;
++            consumed += p->len;
++        }
++    }
++    if (data->fin && consumed) {
++        s->input[(s->head + s->count - 1) % H3_SLOTS].fin = 1;
++    } else if (data->fin && s->count < H3_SLOTS) {
++        H3Packet *p = &s->input[(s->head + s->count++) % H3_SLOTS];
++        p->stream = stream; p->len = 0; p->fin = 1;
++    }
++done:
++    pthread_mutex_unlock(&s->lock);
++    return consumed; /* Partial consumption applies QUIC receive backpressure. */
++}
++
++static int configure_stream(H3Context *s, uint64_t stream)
++{
++    int ret;
++    pthread_mutex_lock(&s->lock);
++    if (s->nb_streams == H3_STREAMS) {
++        s->error = AVERROR(ENOBUFS);
++        pthread_mutex_unlock(&s->lock);
++        return -1;
++    }
++    s->streams[s->nb_streams++] = stream;
++    pthread_mutex_unlock(&s->lock);
++    ret = quic.StreamSetOpt(s->conn, stream, RCP_QUIC_STREAM_DATA_FUNCTION,
++                            data_cb, 0);
++    if (ret) {
++        pthread_mutex_lock(&s->lock);
++        s->error = AVERROR(EIO);
++        pthread_mutex_unlock(&s->lock);
++    }
++    return ret;
++}
++static void inbound_cb(Rcp_QuicConn *conn, void *opaque, uint64_t stream)
++{
++    H3Context *s = opaque;
++    pthread_mutex_lock(&s->lock);
++    if (s->closing) { pthread_mutex_unlock(&s->lock); return; }
++    s->active++;
++    pthread_mutex_unlock(&s->lock);
++    if (configure_stream(s, stream))
++        error_cb(conn, s, 0, NULL);
++    pthread_mutex_lock(&s->lock);
++    s->active--;
++    pthread_mutex_unlock(&s->lock);
++}
++
++static int output_append(H3Context *s, const void *data, size_t len)
++{
++    if (len > sizeof(s->output) - s->output_len)
++        return NGHTTP3_ERR_CALLBACK_FAILURE;
++    memcpy(s->output + s->output_len, data, len);
++    s->output_len += len;
++    return 0;
++}
++static int recv_header(nghttp3_conn *http, int64_t stream, int32_t token,
++                       nghttp3_rcbuf *name, nghttp3_rcbuf *value, uint8_t flags,
++                       void *opaque, void *stream_opaque)
++{
++    H3Context *s = opaque;
++    nghttp3_vec n = nghttp3_rcbuf_get_buf(name), v = nghttp3_rcbuf_get_buf(value);
++    if (stream != s->request_stream) return NGHTTP3_ERR_CALLBACK_FAILURE;
++    if (n.len == 7 && !memcmp(n.base, ":status", 7)) {
++        if (v.len != 3 || v.base[0] < '1' || v.base[0] > '5' ||
++            v.base[1] < '0' || v.base[1] > '9' || v.base[2] < '0' || v.base[2] > '9')
++            return NGHTTP3_ERR_CALLBACK_FAILURE;
++        s->status = (v.base[0] - '0') * 100 + (v.base[1] - '0') * 10 + v.base[2] - '0';
++    } else if (n.len && n.base[0] != ':' &&
++               !(n.len == 17 && !memcmp(n.base, "transfer-encoding", 17)) &&
++               !(n.len == 10 && !memcmp(n.base, "connection", 10))) {
++        av_bprintf(&s->headers, "%.*s: %.*s\r\n", (int)n.len, n.base, (int)v.len, v.base);
++    }
++    return av_bprint_is_complete(&s->headers) ? 0 : NGHTTP3_ERR_CALLBACK_FAILURE;
++}
++static int end_headers(nghttp3_conn *http, int64_t stream, int fin,
++                       void *opaque, void *stream_opaque)
++{
++    H3Context *s = opaque;
++    char status[64];
++    int len;
++    if (s->status < 100) return NGHTTP3_ERR_CALLBACK_FAILURE;
++    if (s->status < 200) {
++        av_bprint_clear(&s->headers);
++        s->status = 0;
++        return 0;
++    }
++    pthread_mutex_lock(&origin_lock);
++    H3Origin *origin = origin_find(s->host, s->port, 0);
++    int announce = origin && !origin->announced;
++    if (origin) origin->announced = 1;
++    pthread_mutex_unlock(&origin_lock);
++    if (announce)
++        av_log(NULL, AV_LOG_INFO, "[OHHTTP3] HTTP/3 response received; QUIC active\n");
++    len = snprintf(status, sizeof(status), "HTTP/1.1 %d\r\n", s->status);
++    const char *connection = s->keepalive && s->requests < 8 ?
++                              "Connection: keep-alive\r\n\r\n" : "Connection: close\r\n\r\n";
++    if (output_append(s, status, len) || output_append(s, s->headers.str, s->headers.len) ||
++        output_append(s, connection, strlen(connection)))
++        return NGHTTP3_ERR_CALLBACK_FAILURE;
++    s->headers_done = 1;
++    return 0;
++}
++static int recv_data(nghttp3_conn *http, int64_t stream, const uint8_t *data,
++                     size_t len, void *opaque, void *stream_opaque)
++{
++    H3Context *s = opaque;
++    if (!s->headers_done || stream != s->request_stream)
++        return NGHTTP3_ERR_CALLBACK_FAILURE;
++    return output_append(s, data, len);
++}
++static int end_stream(nghttp3_conn *http, int64_t stream, void *opaque, void *stream_opaque)
++{
++    H3Context *s = opaque;
++    if (stream == s->request_stream) s->eof = 1;
++    return 0;
++}
++
++static int flush_http(H3Context *s)
++{
++    for (;;) {
++        nghttp3_vec vec[16];
++        Rcp_QuicIoVec iov[16];
++        int64_t stream;
++        int fin, i, ret;
++        uint64_t total = 0;
++        nghttp3_ssize count = nghttp3_conn_writev_stream(s->http, &stream, &fin, vec, 16);
++        if (count < 0) return AVERROR(EIO);
++        if (stream < 0) return 0;
++        for (i = 0; i < count; i++) {
++            iov[i].data = vec[i].base; iov[i].length = vec[i].len; total += vec[i].len;
++        }
++        ret = quic.StreamSend(s->conn, stream, iov, count, fin);
++        if (ret == RCP_QUIC_ERROR_CODE_EAGAIN) return 0;
++        if (ret || nghttp3_conn_add_write_offset(s->http, stream, total))
++            return AVERROR(EIO);
++    }
++}
++
++static int h3_write(URLContext *h, const unsigned char *buf, int len)
++{
++    H3Context *s = h->priv_data;
++    nghttp3_nv fields[128];
++    char *text, *line, *save = NULL, *path, *space;
++    unsigned n = 0, authority = 0;
++    int ret = AVERROR(EINVAL);
++    if (len > 65536 || len < 4 || memcmp(buf + len - 4, "\r\n\r\n", 4))
++        return ret;
++    if (s->request_sent) {
++        if (!s->eof || s->output_pos < s->output_len || s->requests >= 8)
++            return AVERROR(EIO);
++        /* Keep a bounded number of request streams. RCP doesn't expose QUIC
++         * ACK offsets, so do not tell nghttp3 that buffers have been ACKed.
++         * Rotate after eight requests instead of retaining them indefinitely. */
++        pthread_mutex_lock(&s->lock);
++        for (unsigned i = 0; i < s->nb_streams; i++) {
++            if (s->streams[i] == s->request_stream) {
++                s->streams[i] = s->streams[--s->nb_streams];
++                break;
++            }
++        }
++        pthread_mutex_unlock(&s->lock);
++        if (quic.StreamOpen(s->conn, RCP_QUIC_STREAM_BIDI, &s->request_stream, s) ||
++            configure_stream(s, s->request_stream)) return AVERROR(EIO);
++        s->status = s->headers_done = s->eof = s->request_sent = 0;
++        s->output_pos = s->output_len = 0;
++        av_bprint_clear(&s->headers);
++        s->initial_deadline = av_gettime_relative() + FFMIN(H3_INITIAL_US, s->idle_us);
++        s->last_activity = av_gettime_relative();
++    }
++    s->keepalive = 0;
++    text = av_strndup((const char *)buf, len);
++    if (!text) return AVERROR(ENOMEM);
++    line = av_strtok(text, "\r\n", &save);
++    if (!line || strncmp(line, "GET ", 4)) goto done;
++    path = line + 4;
++    space = strchr(path, ' ');
++    if (!space) goto done;
++    *space = 0;
++#define FIELD(key, val) do { fields[n++] = (nghttp3_nv){ (uint8_t *)(key), (uint8_t *)(val), strlen(key), strlen(val), NGHTTP3_NV_FLAG_NONE }; } while (0)
++    FIELD(":method", "GET");
++    FIELD(":scheme", "https");
++    FIELD(":path", path);
++    /* FFmpeg normally emits Host after regular fields. HTTP/3 requires every
++     * pseudo-header before those fields, so reserve authority here. */
++    FIELD(":authority", "");
++    while ((line = av_strtok(NULL, "\r\n", &save))) {
++        char *colon = strchr(line, ':'), *v, *p;
++        if (!colon || n == FF_ARRAY_ELEMS(fields)) goto done;
++        *colon = 0;
++        v = colon + 1;
++        while (*v == ' ' || *v == '\t') v++;
++        for (p = line; *p; p++) *p = av_tolower(*p);
++        if (!strcmp(line, "host")) {
++            if (authority++) goto done;
++            fields[3].value = (uint8_t *)v;
++            fields[3].valuelen = strlen(v);
++        }
++        else if (!strcmp(line, "connection")) {
++            s->keepalive = !av_strcasecmp(v, "keep-alive");
++            continue;
++        }
++        else if (!strcmp(line, "keep-alive") ||
++                 !strcmp(line, "proxy-connection") || !strcmp(line, "transfer-encoding")) continue;
++        else FIELD(line, v);
++    }
++#undef FIELD
++    if (!authority) goto done;
++    ret = nghttp3_conn_submit_request(s->http, s->request_stream, fields, n, NULL, NULL);
++    if (ret) { ret = AVERROR(EIO); goto done; }
++    s->request_sent = 1;
++    s->requests++;
++    ret = flush_http(s);
++    if (!ret) ret = len;
++done:
++    av_free(text);
++    return ret;
++}
++
++static int h3_read(URLContext *h, unsigned char *buf, int len)
++{
++    H3Context *s = h->priv_data;
++    H3Packet packet;
++    uint64_t streams[H3_STREAMS];
++    unsigned count, i;
++    int ret = 0, have;
++    int64_t now = av_gettime_relative();
++    if (s->output_pos < s->output_len) {
++        len = FFMIN(len, s->output_len - s->output_pos);
++        memcpy(buf, s->output + s->output_pos, len);
++        s->output_pos += len;
++        return len;
++    }
++    s->output_pos = s->output_len = 0;
++    if (s->eof) return AVERROR_EOF;
++    if (ff_check_interrupt(&h->interrupt_callback)) return AVERROR_EXIT;
++    if ((!s->headers_done && now > s->initial_deadline) || now - s->last_activity > s->idle_us) {
++        ff_ohos_http3_failed(s->host, s->port);
++        return AVERROR(ETIMEDOUT);
++    }
++    pthread_mutex_lock(&s->lock);
++    ret = s->error;
++    have = s->count > 0;
++    if (have) {
++        packet = s->input[s->head];
++        s->head = (s->head + 1) % H3_SLOTS;
++        s->count--;
++    }
++    count = s->nb_streams;
++    memcpy(streams, s->streams, count * sizeof(*streams));
++    pthread_mutex_unlock(&s->lock);
++    if (ret) goto failed;
++    if (have) {
++        s->last_activity = now;
++        if (nghttp3_conn_read_stream2(s->http, packet.stream, packet.data, packet.len,
++                                     packet.fin, now * 1000) < 0) {
++            ret = AVERROR(EIO);
++            goto failed;
++        }
++    }
++    for (i = 0; i < count; i++)
++        quic.StreamWantRead(s->conn, streams[i]);
++    if ((ret = flush_http(s)) < 0) goto failed;
++    if (s->output_len) return h3_read(h, buf, len);
++    if (s->eof) return AVERROR_EOF;
++    return AVERROR(EAGAIN);
++failed:
++    ff_ohos_http3_failed(s->host, s->port);
++    return ret;
++}
++
++static int h3_close(URLContext *h)
++{
++    H3Context *s = h->priv_data;
++    int closed, ret = 0;
++    int64_t deadline;
++    if (!s) return 0;
++    pthread_mutex_lock(&s->lock);
++    s->closing = 1;
++    pthread_mutex_unlock(&s->lock);
++    /* A certificate or inbound-stream callback may still be using the native
++     * handle. Stop new work, then wait before destroying that handle. */
++    deadline = av_gettime_relative() + 200000;
++    do {
++        pthread_mutex_lock(&s->lock);
++        int active = s->active;
++        pthread_mutex_unlock(&s->lock);
++        if (!active) break;
++        if (av_gettime_relative() >= deadline) { ret = AVERROR(EBUSY); break; }
++        av_usleep(1000);
++    } while (1);
++    if (s->conn && !ret) {
++        /* Stop both directions of bidirectional streams; unidirectional stream
++         * IDs identify their initiator (client=2, server=3). Quiesced callbacks
++         * cannot add streams now. Ignore already-finished stream errors. */
++        for (unsigned i = 0; i < s->nb_streams; i++) {
++            uint64_t id = s->streams[i];
++            int directions = (id & 2) ? ((id & 1) ? 1 : 2) : 3;
++            quic.StreamShutdown(s->conn, id, directions, 0x100);
++        }
++        for (unsigned i = 0; i < s->nb_local_uni; i++)
++            quic.StreamShutdown(s->conn, s->local_uni[i], 2, 0x100);
++        ret = quic.ConnDestroy(s->conn);
++    }
++    deadline = av_gettime_relative() + 200000;
++    do {
++        pthread_mutex_lock(&s->lock);
++        closed = (s->closed || !s->conn) && !s->active;
++        pthread_mutex_unlock(&s->lock);
++        if (closed) break;
++        av_usleep(1000);
++    } while (av_gettime_relative() < deadline);
++    unregister_connection(s);
++    if (ret || !closed) {
++        /* Never free callback state on an unconfirmed close. Pin it, and disable
++         * future attempts so an incompatible runtime cannot leak per channel.
++         * Callbacks do not retain h or the parent HTTPContext. */
++        pthread_mutex_lock(&origin_lock);
++        quic_disabled = 1;
++        pthread_mutex_unlock(&origin_lock);
++        av_log(h, AV_LOG_WARNING, "[OHHTTP3] close unconfirmed; transport disabled\n");
++        h->priv_data = NULL;
++        return 0;
++    }
++    if (s->session) quic.DestroySession(s->session);
++    if (s->http) nghttp3_conn_del(s->http);
++    av_bprint_finalize(&s->headers, NULL);
++    mbedtls_x509_crt_free(&s->ca);
++    pthread_mutex_destroy(&s->lock);
++    av_free(s);
++    h->priv_data = NULL;
++    return 0;
++}
++static const URLProtocol h3_protocol = {
++    .name = "ohos-http3-internal", .url_read = h3_read, .url_write = h3_write,
++    .url_close = h3_close,
++};
++int ff_ohos_http3_is(const URLContext *h) { return h && h->prot == &h3_protocol; }
++
++int ff_ohos_http3_open(URLContext **out, URLContext *parent, const char *host,
++                       int port, AVDictionary *options)
++{
++    const AVDictionaryEntry *entry;
++    const char *unsupported[] = { "cert_file", "cert", "key_file", "key", "cert_pem",
++                                  "key_pem", "verifyhost", "http_proxy", "external_sock" };
++    H3Origin *origin;
++    H3Context *s;
++    URLContext *h;
++    int permitted, ret = AVERROR(EIO), connected, error;
++    unsigned i;
++    uint64_t control, encoder, decoder;
++    uint32_t timeout = 400;
++    int64_t now = av_gettime_relative();
++    nghttp3_settings settings;
++    const nghttp3_callbacks callbacks = {
++        .recv_data = recv_data, .recv_header = recv_header,
++        .end_headers = end_headers, .end_stream = end_stream,
++    };
++    *out = NULL;
++    pthread_mutex_lock(&origin_lock);
++    origin = origin_find(host, port, 0);
++    permitted = origin && origin->expires > now && origin->blocked <= now && !quic_disabled;
++    pthread_mutex_unlock(&origin_lock);
++    if (!permitted) return AVERROR(ENOSYS);
++    for (i = 0; i < FF_ARRAY_ELEMS(unsupported); i++)
++        if (av_dict_get(options, unsupported[i], NULL, 0)) return AVERROR(ENOSYS);
++    /* Honor protocol restrictions even though this is not an exposed URLProtocol. */
++    if ((parent->protocol_whitelist &&
++         (av_match_list("tls", parent->protocol_whitelist, ',') <= 0 ||
++          av_match_list("tcp", parent->protocol_whitelist, ',') <= 0)) ||
++        (parent->protocol_blacklist &&
++         (av_match_list("tls", parent->protocol_blacklist, ',') > 0 ||
++          av_match_list("tcp", parent->protocol_blacklist, ',') > 0)))
++        return AVERROR(ENOSYS);
++    pthread_once(&quic_once, load_quic);
++    if (!quic_available) return AVERROR(ENOSYS);
++    h = av_mallocz(sizeof(*h));
++    s = av_mallocz(sizeof(*s));
++    if (!h || !s) { av_free(h); av_free(s); return AVERROR(ENOMEM); }
++    h->prot = &h3_protocol; h->priv_data = s;
++    h->flags = AVIO_FLAG_READ_WRITE; h->is_connected = h->is_streamed = 1;
++    h->interrupt_callback = parent->interrupt_callback;
++    h->rw_timeout = parent->rw_timeout;
++    pthread_mutex_init(&s->lock, NULL);
++    mbedtls_x509_crt_init(&s->ca);
++    av_bprint_init(&s->headers, 1024, 65536);
++    av_strlcpy(s->host, host, sizeof(s->host)); s->port = port;
++    s->verify = TLS_VERIFY_DEFAULT;
++    entry = av_dict_get(options, "tls_verify", NULL, 0);
++    if (!entry) entry = av_dict_get(options, "verify", NULL, 0);
++    if (entry) {
++        /* Parse bool through FFmpeg, including yes/no, not just atoi(). */
++        /* Literal booleans are the forms supplied by mpv; other forms use TCP. */
++        if (!strcmp(entry->value, "0") || !av_strcasecmp(entry->value, "no") ||
++            !av_strcasecmp(entry->value, "false")) s->verify = 0;
++        else if (!strcmp(entry->value, "1") || !av_strcasecmp(entry->value, "yes") ||
++                 !av_strcasecmp(entry->value, "true")) s->verify = 1;
++        else { ret = AVERROR(ENOSYS); goto fail; }
++    }
++    if (s->verify) {
++        entry = av_dict_get(options, "ca_file", NULL, 0);
++        if (!entry) entry = av_dict_get(options, "cafile", NULL, 0);
++        /* Matches the existing Mbed TLS backend: verification needs a CA file.
++         * Never silently weaken verification or bypass a custom client cert. */
++        if (!entry || mbedtls_x509_crt_parse_file(&s->ca, entry->value)) {
++            ret = AVERROR(ENOSYS); goto fail;
++        }
++    }
++    s->idle_us = h->rw_timeout > 0 ? h->rw_timeout : 60000000;
++    entry = av_dict_get(options, "rw_timeout", NULL, 0);
++    if (entry && strtoll(entry->value, NULL, 10) > 0) s->idle_us = strtoll(entry->value, NULL, 10);
++    s->initial_deadline = now + FFMIN(H3_INITIAL_US, s->idle_us);
++    s->last_activity = now;
++    s->session = quic.CreateSession();
++    s->conn = quic.ConnCreate("h3", s);
++    if (!s->session || !s->conn) goto fail;
++    pthread_mutex_lock(&origin_lock);
++    s->next = active_connections; active_connections = s;
++    pthread_mutex_unlock(&origin_lock);
++    /* Official callback registration uses optLen=0; numeric options use size. */
++#define CONN_CB(opt, cb) do { if (quic.ConnSetOpt(s->conn, opt, cb, 0)) goto fail; } while (0)
++    CONN_CB(RCP_QUIC_CONN_ON_CONNECTED_FUNCTION, connected_cb);
++    CONN_CB(RCP_QUIC_CONN_ON_ERROR_FUNCTION, error_cb);
++    CONN_CB(RCP_QUIC_CONN_ON_CLOSED_FUNCTION, closed_cb);
++    CONN_CB(RCP_QUIC_CONN_STREAM_INBOUND_FUNCTION, inbound_cb);
++    CONN_CB(RCP_QUIC_TLS_CERT_AUTHORITY_FUNCTION, cert_cb);
++#undef CONN_CB
++    if (quic.ConnSetOpt(s->conn, RCP_QUIC_CONN_CONNECT_TIMEOUT_MS, &timeout, sizeof(timeout)) ||
++        quic.ConnConnect(s->session, s->conn, host, port)) goto fail;
++    do {
++        if (ff_check_interrupt(&h->interrupt_callback)) { ret = AVERROR_EXIT; goto fail; }
++        pthread_mutex_lock(&s->lock);
++        connected = s->connected; error = s->error;
++        pthread_mutex_unlock(&s->lock);
++        if (error) goto fail;
++        if (connected) break;
++        av_usleep(1000);
++    } while (av_gettime_relative() < s->initial_deadline);
++    if (!connected) { ret = AVERROR(ETIMEDOUT); goto fail; }
++    nghttp3_settings_default(&settings);
++    settings.qpack_max_dtable_capacity = 0;
++    settings.qpack_blocked_streams = 0;
++    settings.max_field_section_size = 65536;
++    if (nghttp3_conn_client_new(&s->http, &callbacks, &settings, NULL, s)) goto fail;
++    for (i = 0; i < FF_ARRAY_ELEMS(s->local_uni); i++) {
++        if (quic.StreamOpen(s->conn, RCP_QUIC_STREAM_UNI, &s->local_uni[i], s)) goto fail;
++        s->nb_local_uni++;
++    }
++    control = s->local_uni[0]; encoder = s->local_uni[1]; decoder = s->local_uni[2];
++    if (nghttp3_conn_bind_control_stream(s->http, control) ||
++        nghttp3_conn_bind_qpack_streams(s->http, encoder, decoder) ||
++        quic.StreamOpen(s->conn, RCP_QUIC_STREAM_BIDI, &s->request_stream, s) ||
++        configure_stream(s, s->request_stream)) goto fail;
++    av_log(parent, AV_LOG_VERBOSE, "[OHHTTP3] attempting advertised h3 transport\n");
++    *out = h;
++    return 0;
++fail:
++    if (ret != AVERROR(ENOSYS) && ret != AVERROR_EXIT) ff_ohos_http3_failed(host, port);
++    ffurl_closep(&h);
++    return ret;
++}
+diff --git a/libavformat/ohos_http3.h b/libavformat/ohos_http3.h
+new file mode 100644
+index 0000000..a2f4305
+--- /dev/null
++++ b/libavformat/ohos_http3.h
+@@ -0,0 +1,10 @@
++/* Optional HarmonyOS HTTP/3 transport. LGPL-2.1-or-later. */
++#ifndef AVFORMAT_OHOS_HTTP3_H
++#define AVFORMAT_OHOS_HTTP3_H
++#include "url.h"
++void ff_ohos_http3_observe(const char *url, const char *alt_svc);
++int ff_ohos_http3_open(URLContext **out, URLContext *parent,
++                       const char *host, int port, AVDictionary *options);
++int ff_ohos_http3_is(const URLContext *h);
++void ff_ohos_http3_failed(const char *host, int port);
++#endif
+diff --git a/libavformat/ohos_rcp_quic.h b/libavformat/ohos_rcp_quic.h
+new file mode 100644
+index 0000000..0493581
+--- /dev/null
++++ b/libavformat/ohos_rcp_quic.h
+@@ -0,0 +1,56 @@
++/*
++ * ABI subset of Huawei RemoteCommunicationKit/rcp_quic.h, API 26.
++ * Copyright (c) 2026 Huawei Device Co., Ltd.
++ * Licensed under the Apache License, Version 2.0.
++ * https://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Definitions checked against DevEco native 26.0.0.105. The public OpenHarmony
++ * NDK does not contain HMS headers. No declarations here are linked directly;
++ * all functions must be resolved from the optional system library at runtime.
++ */
++#ifndef AVFORMAT_OHOS_RCP_QUIC_H
++#define AVFORMAT_OHOS_RCP_QUIC_H
++#include <stdint.h>
++#include <stddef.h>
++#include <stdbool.h>
++typedef void Rcp_QuicConn;
++typedef void Rcp_QuicSession;
++typedef int Rcp_QuicErrorCode;
++typedef int Rcp_QuicConnOpt;
++typedef int Rcp_QuicStreamOpt;
++typedef int Rcp_QuicStreamDirection;
++enum {
++    RCP_QUIC_CONN_ON_CONNECTED_FUNCTION = 3,
++    RCP_QUIC_CONN_ON_ERROR_FUNCTION = 4,
++    RCP_QUIC_CONN_ON_CLOSED_FUNCTION = 5,
++    RCP_QUIC_CONN_STREAM_INBOUND_FUNCTION = 6,
++    RCP_QUIC_CONN_CONNECT_TIMEOUT_MS = 7,
++    RCP_QUIC_CONN_IDLE_TIMEOUT_MS = 8,
++    RCP_QUIC_TLS_CERT_AUTHORITY_FUNCTION = 1000,
++    RCP_QUIC_STREAM_EVENT_FUNCTION = 0,
++    RCP_QUIC_STREAM_DATA_FUNCTION = 1,
++    RCP_QUIC_INBOUND_STREAM_USER_OBJECT = 2,
++    RCP_QUIC_STREAM_BIDI = 0,
++    RCP_QUIC_STREAM_UNI = 1,
++    RCP_QUIC_ERROR_CODE_EAGAIN = 1007920015,
++};
++typedef struct Rcp_QuicIoVec { uint8_t *data; uint64_t length; } Rcp_QuicIoVec;
++typedef struct Rcp_QuicStreamData {
++    Rcp_QuicIoVec *iov;
++    uint32_t iovLen;
++    bool fin;
++} Rcp_QuicStreamData;
++typedef struct OhosQuicAPI {
++    Rcp_QuicSession *(*CreateSession)(void);
++    void (*DestroySession)(Rcp_QuicSession *);
++    Rcp_QuicConn *(*ConnCreate)(char *, void *);
++    int (*ConnSetOpt)(Rcp_QuicConn *, Rcp_QuicConnOpt, const void *, uint32_t);
++    int (*ConnConnect)(Rcp_QuicSession *, Rcp_QuicConn *, const char *, uint16_t);
++    int (*ConnDestroy)(Rcp_QuicConn *);
++    int (*StreamOpen)(Rcp_QuicConn *, Rcp_QuicStreamDirection, uint64_t *, void *);
++    int (*StreamSetOpt)(Rcp_QuicConn *, uint64_t, Rcp_QuicStreamOpt, const void *, uint32_t);
++    int (*StreamSend)(Rcp_QuicConn *, uint64_t, const Rcp_QuicIoVec *, uint32_t, bool);
++    int (*StreamWantRead)(Rcp_QuicConn *, uint64_t);
++    int (*StreamShutdown)(Rcp_QuicConn *, uint64_t, int, uint64_t);
++} OhosQuicAPI;
++#endif

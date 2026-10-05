@@ -38,6 +38,7 @@ cd .build
   --extra-ldflags="-L$DEST/lib" \
   --enable-libdav1d \
   --enable-mbedtls \
+  --enable-ohos-http3 \
   --disable-vulkan \
   \
   --disable-devices \

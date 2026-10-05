@@ -51,6 +51,10 @@ jobs:
           ./bundle.sh
         shell: bash
 
+      - name: Check optional HTTP3 protocol
+        run: bash scripts/test-ohos-http3.sh
+        shell: bash
+
       - name: Upload Artifact
         uses: actions/upload-artifact@v7
         with:

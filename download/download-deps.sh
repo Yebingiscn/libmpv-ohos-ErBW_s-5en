@@ -27,6 +27,17 @@ else
   echo "dav1d already exists, skipping."
 fi
 
+# HTTP/3 framing and QPACK. QUIC itself is an optional system service.
+if [ ! -d nghttp3 ]; then
+  echo "Downloading nghttp3..."
+  git -c advice.detachedHead=false clone -q --depth 1 -b "$V_NGHTTP3" \
+    https://github.com/ngtcp2/nghttp3.git nghttp3
+  test "$(git -C nghttp3 rev-parse HEAD)" = "$V_NGHTTP3_COMMIT"
+  git -C nghttp3 submodule update --init --depth 1 lib/sfparse
+else
+  test "$(git -C nghttp3 rev-parse HEAD)" = "$V_NGHTTP3_COMMIT"
+fi
+
 # libdvdcss
 if [ ! -d libdvdcss ]; then
   echo "Downloading libdvdcss..."

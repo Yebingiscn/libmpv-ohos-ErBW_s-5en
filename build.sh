@@ -5,6 +5,7 @@ set -eu
 # ffmpeg
 ./scripts/mbedtls.sh build
 ./scripts/dav1d.sh build
+./scripts/nghttp3.sh build
 ./scripts/ffmpeg.sh build
 
 # DVD

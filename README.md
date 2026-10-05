@@ -25,6 +25,29 @@ Scripts are compatible with macOS, Linux and WSL, Windows is not supported.
 This tree is based on the `20260715` mpv-arkts binary baseline and pins
 `ErBWs/mpv` to commit `6edeee00a07b9b76f197aa71eee3d029fb090de4`.
 
+## Experimental optional HTTP/3
+
+HTTPS GET connections automatically try RCP QUIC / nghttp3 after the original
+server advertises same-host, same-port `h3` in Alt-Svc. The first ordinary request
+is unchanged. Plain HTTP IPTV, UDP/RTP, RTSP and local playback are unaffected.
+No application setting or URL rewrite is required. Both video output modes use
+the same network layer; actual improvement requires an HTTP/3-enabled source.
+
+QUIC APIs are dynamically resolved and nghttp3 1.18.0 is statically linked.
+Neither the application nor libmpv may require a system QUIC library at load
+time. Missing capabilities, unsupported TLS/proxy configuration or failed H3
+setup use existing TCP/TLS. Failed endpoints back off for five minutes. HLS can
+reuse eight requests per connection before a bounded-state rotation. This is
+not a full multi-player connection pool. TLS verification policy is preserved;
+custom client certificates and alternative H3 authorities are not supported.
+
+Successful H3 response parsing logs `[OHHTTP3] HTTP/3 response received; QUIC active`.
+This is different from an attempt or mere API availability. Phone/tablet/2in1/TV
+API 26 coverage is documented, but each real device still needs library, TLS,
+cancel/close and weak-network validation. See `tests/ohos-http3-integration.md`.
+CI runs host protocol regressions after the target build and verifies optional
+dependencies in the final libmpv. Host mocks do not prove on-device QUIC works.
+
 ## Audio Vivid speed policy
 
 The dedicated OHAudio Vivid output retains PCM/metadata frame pairing. Playback

@@ -43,6 +43,21 @@ for symbol in mpv_create ohos_osd_set_global_surface; do
 done
 
 dynamic_section=$("$READELF" -d "$LIBMPV")
+if grep -Eq 'NEEDED.*lib(rcp|nghttp3)' <<< "$dynamic_section"; then
+  echo "HTTP/3 must not add a required system QUIC or shared nghttp3 dependency" >&2
+  exit 1
+fi
+if "$NM" -D --undefined-only "$LIBMPV" | grep -Eq '[[:space:]]HMS_Rcp_Quic'; then
+  echo "QUIC calls must use runtime symbol lookup" >&2
+  exit 1
+fi
+for marker in "[OHHTTP3] HTTP/3 response received; QUIC active" \
+              "[OHHTTP3] transport failed; falling back to TCP/TLS"; do
+  if ! "$STRINGS" "$LIBMPV" | grep -F "$marker" >/dev/null; then
+    echo "Missing optional HTTP/3 implementation: $marker" >&2
+    exit 1
+  fi
+done
 for marker in usb-exclusive dsd-dop dsd-native dsd-mode sweetvideo.dsd_raw; do
   if ! "$STRINGS" "$LIBMPV" | grep -Fx "$marker" >/dev/null; then
     echo "Missing USB exclusive/DSD implementation: $marker" >&2

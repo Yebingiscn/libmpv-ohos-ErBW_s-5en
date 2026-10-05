@@ -14,6 +14,8 @@ V_SDK_NATIVE_VERSION=26.0.0.38
 # moving to the 4.x ABI needs a separate FFmpeg adapter validation.
 V_MBEDTLS=3.6.7
 V_DAV1D=1.5.4
+V_NGHTTP3=v1.18.0
+V_NGHTTP3_COMMIT=dbfc24286138cb0b6490160e7ca87fe1ce6722a0
 
 # AVS1-P16 (AVS+) software decoder imported into FFmpeg's CAVS decoder.
 # Keep this pinned because the upstream integration is distributed as a patch.
