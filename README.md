@@ -48,6 +48,15 @@ cancel/close and weak-network validation. See `tests/ohos-http3-integration.md`.
 CI runs host protocol regressions after the target build and verifies optional
 dependencies in the final libmpv. Host mocks do not prove on-device QUIC works.
 
+The FFmpeg patch exports `ohos_http3_extralibs` through `avformat_extralibs`,
+so the installed static `libavformat.pc` carries nghttp3 to mpv's final link.
+The build checks that metadata after installation and rejects all unresolved
+`nghttp3_*` imports in the final ELF, not merely a shared-library dependency.
+The same check can audit a library extracted from a HAP with
+`bash scripts/verify-ohos-http3-elf.sh /path/to/libmpv.so` (set `NM`/`READELF`
+to the SDK tools when needed). This prevents a network feature's missing static
+dependency from breaking the shared native module and both player engines.
+
 ## Default optional audio workgroup
 
 The `ohaudio` PCM output automatically probes all seven API 20 audio-workgroup

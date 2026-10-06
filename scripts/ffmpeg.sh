@@ -52,4 +52,15 @@ cd .build
 make -j$CORES
 make install
 
+# Check the installed metadata consumed by mpv, not just configure's probe.
+# Static avformat must carry nghttp3 through its pkg-config dependency closure.
+avformat_libs=$(pkg-config --libs libavformat)
+avformat_static_libs=$(pkg-config --libs --static libavformat)
+for flags in "$avformat_libs" "$avformat_static_libs"; do
+  if ! grep -Eq '(^|[[:space:]])-lnghttp3([[:space:]]|$)' <<< "$flags"; then
+    echo 'Installed libavformat.pc lost its static nghttp3 dependency' >&2
+    exit 1
+  fi
+done
+
 popd

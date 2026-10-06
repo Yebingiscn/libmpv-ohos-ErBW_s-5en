@@ -23,8 +23,25 @@ trap report_failure ERR
 trap 'rm -rf -- "$TMP_DIR"' EXIT
 cmake -S "$NGHTTP3_SOURCE" -B "$TMP_DIR/nghttp3" \
   -DCMAKE_C_COMPILER="$CC_FOR_BUILD" -DENABLE_LIB_ONLY=ON \
+  -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
   -DENABLE_SHARED_LIB=OFF -DBUILD_TESTING=OFF >"$TMP_DIR/nghttp3.log" 2>&1
 cmake --build "$TMP_DIR/nghttp3" -j4 >>"$TMP_DIR/nghttp3.log" 2>&1
+# Check the same ELF guard used by target verification, with real nghttp3.
+probe_args=(-shared -fPIC -DNGHTTP3_STATICLIB \
+  -I"$NGHTTP3_SOURCE/lib/includes" -I"$TMP_DIR/nghttp3/lib/includes" \
+  "$ROOT/tests/http3-link-probe.c")
+"$CC_FOR_BUILD" "${probe_args[@]}" -Wl,--no-undefined \
+  "$TMP_DIR/nghttp3/lib/libnghttp3.a" -o "$TMP_DIR/http3-linked.so"
+NM="${NM_FOR_BUILD:-nm}" READELF="${READELF_FOR_BUILD:-readelf}" \
+  bash "$ROOT/scripts/verify-ohos-http3-elf.sh" "$TMP_DIR/http3-linked.so"
+"$CC_FOR_BUILD" "${probe_args[@]}" -o "$TMP_DIR/http3-unlinked.so"
+if rejected=$(NM="${NM_FOR_BUILD:-nm}" READELF="${READELF_FOR_BUILD:-readelf}" \
+    bash "$ROOT/scripts/verify-ohos-http3-elf.sh" "$TMP_DIR/http3-unlinked.so" 2>&1); then
+  echo 'HTTP/3 ELF guard accepted an unlinked dependency' >&2
+  exit 1
+fi
+grep -Fq 'nghttp3 must be statically resolved' <<< "$rejected"
+echo 'HTTP/3 linked/unlinked ELF guard regression passed'
 cmake -S "$MBEDTLS_SOURCE" -B "$TMP_DIR/mbedtls" \
   -DCMAKE_C_COMPILER="$CC_FOR_BUILD" -DENABLE_PROGRAMS=OFF \
   -DENABLE_TESTING=OFF >"$TMP_DIR/mbedtls.log" 2>&1

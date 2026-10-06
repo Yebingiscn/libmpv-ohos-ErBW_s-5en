@@ -44,5 +44,15 @@ the HMS 26.0.0.105 header, not a packaged/copied system library.
 
 For final packaged binaries check ARM64 ELF architecture, NEEDED and undefined
 symbols. Neither librcp_quic.so/librcp_quic_c.so nor libnghttp3.so may be required;
-there must be no direct `HMS_Rcp_Quic*` imports. Device improvement remains
+there must be no direct `HMS_Rcp_Quic*` or unresolved `nghttp3_*` imports.
+Run `scripts/verify-ohos-http3-elf.sh` against the extracted libmpv.so.
+The installed static libavformat pkg-config flags must include `-lnghttp3`;
+the source regression exercises enabled/disabled dependency flattening using
+FFmpeg's actual helpers. `tests/http3-link-probe.c` references all ten nghttp3
+APIs from the failing artifact for an SDK ARM64 static-link check. These checks
+are separate from a full libmpv build and real-device playback. Device improvement remains
 unverified until real sources and controlled network conditions are tested.
+
+The Linux host protocol script also builds linked/unlinked ELF probes with real
+nghttp3 and checks acceptance/rejection using the production ELF guard. Its
+nghttp3 build uses PIC and independent temporary caches, not target outputs.

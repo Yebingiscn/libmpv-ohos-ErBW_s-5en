@@ -52,14 +52,7 @@ if ! "$STRINGS" "$LIBMPV" | grep -F 'Audio workgroup active (%s).' >/dev/null; t
   echo "Missing default PCM/AudioSuite workgroup implementation" >&2
   exit 1
 fi
-if grep -Eq 'NEEDED.*lib(rcp|nghttp3)' <<< "$dynamic_section"; then
-  echo "HTTP/3 must not add a required system QUIC or shared nghttp3 dependency" >&2
-  exit 1
-fi
-if "$NM" -D --undefined-only "$LIBMPV" | grep -Eq '[[:space:]]HMS_Rcp_Quic'; then
-  echo "QUIC calls must use runtime symbol lookup" >&2
-  exit 1
-fi
+bash "$ROOT_DIR/scripts/verify-ohos-http3-elf.sh" "$LIBMPV"
 for marker in "[OHHTTP3] HTTP/3 response received; QUIC active" \
               "[OHHTTP3] transport failed; falling back to TCP/TLS"; do
   if ! "$STRINGS" "$LIBMPV" | grep -F "$marker" >/dev/null; then

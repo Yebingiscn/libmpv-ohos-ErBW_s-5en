@@ -13,6 +13,7 @@ done
 grep -Fq 'ff_ohos_http3_observe(s->location, p)' "$FFMPEG_SOURCE/libavformat/http.c"
 grep -Fq 's->off = request_off' "$FFMPEG_SOURCE/libavformat/http.c"
 grep -Fq 'ohos_http3_deps="pthreads libdl mbedtls https_protocol"' "$FFMPEG_SOURCE/configure"
+"${PYTHON_FOR_BUILD:-python3}" "$ROOT/tests/http3-link-dependencies.py" "$FFMPEG_SOURCE"
 if grep -Eq -- '-lrcp(_quic)?(_c)?([[:space:]]|$)' "$ROOT/scripts/ffmpeg.sh"; then
   echo 'RCP QUIC must not be directly linked' >&2; exit 1
 fi
