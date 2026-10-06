@@ -43,6 +43,15 @@ for symbol in mpv_create ohos_osd_set_global_surface; do
 done
 
 dynamic_section=$("$READELF" -d "$LIBMPV")
+workgroup_imports=$("$NM" -D --undefined-only "$LIBMPV")
+if grep -Eq '[[:space:]](OH_AudioWorkgroup_[A-Za-z0-9_]+|OH_AudioResourceManager_(Create|Release)Workgroup|OH_AudioManager_GetAudioResourceManager)(@.*)?$' <<< "$workgroup_imports"; then
+  echo "Audio workgroup APIs must remain optional runtime-resolved symbols" >&2
+  exit 1
+fi
+if ! "$STRINGS" "$LIBMPV" | grep -F 'Audio workgroup active (%s).' >/dev/null; then
+  echo "Missing default PCM/AudioSuite workgroup implementation" >&2
+  exit 1
+fi
 if grep -Eq 'NEEDED.*lib(rcp|nghttp3)' <<< "$dynamic_section"; then
   echo "HTTP/3 must not add a required system QUIC or shared nghttp3 dependency" >&2
   exit 1

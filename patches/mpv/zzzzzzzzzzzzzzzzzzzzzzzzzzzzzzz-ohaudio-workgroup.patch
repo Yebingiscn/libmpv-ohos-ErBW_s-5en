@@ -1,0 +1,339 @@
+diff --git a/audio/out/ao_ohaudio.c b/audio/out/ao_ohaudio.c
+index 2def0b2c67..a5df24640c 100644
+--- a/audio/out/ao_ohaudio.c
++++ b/audio/out/ao_ohaudio.c
+@@ -28,11 +28,14 @@
+ #include "osdep/threads.h"
+ #include "osdep/timer.h"
+ #include "ohaudio_clock.h"
++#include "ohaudio_workgroup.h"
+ #include "ohaudio_playhead.h"
+ 
+ #include <stdatomic.h>
+ #include <string.h>
+ #include <time.h>
++#include <unistd.h>
++#include <sys/syscall.h>
+ 
+ #include <ohaudio/native_audiorenderer.h>
+ #include <ohaudio/native_audiostreambuilder.h>
+@@ -74,6 +77,7 @@ enum suite_separation_output {
+ struct priv {
+     OH_AudioStreamBuilder* builder;
+     OH_AudioRenderer *renderer;
++    struct ohaudio_workgroup workgroup;
+ 
+     OH_AudioSuiteEngine *suite_engine;
+     OH_AudioSuitePipeline *suite_pipeline;
+@@ -171,6 +175,7 @@ static MP_THREAD_VOID clock_thread(void *arg)
+     struct priv *p = ao->priv;
+     int reported_clock_error = 0;
+     int reported_suite_error = 0;
++    int reported_wg_state = OHAUDIO_WG_READY;
+     int64_t perf_last_ns = 0;
+ 
+     mp_thread_set_name("ohaudio-clock");
+@@ -187,6 +192,18 @@ static MP_THREAD_VOID clock_thread(void *arg)
+                                                memory_order_acquire);
+         mp_mutex_unlock(&p->clock_lock);
+ 
++        int wg_state = atomic_load_explicit(&p->workgroup.state, memory_order_acquire);
++        if (wg_state != reported_wg_state) {
++            if (wg_state == OHAUDIO_WG_ACTIVE)
++                MP_INFO(ao, "Audio workgroup active (%s).\n",
++                        p->suite_active ? "AudioSuite" : "PCM");
++            else if (wg_state == OHAUDIO_WG_FALLBACK)
++                MP_WARN(ao, "Audio workgroup disabled: stage=%d code=%d; output unchanged.\n",
++                        atomic_load_explicit(&p->workgroup.error_stage, memory_order_relaxed),
++                        atomic_load_explicit(&p->workgroup.error_code, memory_order_relaxed));
++            reported_wg_state = wg_state;
++        }
++
+         const bool perf = mp_msg_test(ao->log, MSGL_DEBUG);
+         int64_t perf_begin = perf ? mp_time_ns() : 0;
+         int64_t position = 0;
+@@ -698,15 +715,24 @@ static void uninit(struct ao* ao)
+ 
+     stop_clock_thread(p);
+ 
++    bool renderer_quiesced = true;
+     if (p->renderer) {
+         uint32_t underflows;
+         if (OH_AudioRenderer_GetUnderflowCount(p->renderer, &underflows) ==
+             AUDIOSTREAM_SUCCESS)
+             MP_TRACE(ao, "OHAudio underflows: %u\n", underflows);
+-        OH_AudioRenderer_Release(p->renderer);
++        OH_AudioRenderer_Stop(p->renderer);
++        renderer_quiesced = OH_AudioRenderer_Release(p->renderer) == AUDIOSTREAM_SUCCESS;
+         p->renderer = NULL;
+     }
+ 
++    if (!ohaudio_wg_uninit(&p->workgroup, renderer_quiesced))
++        MP_WARN(ao, "Audio workgroup cleanup unconfirmed; optional resources retained.\n");
++    else if (p->workgroup.cycles)
++        MP_VERBOSE(ao, "Audio workgroup finished: cycles=%llu registrations=%llu.\n",
++                   (unsigned long long)p->workgroup.cycles,
++                   (unsigned long long)p->workgroup.registrations);
++
+     uninit_audio_suite(p);
+ 
+     if (p->builder) {
+@@ -780,6 +806,8 @@ static int32_t audio_on_write_callback(
+ 
+     int output_stride = p->suite_active ? p->suite_output_stride : ao->sstride;
+     int output_rate = p->suite_active ? p->suite_output_rate : ao->samplerate;
++    if (output_stride <= 0 || output_rate <= 0 || audioDataSize <= 0)
++        return 0;
+     int samples = audioDataSize / output_stride;
+     int64_t now = mp_time_ns();
+ 
+@@ -826,6 +854,21 @@ static int32_t audio_on_write_callback(
+ 
+     int64_t end_time = now +
+         MP_TIME_S_TO_NS(samples + p->queued_frames) / output_rate;
++    bool wg_started = false;
++    if (p->workgroup.group && atomic_load_explicit(&p->workgroup.state,
++            memory_order_relaxed) != OHAUDIO_WG_FALLBACK) {
++        struct timespec system_time;
++        uint64_t wg_start, wg_deadline;
++        if (clock_gettime(CLOCK_REALTIME, &system_time) == 0 &&
++            ohaudio_wg_deadline(system_time.tv_sec, system_time.tv_nsec,
++                               samples, output_rate, &wg_start, &wg_deadline))
++        {
++            long tid = syscall(SYS_gettid);
++            if (tid > 0)
++                wg_started = ohaudio_wg_begin(&p->workgroup,
++                    (uint64_t)tid, wg_start, wg_deadline);
++        }
++    }
+     int copied;
+     if (p->suite_active) {
+         p->suite_end_time = end_time;
+@@ -834,6 +877,7 @@ static int32_t audio_on_write_callback(
+         copied = ao_read_data_nonblocking(ao, &audioData, samples, end_time,
+                                           NULL, false, NULL);
+     }
++    if (wg_started) ohaudio_wg_end(&p->workgroup);
+     p->written_frames += copied;
+ 
+     // The advanced callback lets OHAudio ignore any untouched tail and back
+@@ -852,6 +896,10 @@ static int init(struct ao* ao)
+     int renderer_channels;
+     int renderer_format;
+ 
++    bool wg_available = ohaudio_wg_init(&p->workgroup);
++    MP_INFO(ao, "Audio workgroup %s; default automatic policy covers PCM and AudioSuite.\n",
++               wg_available ? "ready (awaiting callback thread)" : "unavailable, using normal scheduling");
++
+     res = OH_AudioStreamBuilder_Create(&p->builder, AUDIOSTREAM_TYPE_RENDERER);
+ 
+     if (res != AUDIOSTREAM_SUCCESS) {
+diff --git a/audio/out/ohaudio_workgroup.h b/audio/out/ohaudio_workgroup.h
+new file mode 100644
+index 0000000000..259e475917
+--- /dev/null
++++ b/audio/out/ohaudio_workgroup.h
+@@ -0,0 +1,203 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <dlfcn.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdatomic.h>
++#include <ohaudio/native_audio_resource_manager.h>
++
++enum ohaudio_wg_state { OHAUDIO_WG_UNAVAILABLE, OHAUDIO_WG_READY,
++                       OHAUDIO_WG_ACTIVE, OHAUDIO_WG_FALLBACK };
++enum ohaudio_wg_error { OHAUDIO_WG_LOAD = 1, OHAUDIO_WG_MANAGER,
++    OHAUDIO_WG_CREATE, OHAUDIO_WG_ADD, OHAUDIO_WG_REMOVE,
++    OHAUDIO_WG_START, OHAUDIO_WG_STOP, OHAUDIO_WG_RELEASE };
++
++struct ohaudio_wg_api {
++    __typeof__(OH_AudioManager_GetAudioResourceManager) *manager;
++    __typeof__(OH_AudioResourceManager_CreateWorkgroup) *create;
++    __typeof__(OH_AudioResourceManager_ReleaseWorkgroup) *release;
++    __typeof__(OH_AudioWorkgroup_AddCurrentThread) *add;
++    __typeof__(OH_AudioWorkgroup_RemoveThread) *remove;
++    __typeof__(OH_AudioWorkgroup_Start) *start;
++    __typeof__(OH_AudioWorkgroup_Stop) *stop;
++};
++
++struct ohaudio_workgroup {
++    struct ohaudio_wg_api api;
++    void *library;
++    OH_AudioResourceManager *manager;
++    OH_AudioWorkgroup *group;
++    // Callback-owned, protected against overlapping callbacks by a try-gate.
++    uint64_t owner;
++    int32_t token;
++    bool joined, disabled, in_cycle;
++    atomic_bool busy;
++    atomic_int state, error_stage, error_code;
++    uint64_t cycles, registrations;
++};
++
++static inline void ohaudio_wg_fail(struct ohaudio_workgroup *w, int stage, int code)
++{
++    w->disabled = true;
++    atomic_store_explicit(&w->error_code, code, memory_order_relaxed);
++    atomic_store_explicit(&w->error_stage, stage, memory_order_relaxed);
++    atomic_store_explicit(&w->state, OHAUDIO_WG_FALLBACK, memory_order_release);
++}
++
++// The official Start API uses system-clock epoch milliseconds, not mp_time_ns.
++// Request duration is only a conservative budget, not hardware presentation
++// time. Leave 10% (at least 1ms) for handoff; don't boost sub-ms/invalid requests.
++static inline bool ohaudio_wg_deadline(int64_t seconds, long nanos,
++    int frames, int rate, uint64_t *start, uint64_t *deadline)
++{
++    if (seconds <= 0 || nanos < 0 || nanos >= 1000000000L ||
++        frames <= 0 || rate <= 0 || (uint64_t)seconds > UINT64_MAX / 1000)
++        return false;
++    uint64_t period = (uint64_t)frames * 1000 / (uint32_t)rate;
++    if (period < 2) return false;
++    // Long/offloaded buffers must not request an excessively long CPU boost.
++    if (period > 100) period = 100;
++    uint64_t margin = period / 10;
++    if (!margin) margin = 1;
++    uint64_t fractional = (uint64_t)nanos / 1000000;
++    uint64_t base = (uint64_t)seconds * 1000;
++    if (base > UINT64_MAX - fractional) return false;
++    base += fractional;
++    if (base > UINT64_MAX - (period - margin)) return false;
++    *start = base;
++    *deadline = base + period - margin;
++    return true;
++}
++
++// Called only before callbacks exist. No new DT_NEEDED or direct new API refs.
++static inline bool ohaudio_wg_init(struct ohaudio_workgroup *w)
++{
++    *w = (struct ohaudio_workgroup){0};
++    atomic_init(&w->busy, false);
++    atomic_init(&w->state, OHAUDIO_WG_UNAVAILABLE);
++    atomic_init(&w->error_stage, 0);
++    atomic_init(&w->error_code, 0);
++    w->library = dlopen("libohaudio.so", RTLD_NOW | RTLD_LOCAL);
++    if (!w->library) goto missing;
++#define WG_LOAD(field, name) do { \
++    w->api.field = (__typeof__(w->api.field))dlsym(w->library, #name); \
++    if (!w->api.field) goto missing; \
++} while (0)
++    WG_LOAD(manager, OH_AudioManager_GetAudioResourceManager);
++    WG_LOAD(create, OH_AudioResourceManager_CreateWorkgroup);
++    WG_LOAD(release, OH_AudioResourceManager_ReleaseWorkgroup);
++    WG_LOAD(add, OH_AudioWorkgroup_AddCurrentThread);
++    WG_LOAD(remove, OH_AudioWorkgroup_RemoveThread);
++    WG_LOAD(start, OH_AudioWorkgroup_Start);
++    WG_LOAD(stop, OH_AudioWorkgroup_Stop);
++#undef WG_LOAD
++    int res = w->api.manager(&w->manager);
++    if (res != AUDIOCOMMON_RESULT_SUCCESS || !w->manager) {
++        ohaudio_wg_fail(w, OHAUDIO_WG_MANAGER, res);
++        return false;
++    }
++    res = w->api.create(w->manager, "mpv-ohaudio", &w->group);
++    if (res != AUDIOCOMMON_RESULT_SUCCESS || !w->group) {
++        ohaudio_wg_fail(w, OHAUDIO_WG_CREATE, res);
++        return false;
++    }
++    atomic_store_explicit(&w->state, OHAUDIO_WG_READY, memory_order_release);
++    return true;
++missing:
++    if (w->library) dlclose(w->library);
++    w->library = NULL;
++    w->disabled = true;
++    atomic_store_explicit(&w->error_stage, OHAUDIO_WG_LOAD, memory_order_relaxed);
++    return false;
++}
++
++// Returns true only for a successfully started cycle. Caller then MUST end it.
++// An overlapping callback skips scheduling hints without waiting for the gate.
++static inline bool ohaudio_wg_begin(struct ohaudio_workgroup *w, uint64_t owner,
++                                   uint64_t start, uint64_t deadline)
++{
++    if (!w->group || !owner || deadline <= start) return false;
++    bool expected = false;
++    if (!atomic_compare_exchange_strong_explicit(&w->busy, &expected, true,
++            memory_order_acquire, memory_order_relaxed)) return false;
++    if (w->disabled) goto skip;
++    int res;
++    if (w->joined && w->owner != owner) {
++        res = w->api.remove(w->group, w->token);
++        if (res != AUDIOCOMMON_RESULT_SUCCESS) {
++            ohaudio_wg_fail(w, OHAUDIO_WG_REMOVE, res);
++            goto skip;
++        }
++        w->joined = false;
++    }
++    if (!w->joined) {
++        res = w->api.add(w->group, &w->token);
++        if (res != AUDIOCOMMON_RESULT_SUCCESS) {
++            ohaudio_wg_fail(w, OHAUDIO_WG_ADD, res);
++            goto skip;
++        }
++        w->joined = true;
++        w->owner = owner;
++        w->registrations++;
++    }
++    res = w->api.start(w->group, start, deadline);
++    if (res != AUDIOCOMMON_RESULT_SUCCESS) {
++        // A failed system operation can be partially applied. Balance once,
++        // then keep this AO on the unmodified output path without frame retries.
++        w->in_cycle = w->api.stop(w->group) != AUDIOCOMMON_RESULT_SUCCESS;
++        ohaudio_wg_fail(w, OHAUDIO_WG_START, res);
++        goto skip;
++    }
++    w->in_cycle = true;
++    w->cycles++;
++    if (atomic_load_explicit(&w->state, memory_order_relaxed) != OHAUDIO_WG_ACTIVE)
++        atomic_store_explicit(&w->state, OHAUDIO_WG_ACTIVE, memory_order_release);
++    return true;
++skip:
++    atomic_store_explicit(&w->busy, false, memory_order_release);
++    return false;
++}
++
++static inline void ohaudio_wg_end(struct ohaudio_workgroup *w)
++{
++    int res = w->api.stop(w->group);
++    w->in_cycle = res != AUDIOCOMMON_RESULT_SUCCESS;
++    if (w->in_cycle) ohaudio_wg_fail(w, OHAUDIO_WG_STOP, res);
++    atomic_store_explicit(&w->busy, false, memory_order_release);
++}
++
++// Only after the renderer has successfully released all callbacks. On failed
++// quiescence/release, pin the library and group instead of freeing live state.
++static inline bool ohaudio_wg_uninit(struct ohaudio_workgroup *w, bool quiesced)
++{
++    if (!quiesced || atomic_load_explicit(&w->busy, memory_order_acquire))
++        return false;
++    if (w->group) {
++        if (w->in_cycle) {
++            int res = w->api.stop(w->group);
++            w->in_cycle = res != AUDIOCOMMON_RESULT_SUCCESS;
++            if (w->in_cycle) {
++                ohaudio_wg_fail(w, OHAUDIO_WG_STOP, res);
++                return false;
++            }
++        }
++        if (w->joined) {
++            int res = w->api.remove(w->group, w->token);
++            if (res == AUDIOCOMMON_RESULT_SUCCESS) w->joined = false;
++            // Releasing the entire group is still required if a departed
++            // renderer thread no longer has a valid membership token.
++        }
++        int res = w->api.release(w->manager, w->group);
++        if (res != AUDIOCOMMON_RESULT_SUCCESS) {
++            ohaudio_wg_fail(w, OHAUDIO_WG_RELEASE, res);
++            return false;
++        }
++        w->group = NULL;
++        w->joined = false;
++    }
++    if (w->library) dlclose(w->library);
++    w->library = NULL;
++    w->disabled = true;
++    return true;
++}

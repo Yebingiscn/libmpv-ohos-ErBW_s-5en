@@ -48,6 +48,35 @@ cancel/close and weak-network validation. See `tests/ohos-http3-integration.md`.
 CI runs host protocol regressions after the target build and verifies optional
 dependencies in the final libmpv. Host mocks do not prove on-device QUIC works.
 
+## Default optional audio workgroup
+
+The `ohaudio` PCM output automatically probes all seven API 20 audio-workgroup
+symbols in the already-used `libohaudio.so`. Both ordinary PCM copying and
+AudioSuite rendering share the same per-callback scheduling scope. No UI or mpv
+option, new processing thread, extra audio queue, or mandatory new symbol is
+added. Unsupported systems and operation failures keep the original output.
+
+Groups are created outside callbacks. The actual callback thread registers once
+(again only if its kernel thread ID changes); successful Start calls are paired
+with Stop. Scheduling timestamps use system-clock epoch milliseconds, separate
+from mpv's A/V-sync clock. The requested output duration gives a conservative
+budget with a 10%/minimum-1ms handoff margin, capped at 100ms; sub-2ms requests
+skip workgroup hints. This is an estimate, not a measured hardware deadline.
+
+An off-callback log distinguishes `ready` from `Audio workgroup active (PCM).`
+or `Audio workgroup active (AudioSuite).` Runtime failure is reported once and
+disables further scheduling calls for that AO. Teardown releases the renderer
+before workgroup members/group/library; unconfirmed teardown pins optional
+resources instead of unloading live code. Existing buffering, music route
+policy, AudioSuite optional loading and A/V timing remain unchanged.
+
+Host fault-injection/concurrency tests run during patch verification; final ELF
+verification rejects mandatory workgroup imports. See
+[workgroup acceptance and limitations](tests/ohaudio-workgroup-integration.md).
+Passing these tests does not demonstrate lower device underruns or power use.
+Native Vivid, compressed E-AC3, USB-exclusive and system AVPlayer outputs are
+separate paths and are not changed by this integration.
+
 ## Audio Vivid speed policy
 
 The dedicated OHAudio Vivid output retains PCM/metadata frame pairing. Playback
@@ -274,6 +303,28 @@ The patch stage runs host-only DST/WavPack byte-exact decoder tests in a separat
 temporary build; target build caches and dependency versions are not changed.
 Protocol tests and cross-compilation do not establish bit-perfect device playback
 or screen-off reliability; both require real DAC testing.
+
+## Default GPU optimizations
+
+`zz-maleoon-artcnn-workgroup.patch` detects Maleoon from the actual GLES renderer
+or Vulkan device name. Opted-in ArtCNN assets use 8x8 (64-thread) workgroups on
+supported devices, retaining the output-block/invocation ratio, shared barriers,
+coefficients and original FP16-extension/FP32 fallback. Unmarked custom shaders
+and non-Maleoon devices retain their original metadata. Assets opt in with an
+ordinary `// @sweetvideo-maleoon-artcnn-8x8` GLSL comment in each compute body;
+older libraries accept the assets unchanged, but do not apply the optimization.
+No new platform library or UI setting is introduced. The patch stage runs a
+host-only policy/output-coverage test; this does not establish faster device
+rendering or pixel-equivalent GPU output.
+
+The matching SweetVideo native wrapper enables the existing gpu-next disk cache
+in the application's private cache directory, applies a validated shader list in
+one property update and skips unchanged lists. Its danmaku renderer uploads one
+vertex batch per frame, packs bounded atlases with extruded gutters, and merges
+adjacent draws only (preserving transparent sprite order). See
+[GPU acceptance and audit](tests/maleoon-gpu-acceptance.md) before making
+performance claims. Native wrapper/application changes live in SweetVideo and
+its libmpvnative submodule, not in this build repository.
 
 ## Build Dependencies
 

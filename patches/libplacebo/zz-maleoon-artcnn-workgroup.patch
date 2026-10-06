@@ -1,0 +1,131 @@
+diff --git a/src/gpu.h b/src/gpu.h
+index c38de61..61e6b14 100644
+--- a/src/gpu.h
++++ b/src/gpu.h
+@@ -44,6 +44,9 @@ struct pl_gpu_fns {
+     // Internal cache, or NULL. Set by the user (via pl_gpu_set_cache).
+     _Atomic(pl_cache) cache;
+ 
++    // Backend-local detection; not part of the exported pl_gpu ABI.
++    bool maleoon;
++
+     // Destructors: These also free the corresponding objects, but they
+     // must not be called on NULL. (The NULL checks are done by the pl_*_destroy
+     // wrappers)
+diff --git a/src/maleoon_policy.h b/src/maleoon_policy.h
+new file mode 100644
+index 0000000..2737e29
+--- /dev/null
++++ b/src/maleoon_policy.h
+@@ -0,0 +1,37 @@
++/* Private OHOS policy. No public ABI or application setting. */
++#pragma once
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <string.h>
++
++static inline bool pl_maleoon_name(const char *name)
++{
++    if (!name) return false;
++    const char match[] = "maleoon";
++    for (; *name; name++) {
++        size_t i = 0;
++        for (; match[i] && name[i]; i++) {
++            char c = name[i];
++            if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
++            if (c != match[i]) break;
++        }
++        if (!match[i]) return true;
++    }
++    return false;
++}
++
++// Only opted-in ArtCNN passes whose output block has an integral 1x/2x/4x
++// relation to invocation count. Preserve that relation and all barriers.
++static inline bool pl_maleoon_workgroup(bool maleoon, bool opted_in,
++    uint32_t max_threads, uint32_t max_x, uint32_t max_y,
++    int *bw, int *bh, int *tw, int *th)
++{
++    if (!maleoon || !opted_in || max_threads < 64 || max_x < 8 || max_y < 8 ||
++        *tw != 12 || *th != 16 ||
++        (*bw != 12 && *bw != 24 && *bw != 48) || (*bh != 16 && *bh != 32)) return false;
++    *bw = (*bw / *tw) * 8;
++    *bh = (*bh / *th) * 8;
++    *tw = *th = 8;
++    return true;
++}
+diff --git a/src/opengl/gpu.c b/src/opengl/gpu.c
+index a515943..3d8f8c0 100644
+--- a/src/opengl/gpu.c
++++ b/src/opengl/gpu.c
+@@ -17,6 +17,7 @@
+ 
+ #include "gpu.h"
+ #include "hash.h"
++#include "../maleoon_policy.h"
+ #include "common.h"
+ #include "formats.h"
+ #include "utils.h"
+@@ -119,6 +120,7 @@ pl_gpu pl_gpu_create_gl(pl_log log, pl_opengl pl_gl, const struct pl_opengl_para
+     p->gl_ver = glsl->gles ? 0 : ver;
+     p->gles_ver = glsl->gles ? ver : 0;
+     p->sig = pl_str0_hash((const char *) gl->GetString(GL_VERSION));
++    p->impl.maleoon = pl_maleoon_name((const char *) gl->GetString(GL_RENDERER));
+     pl_hash_merge(&p->sig, pl_str0_hash((const char *) gl->GetString(GL_VENDOR)));
+     pl_hash_merge(&p->sig, pl_str0_hash((const char *) gl->GetString(GL_RENDERER)));
+ 
+diff --git a/src/shaders/custom_mpv.c b/src/shaders/custom_mpv.c
+index 4ef0817..0e3957d 100644
+--- a/src/shaders/custom_mpv.c
++++ b/src/shaders/custom_mpv.c
+@@ -20,6 +20,7 @@
+ 
+ #include "gpu.h"
+ #include "shaders.h"
++#include "../maleoon_policy.h"
+ 
+ #include <libplacebo/shaders/colorspace.h>
+ #include <libplacebo/shaders/custom.h>
+@@ -1671,6 +1672,21 @@ const struct pl_hook *pl_mpv_user_shader_parse(pl_gpu gpu,
+         if (!parse_hook(gpu->log, &shader, &h))
+             goto error;
+ 
++        // Ordinary GLSL comment: older libraries still accept these assets.
++        // Do not modify arbitrary user shaders, precision, coefficients or
++        // shared-memory barriers. The source uses gl_WorkGroupSize throughout.
++        const struct pl_gpu_fns *impl = PL_PRIV(gpu);
++        bool opted_in = h.is_compute &&
++            pl_str_startswith0(h.pass_desc, "ArtCNN ") &&
++            pl_str_find(h.pass_body, pl_str0("// @sweetvideo-maleoon-artcnn-8x8")) >= 0;
++        if (gpu->glsl.compute && pl_maleoon_workgroup(impl->maleoon, opted_in,
++                gpu->glsl.max_group_threads, gpu->glsl.max_group_size[0],
++                gpu->glsl.max_group_size[1], &h.block_w, &h.block_h,
++                &h.threads_w, &h.threads_h)) {
++            PL_DEBUG(gpu, "Maleoon ArtCNN workgroup: 8x8, output block %dx%d",
++                     h.block_w, h.block_h);
++        }
++
+         struct hook_pass pass = {
+             .exec_stages = 0,
+             .hook = h,
+diff --git a/src/vulkan/gpu.c b/src/vulkan/gpu.c
+index e541582..1377ecc 100644
+--- a/src/vulkan/gpu.c
++++ b/src/vulkan/gpu.c
+@@ -17,6 +17,7 @@
+ 
+ #include "gpu.h"
+ #include "formats.h"
++#include "../maleoon_policy.h"
+ #include "glsl/spirv.h"
+ 
+ #ifdef PL_HAVE_UNIX
+@@ -485,6 +486,7 @@ pl_gpu pl_gpu_create_vk(struct vk_ctx *vk)
+         vk_link_struct(&props, &copy_props);
+ 
+     vk->GetPhysicalDeviceProperties2(vk->physd, &props);
++    p->impl.maleoon = pl_maleoon_name(props.properties.deviceName);
+     VkPhysicalDeviceLimits limits = props.properties.limits;
+ 
+     // Determine GLSL features and limits
