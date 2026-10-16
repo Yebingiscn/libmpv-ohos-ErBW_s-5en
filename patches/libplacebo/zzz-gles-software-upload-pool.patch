@@ -1,0 +1,245 @@
+diff --git a/src/opengl/gpu.h b/src/opengl/gpu.h
+--- a/src/opengl/gpu.h
++++ b/src/opengl/gpu.h
+@@ -19,6 +19,7 @@
+ 
+ #include "../gpu.h"
+ #include "common.h"
++#include "upload_pool.h"
+ 
+ // Thread safety: Unsafe, same as pl_gpu_destroy
+ pl_gpu pl_gpu_create_gl(pl_log log, pl_opengl gl, const struct pl_opengl_params *params);
+@@ -42,6 +43,7 @@
+ 
+     // Sync objects and associated callbacks
+     PL_ARRAY(struct gl_cb) callbacks;
++    struct gles_upload_pool upload_pool;
+ 
+ 
+     // Incrementing counters to keep track of object uniqueness
+diff --git a/src/opengl/gpu.c b/src/opengl/gpu.c
+--- a/src/opengl/gpu.c
++++ b/src/opengl/gpu.c
+@@ -40,6 +40,11 @@
+     pl_gpu_finish(gpu);
+     while (p->callbacks.num > 0)
+         gl_poll_callbacks(gpu);
++
++    if (MAKE_CURRENT()) {
++        gles_upload_destroy(&p->upload_pool, gl_funcs_get(gpu));
++        RELEASE_CURRENT();
++    }
+ 
+     pl_free((void *) gpu);
+ }
+diff --git a/src/opengl/gpu_tex.c b/src/opengl/gpu_tex.c
+--- a/src/opengl/gpu_tex.c
++++ b/src/opengl/gpu_tex.c
+@@ -900,7 +900,7 @@
+     // If the user requests asynchronous uploads, it's more efficient to do
+     // them via a PBO - this allows us to skip blocking the caller, especially
+     // when the host pointer can be imported directly.
+-    if (params->callback && !buf) {
++    if (params->callback && !buf && p->gles_ver < 30) {
+         size_t buf_size = pl_tex_transfer_size(params);
+         const size_t min_size = 32*1024; // 32 KiB
+         if (buf_size >= min_size && buf_size <= gpu->limits.max_buf_size)
+@@ -911,6 +911,24 @@
+         return false;
+ 
+     uintptr_t src = (uintptr_t) params->ptr;
++    int staging = -1;
++    // GLES 3 has core pixel-unpack buffers even when desktop ARB PBO capability
++    // checks are false. Reuse bounded storage without changing those public
++    // capabilities or moving the decoder's reference frames into uncached RAM.
++    if (!buf && params->callback && params->ptr && p->gles_ver >= 30 &&
++        pl_tex_params_dimension(tex->params) == 2 &&
++        gl->MapBufferRange && gl->UnmapBuffer && gl->FenceSync &&
++        gl->ClientWaitSync && gl->DeleteSync) {
++        bool disabled = p->upload_pool.disabled;
++        staging = gles_upload_prepare(&p->upload_pool, gl, params->ptr,
++                                      pl_tex_transfer_size(params));
++        if (!disabled && p->upload_pool.disabled) {
++            gl_check_err(gpu, "GLES software upload staging unavailable");
++            PL_WARN(gpu, "GLES software upload staging disabled; using client memory");
++        }
++        if (staging >= 0)
++            src = 0; // Offset into the pixel-unpack buffer left bound above.
++    }
+     if (buf) {
+         gl->BindBuffer(GL_PIXEL_UNPACK_BUFFER, buf_gl->buffer);
+         src = buf_gl->offset + params->buf_offset;
+@@ -971,8 +989,9 @@
+     gl->PixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+     gl->PixelStorei(GL_UNPACK_IMAGE_HEIGHT, 0);
+ 
++    if (buf || staging >= 0)
++        gl->BindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+     if (buf) {
+-        gl->BindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+         if (buf->params.host_mapped) {
+             // Make sure the PBO is not reused until GL is done with it. If a
+             // previous operation is pending, "update" it by creating a new
+@@ -982,15 +1001,39 @@
+         }
+     }
+ 
+-    if (params->callback) {
++    bool ok = gl_check_err(gpu, "gl_tex_upload");
++    if (staging >= 0 && ok) {
++        ok = gles_upload_submit(&p->upload_pool, gl, staging);
++        if (!ok)
++            gl_check_err(gpu, "GLES software upload fence");
++        else if (!p->upload_pool.announced) {
++            PL_INFO(gpu, "GLES software frame upload: bounded PBO staging (64 MiB)");
++            p->upload_pool.announced = true;
++        }
++    }
++    if (staging >= 0 && !ok) {
++        p->upload_pool.disabled = true;
++        PL_WARN(gpu, "GLES software upload submission failed; subsequent uploads use client memory");
++    }
++
++    if (params->callback && ok && staging >= 0) {
++        // The source frame can be released now: the PBO owns its copied bytes.
++        // Its fence, rather than the AVFrame lifetime, protects GPU transfers.
++        params->callback(params->priv);
++    } else if (params->callback && ok) {
++        GLsync sync = gl->FenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
++        if (!sync) {
++            gl_check_err(gpu, "gl_tex_upload callback fence");
++            RELEASE_CURRENT();
++            return false;
++        }
+         PL_ARRAY_APPEND(gpu, p->callbacks, (struct gl_cb) {
+-            .sync = gl->FenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0),
++            .sync = sync,
+             .callback = params->callback,
+             .priv = params->priv,
+         });
+     }
+ 
+-    bool ok = gl_check_err(gpu, "gl_tex_upload");
+     RELEASE_CURRENT();
+     return ok;
+ }
+diff --git a/src/opengl/upload_pool.h b/src/opengl/upload_pool.h
+new file mode 100644
+--- /dev/null
++++ b/src/opengl/upload_pool.h
+@@ -0,0 +1,115 @@
++/* Bounded GLES 3 software-frame staging. The owning GL context must be current.
++ * SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <string.h>
++
++#define GLES_UPLOAD_SLOTS 6
++#define GLES_UPLOAD_MIN (32u * 1024u)
++#define GLES_UPLOAD_MAX (16u * 1024u * 1024u)
++#define GLES_UPLOAD_BUDGET (64u * 1024u * 1024u)
++
++struct gles_upload_slot {
++    GLuint buffer;
++    GLsync fence;
++    size_t capacity;
++};
++
++struct gles_upload_pool {
++    struct gles_upload_slot slots[GLES_UPLOAD_SLOTS];
++    size_t allocated;
++    bool disabled;
++    bool announced;
++};
++
++// Never wait for the GPU. Busy slots and oversized planes use the original
++// client-memory upload. Only sequential CPU writes target this mapped memory;
++// the VP9 decoder's reference-frame reads remain in ordinary cached RAM.
++static inline int gles_upload_prepare(struct gles_upload_pool *pool,
++                               const gl_funcs *gl, const void *pixels, size_t size)
++{
++    if (pool->disabled || !pixels || size < GLES_UPLOAD_MIN || size > GLES_UPLOAD_MAX)
++        return -1;
++
++    int best = -1, grow = -1;
++    for (int i = 0; i < GLES_UPLOAD_SLOTS; i++) {
++        struct gles_upload_slot *slot = &pool->slots[i];
++        if (slot->fence) {
++            GLenum status = gl->ClientWaitSync(slot->fence, 0, 0);
++            if (status == GL_TIMEOUT_EXPIRED)
++                continue;
++            if (status != GL_ALREADY_SIGNALED && status != GL_CONDITION_SATISFIED) {
++                pool->disabled = true;
++                return -1;
++            }
++            gl->DeleteSync(slot->fence);
++            slot->fence = NULL;
++        }
++        if (slot->buffer && slot->capacity >= size) {
++            if (best < 0 || slot->capacity < pool->slots[best].capacity)
++                best = i;
++        } else if (pool->allocated - slot->capacity + size <= GLES_UPLOAD_BUDGET) {
++            if (grow < 0 || slot->capacity > pool->slots[grow].capacity)
++                grow = i;
++        }
++    }
++
++    int index = best >= 0 ? best : grow;
++    if (index < 0)
++        return -1;
++    struct gles_upload_slot *slot = &pool->slots[index];
++    if (!slot->buffer) {
++        gl->GenBuffers(1, &slot->buffer);
++        if (!slot->buffer) {
++            pool->disabled = true;
++            return -1;
++        }
++    }
++    gl->BindBuffer(GL_PIXEL_UNPACK_BUFFER, slot->buffer);
++    if (slot->capacity < size) {
++        gl->BufferData(GL_PIXEL_UNPACK_BUFFER, size, NULL, GL_STREAM_DRAW);
++        pool->allocated += size - slot->capacity;
++        slot->capacity = size;
++    }
++    void *mapped = gl->MapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0, size,
++                                     GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
++    if (!mapped) {
++        gl->BindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
++        pool->disabled = true;
++        return -1;
++    }
++    memcpy(mapped, pixels, size);
++    if (!gl->UnmapBuffer(GL_PIXEL_UNPACK_BUFFER)) {
++        gl->BindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
++        pool->disabled = true;
++        return -1;
++    }
++    // Leave the PBO bound for TexSubImage2D; the caller unbinds it afterwards.
++    return index;
++}
++
++static inline bool gles_upload_submit(struct gles_upload_pool *pool,
++                               const gl_funcs *gl, int index)
++{
++    pool->slots[index].fence = gl->FenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
++    if (!pool->slots[index].fence) {
++        // Do not reuse untracked in-flight storage, even on a later frame.
++        pool->disabled = true;
++        return false;
++    }
++    return true;
++}
++
++static inline void gles_upload_destroy(struct gles_upload_pool *pool, const gl_funcs *gl)
++{
++    for (int i = 0; i < GLES_UPLOAD_SLOTS; i++) {
++        struct gles_upload_slot *slot = &pool->slots[i];
++        if (slot->fence)
++            gl->DeleteSync(slot->fence);
++        if (slot->buffer)
++            gl->DeleteBuffers(1, &slot->buffer);
++    }
++    *pool = (struct gles_upload_pool) {0};
++}

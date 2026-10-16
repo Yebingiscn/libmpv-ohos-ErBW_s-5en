@@ -260,6 +260,11 @@ for marker in "[Perf] decode-send" "[Perf] decode-receive" \
 done
 
 echo "$features"
+if ! "$STRINGS" "$LIBMPV" | grep -F \
+    "GLES software frame upload: bounded PBO staging (64 MiB)" >/dev/null; then
+  echo "Missing bounded GLES software upload staging" >&2
+  exit 1
+fi
 echo "$configuration"
 grep -E "NEEDED|SONAME" <<< "$dynamic_section"
 if command -v sha256sum >/dev/null 2>&1; then

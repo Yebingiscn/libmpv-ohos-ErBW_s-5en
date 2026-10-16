@@ -366,6 +366,16 @@ adjacent draws only (preserving transparent sprite order). See
 performance claims. Native wrapper/application changes live in SweetVideo and
 its libmpvnative submodule, not in this build repository.
 
+GLES 3 software video uploads reuse a bounded pixel-unpack buffer pool (six
+slots, at most 64 MiB per context). This keeps decoder reference frames in
+cached CPU memory, preserves YUV bytes, and allows source frames to be released
+after staging. Busy buffers are never waited on; unsupported sizes/capabilities
+and staging failures retain client-memory uploads. Vulkan and hardware external
+textures retain their existing paths. This requires rebuilding `libmpv.so`.
+See [software upload acceptance](tests/gles-upload-integration.md) for limits,
+runtime confirmation and device performance checks. Host tests do not establish
+a CPU or power reduction on real hardware.
+
 ## Build Dependencies
 
 - git
