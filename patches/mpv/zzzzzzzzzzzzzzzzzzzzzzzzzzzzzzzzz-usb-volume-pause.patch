@@ -1,0 +1,157 @@
+diff --git a/audio/out/ao.c b/audio/out/ao.c
+index a825a51..55122e9 100644
+--- a/audio/out/ao.c
++++ b/audio/out/ao.c
+@@ -658,7 +658,7 @@ void ao_print_devices(struct mpv_global *global, struct mp_log *log,
+ 
+ void ao_set_gain(struct ao *ao, float gain)
+ {
+-    if (strcmp(ao->driver->name, "usb-exclusive") == 0) gain = 1.0f;
++    if (strcmp(ao->driver->name, "usb-exclusive") == 0 && !ao->usb_pcm_gain) gain = 1.0f;
+     atomic_store(&ao->gain, gain);
+ }
+ 
+diff --git a/audio/out/internal.h b/audio/out/internal.h
+index 5b4b18a..1ff4faf 100644
+--- a/audio/out/internal.h
++++ b/audio/out/internal.h
+@@ -66,6 +66,8 @@ struct ao {
+ 
+     // Float gain multiplicator
+     _Atomic float gain;
++    // USB exclusive defaults to unity until compatible PCM is negotiated.
++    bool usb_pcm_gain;
+ 
+     int buffer;
+     double def_buffer;
+diff --git a/audio/out/ao_usb_exclusive.c b/audio/out/ao_usb_exclusive.c
+index da3c5be..5b05100 100644
+--- a/audio/out/ao_usb_exclusive.c
++++ b/audio/out/ao_usb_exclusive.c
+@@ -162,6 +162,14 @@ static bool submit_feedback(struct priv *p)
+     s->pending = ioctl(p->fd, USBDEVFS_SUBMITURB, s->urb) == 0;
+     return s->pending;
+ }
++static struct slot *completed_slot(struct priv *p, struct usbdevfs_urb *urb)
++{
++    // A duplicated usbfs fd may still return a completion from an earlier AO.
++    // Never dereference its usercontext (the previous AO may have been freed).
++    for (unsigned i = 0; i < SLOTS; i++)
++        if (p->slots[i].urb == urb) return &p->slots[i];
++    return p->feedback.urb == urb ? &p->feedback : NULL;
++}
+ static void *worker(void *ctx)
+ {
+     struct ao *ao = ctx;
+@@ -170,8 +178,14 @@ static void *worker(void *ctx)
+         pthread_mutex_lock(&p->mutex);
+         struct usbdevfs_urb *done = NULL;
+         while (ioctl(p->fd, USBDEVFS_REAPURBNDELAY, &done) == 0) {
+-            struct slot *s = done->usercontext;
++            struct slot *s = completed_slot(p, done);
++            if (!s) continue;
++            if (!s->pending || (s != &p->feedback && s->frames > p->in_flight)) {
++                MP_ERR(ao, "USB completion accounting mismatch.\n");
++                fail(ao); break;
++            }
+             s->pending = false;
++            if (s != &p->feedback) p->in_flight -= s->frames;
+             if (done->status || done->error_count) {
+                 MP_ERR(ao, "USB URB completion: endpoint=%u status=%d errors=%d\n",
+                        done->endpoint, done->status, done->error_count);
+@@ -191,7 +205,6 @@ static void *worker(void *ctx)
+                     p->rate_q32 = q; p->feedback_time = mp_time_ns();
+                 } else { fail(ao); break; }
+             } else {
+-                p->in_flight -= s->frames;
+                 p->progress_time = mp_time_ns();
+             }
+         }
+@@ -236,7 +249,29 @@ static void *worker(void *ctx)
+     }
+     return NULL;
+ }
+-static void stop_thread(struct priv *p)
++static bool reap_cancelled(struct priv *p)
++{
++    unsigned pending = 0;
++    for (unsigned i = 0; i < SLOTS; i++) pending += p->slots[i].pending;
++    pending += p->feedback.pending;
++    int64_t deadline = mp_time_ns() + MP_TIME_S_TO_NS(2);
++    while (pending) {
++        struct usbdevfs_urb *u = NULL;
++        if (ioctl(p->fd, USBDEVFS_REAPURBNDELAY, &u) == 0) {
++            struct slot *s = completed_slot(p, u);
++            if (!s) continue;
++            if (!s->pending) return false;
++            s->pending = false;
++            pending--;
++        } else {
++            if ((errno != EINTR && errno != EAGAIN) || mp_time_ns() >= deadline)
++                return false;
++            mp_sleep_ns(MP_TIME_MS_TO_NS(1));
++        }
++    }
++    return true;
++}
++static bool stop_thread(struct priv *p)
+ {
+     atomic_store(&p->stop, true);
+     if (p->thread_live) { pthread_join(p->thread, NULL); p->thread_live = false; }
+@@ -246,20 +281,15 @@ static void stop_thread(struct priv *p)
+     }
+     /* Closing our duplicated fd alone does not cancel URBs while the ArkTS
+      * owner still holds the same file description. Reap every cancelled URB. */
+-    unsigned pending = 0;
+-    for (unsigned i = 0; i < SLOTS; i++) pending += p->slots[i].pending;
+-    pending += p->feedback.pending;
+-    while (pending) {
+-        struct usbdevfs_urb *u = NULL;
+-        if (ioctl(p->fd, USBDEVFS_REAPURB, &u) == 0) {
+-            ((struct slot *)u->usercontext)->pending = false; pending--;
+-        } else if (errno != EINTR) break;
+-    }
++    return reap_cancelled(p);
+ }
+ static void reset(struct ao *ao)
+ {
+     struct priv *p = ao->priv;
+-    stop_thread(p);
++    if (!stop_thread(p)) {
++        MP_ERR(ao, "USB cancellation did not drain; refusing to reuse pending buffers.\n");
++        fail(ao);
++    }
+     p->started = false; p->count = p->head = p->in_flight = 0; p->phase = 0;
+ }
+ static void uninit(struct ao *ao)
+@@ -268,10 +298,13 @@ static void uninit(struct ao *ao)
+     stop_thread(p);
+     if (p->claimed) { set_alt(p, 0); release_interface(p, p->mode.interface); }
+     if (p->control_claimed) release_interface(p, p->mode.control);
++    // Releasing interfaces cancels outstanding transfers too. Keep any unreaped
++    // user buffers alive if the platform still refuses to report completion.
++    if (!reap_cancelled(p)) MP_WARN(ao, "USB buffers retained after failed cancellation.\n");
+     if (p->fd >= 0) close(p->fd);
+     for (unsigned i = 0; i <= SLOTS; i++) {
+         struct slot *s = i == SLOTS ? &p->feedback : &p->slots[i];
+-        free(s->urb); free(s->data);
++        if (!s->pending) { free(s->urb); free(s->data); }
+     }
+     free(p->ring);
+     if (p->mutex_live) pthread_mutex_destroy(&p->mutex);
+@@ -373,6 +406,7 @@ static int init(struct ao *ao)
+     if (pthread_mutex_init(&p->mutex, NULL)) goto error;
+     p->mutex_live = true;
+     ao->format = fmt; ao->device_buffer = p->capacity;
++    ao->usb_pcm_gain = convert && !dop && !native;
+     MP_INFO(ao, "USB PCM policy: %s\n", convert ? "compatible conversion (not guaranteed bit-perfect)" : "strict original samples");
+     MP_INFO(ao, "USB exclusive %d Hz / %u-bit / %s; hardware volume %s\n", ao->samplerate,
+         p->mode.bits, native ? "Native DSD" : dop ? "DoP" : "PCM", p->volume_available ? "available" : "unavailable");
+@@ -385,6 +419,7 @@ error:
+ static void start(struct ao *ao)
+ {
+     struct priv *p = ao->priv;
++    if (atomic_load(&p->failed)) return;
+     pthread_mutex_lock(&p->mutex);
+     p->started = true; p->progress_time = p->feedback_time = mp_time_ns();
+     pthread_mutex_unlock(&p->mutex);

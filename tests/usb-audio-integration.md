@@ -25,7 +25,9 @@
 
 2026-09-25 本地验证：以上 C 测试通过；另以 FFmpeg FATE 的 `dst/dst-64fs44-2ch.dff` 中 10 个压缩 DST 帧验证 raw DSD 经独立 DSD-to-PCM 后与默认解码结果逐字节一致。MPV/FFmpeg 改动文件 ARM64 SDK 编译通过，应用调试 HAP 构建通过。尚未完成新 libmpv 的完整目标构建，也没有连接 DAC 验证；现有 HAP 内仍是此前的底层库，不含这些新增功能。
 
-局部 ARM64 编译不等于完整构建。通过 Linux/macOS CI 重新构建 libmpv 后，才可替换应用内两个库副本。旧库会被应用的后端选项探测拦截。
+局部 ARM64 编译不等于完整构建。通过 Linux/macOS CI 重新构建 libmpv 后，替换应用当前使用的底层库；目前为 `libmpvnative/libs/arm64-v8a/libmpv.so`，不要恢复已移除的 entry 副本。
+
+2026-10-17 音量/暂停修复：兼容 PCM 允许 MPV 数字增益，严格 PCM、DoP、Native DSD 继续固定原始增益。取消 URB 使用非阻塞回收并重试 EAGAIN/EINTR；超时禁止重新启动，交给应用回退。回收未知旧 AO 的完成事件时不解引用旧 usercontext；无法确认回收完成的缓冲区保留，避免内核继续写入已释放内存（异常路径会占用少量内存直到进程退出）。`tests/usb-lifecycle.c` 编译实际 AO 函数，覆盖增益策略、延迟取消、旧完成事件、重复重置和取消超时。仍需真机验证连续暂停/恢复、拖动和拔插。
 
 ## 真机必须完成的项目
 

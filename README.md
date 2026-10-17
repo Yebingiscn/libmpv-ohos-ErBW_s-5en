@@ -324,6 +324,11 @@ when the source rate is unavailable, 48/96 kHz resampling. It does not claim
 bit-perfect output. The default remains strict; DoP/native DSD never enter this
 conversion path. Applications can use software `volume` in compatible PCM mode
 when `ao-volume` is unavailable. Do not digitally scale opaque DSD frames.
+Gain is enabled only after compatible PCM negotiation; strict PCM and DSD retain
+unity gain. Pause/reset drains cancelled URBs before reuse, retrying temporary
+EAGAIN/EINTR results; cancellation timeout fails the output instead of restarting
+with stale transfers. Applications using USB must distinguish the platform
+AudioSession idle timeout from actual focus loss, since USB bypasses AudioRenderer.
 Transfer failures include source location, queue state and URB/packet errors;
 the application must handle audio-output failure by reloading ordinary output
 at the saved position, rather than leaving the video stopped or silent.
