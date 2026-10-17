@@ -1,0 +1,182 @@
+diff --git a/audio/out/ao_usb_exclusive.c b/audio/out/ao_usb_exclusive.c
+index 494ec29..da3c5be 100644
+--- a/audio/out/ao_usb_exclusive.c
++++ b/audio/out/ao_usb_exclusive.c
+@@ -17,14 +17,15 @@
+ #include "osdep/timer.h"
+ #include "usb_audio_protocol.h"
+ #include "usb_audio_dsd.h"
++#include "usb_audio_pcm.h"
+ 
+-#define SLOTS 8
++#define SLOTS 32
+ #define PACKETS 8
+ struct slot { struct usbdevfs_urb *urb; uint8_t *data; unsigned frames; bool pending; };
+ struct priv {
+     int source_fd, fd, dsd_mode;
+     enum ua_dsd_order dsd_order;
+-    bool allow_dop, claimed, control_claimed, thread_live, mutex_live;
++    bool allow_dop, compatible, claimed, control_claimed, thread_live, mutex_live;
+     struct ua_mode mode;
+     struct slot slots[SLOTS], feedback;
+     pthread_t thread;
+@@ -132,14 +133,16 @@ static int control(struct ao *ao, enum aocontrol cmd, void *arg)
+     }
+     return CONTROL_OK;
+ }
+-static void fail(struct ao *ao)
++static void fail_at(struct ao *ao, int line, int last_errno)
+ {
+     struct priv *p = ao->priv;
+     if (!atomic_exchange(&p->failed, true)) {
+-        MP_ERR(ao, "USB exclusive transfer failed; stopping without mixer fallback.\n");
++        MP_ERR(ao, "USB exclusive output failed at line %d (last errno=%d, queued=%u, in_flight=%u); requesting application recovery.\n",
++               line, last_errno, p->count, p->in_flight);
+         ao_report_error(ao);
+     }
+ }
++#define fail(ao) fail_at(ao, __LINE__, errno)
+ static bool alloc_slot(struct slot *s, unsigned packets, unsigned bytes)
+ {
+     s->urb = calloc(1, sizeof(*s->urb) + packets * sizeof(struct usbdevfs_iso_packet_desc));
+@@ -169,9 +172,16 @@ static void *worker(void *ctx)
+         while (ioctl(p->fd, USBDEVFS_REAPURBNDELAY, &done) == 0) {
+             struct slot *s = done->usercontext;
+             s->pending = false;
+-            if (done->status || done->error_count) { fail(ao); break; }
++            if (done->status || done->error_count) {
++                MP_ERR(ao, "USB URB completion: endpoint=%u status=%d errors=%d\n",
++                       done->endpoint, done->status, done->error_count);
++                fail(ao); break;
++            }
+             for (int i = 0; i < done->number_of_packets; i++)
+-                if (done->iso_frame_desc[i].status) fail(ao);
++                if (done->iso_frame_desc[i].status) {
++                    MP_ERR(ao, "USB packet %d status=%d\n", i, done->iso_frame_desc[i].status);
++                    fail(ao);
++                }
+             if (s == &p->feedback) {
+                 unsigned n = done->iso_frame_desc[0].actual_length;
+                 if (n == 3 || n == 4) {
+@@ -273,6 +283,10 @@ static int init(struct ao *ao)
+     atomic_init(&p->stop, false); atomic_init(&p->failed, false);
+     int fmt = af_fmt_from_planar(ao->format);
+     bool dop = fmt == AF_FORMAT_S_DOP, native = fmt == AF_FORMAT_S_DSD;
++    bool convert = p->compatible && af_fmt_is_pcm(fmt);
++    // Negotiate integer PCM with mpv's conversion filter; never reinterpret float bytes.
++    if (convert && fmt != AF_FORMAT_S16 && fmt != AF_FORMAT_S32) fmt = AF_FORMAT_S32;
++    if (convert && ao->channels.num > 2) mp_chmap_from_channels(&ao->channels, 2);
+     if (ao->samplerate < 8000 || ao->samplerate > 1536000) return -1;
+     if (p->source_fd < 0 || (fmt != AF_FORMAT_S16 && fmt != AF_FORMAT_S32 && !dop && !native) ||
+         (dop && !(p->dsd_mode == 1 || (p->dsd_mode == 0 && p->allow_dop))) ||
+@@ -298,6 +312,7 @@ static int init(struct ao *ao)
+         struct ua_caps caps;
+         if (!ua_parse(config, size, &caps)) goto error;
+         int best = -1;
++        unsigned best_rate = 0;
+         for (unsigned j = 0; j < caps.count; j++) {
+             struct ua_mode *m = &caps.modes[j];
+             enum ua_dsd_order order = ua_dsd_mode(vendor, product, revision, m);
+@@ -306,10 +321,20 @@ static int init(struct ao *ao)
+             if (!m->endpoint || m->channels != ao->channels.num || m->interval < 1 || m->interval > 4 ||
+                 m->bytes < 2 || m->bytes > 4 ||
+                 (m->bits != m->bytes * 8 && !(m->bytes == 4 && m->bits == 24)) ||
+-                (fmt == AF_FORMAT_S32 && m->bits < 24) || (dop && m->bits < 24) ||
+-                (((m->attributes >> 2) & 3) == 1 && !m->feedback) ||
+-                !rate_supported(p, m, ao->samplerate)) continue;
+-            if (best < 0 || (fmt == AF_FORMAT_S16 ? m->bits < caps.modes[best].bits : m->bits > caps.modes[best].bits)) best = j;
++                (!convert && fmt == AF_FORMAT_S32 && m->bits < 24) || (dop && m->bits < 24) ||
++                (((m->attributes >> 2) & 3) == 1 && !m->feedback)) continue;
++            unsigned rate = ao->samplerate;
++            if (!rate_supported(p, m, rate)) {
++                if (!convert) continue;
++                rate = rate_supported(p, m, 48000) ? 48000 : rate_supported(p, m, 96000) ? 96000 : 0;
++                if (!rate) continue;
++            }
++            bool exact = rate == (unsigned)ao->samplerate;
++            bool best_exact = best_rate == (unsigned)ao->samplerate;
++            if (best < 0 || (exact && !best_exact) || (exact == best_exact &&
++                (fmt == AF_FORMAT_S16 ? m->bits < caps.modes[best].bits : m->bits > caps.modes[best].bits))) {
++                best = j; best_rate = rate;
++            }
+         }
+         if (best < 0) {
+             if (native) MP_ERR(ao, "Native DSD: no compatible exact-rate mode for %04x:%04x firmware %04x.\n",
+@@ -317,6 +342,10 @@ static int init(struct ao *ao)
+             goto error;
+         }
+         p->mode = caps.modes[best];
++        if (best_rate != (unsigned)ao->samplerate) {
++            MP_INFO(ao, "USB compatible resampling: %d -> %u Hz\n", ao->samplerate, best_rate);
++            ao->samplerate = best_rate;
++        }
+         p->dsd_order = native ? ua_dsd_mode(vendor, product, revision, &p->mode) : UA_DSD_NONE;
+         found = true; break;
+     }
+@@ -344,6 +373,7 @@ static int init(struct ao *ao)
+     if (pthread_mutex_init(&p->mutex, NULL)) goto error;
+     p->mutex_live = true;
+     ao->format = fmt; ao->device_buffer = p->capacity;
++    MP_INFO(ao, "USB PCM policy: %s\n", convert ? "compatible conversion (not guaranteed bit-perfect)" : "strict original samples");
+     MP_INFO(ao, "USB exclusive %d Hz / %u-bit / %s; hardware volume %s\n", ao->samplerate,
+         p->mode.bits, native ? "Native DSD" : dop ? "DoP" : "PCM", p->volume_available ? "available" : "unavailable");
+     return 0;
+@@ -380,14 +410,22 @@ static bool write_data(struct ao *ao, void **data, int samples)
+             }
+             uint32_t word = ua_le(src, src_bytes);
+             if (src_bytes == 2) word <<= 16;
+-            if (ao->format != AF_FORMAT_S_DOP && p->mode.bits == 24 && (word & 255)) {
+-                ok = false; break;
++            if (af_fmt_is_pcm(ao->format)) {
++                if (!ua_pcm_pack(word, dst_bytes, p->mode.bits, p->compatible, dst + c * dst_bytes)) {
++                    MP_ERR(ao, "USB strict PCM rejected precision loss: source=%u bytes, DAC=%u bits.\n",
++                           src_bytes, p->mode.bits);
++                    ok = false; break;
++                }
++                continue;
+             }
+             unsigned shift = 32 - dst_bytes * 8;
+             // 32-valid-bit DACs conventionally carry DoP in the low 24 bits;
+             // 24-valid-bit subslots retain the UAC-required left alignment.
+             if (ao->format == AF_FORMAT_S_DOP && p->mode.bits == 32) shift = 8;
+-            if (shift && (word & ((1u << shift) - 1))) { ok = false; break; }
++            if (shift && (word & ((1u << shift) - 1))) {
++                MP_ERR(ao, "USB strict PCM rejected precision loss: source=%u destination=%u bytes.\n", src_bytes, dst_bytes);
++                ok = false; break;
++            }
+             word >>= shift;
+             for (unsigned b = 0; b < dst_bytes; b++) dst[c * dst_bytes + b] = word >> (8 * b);
+         }
+@@ -416,6 +454,7 @@ const struct ao_driver audio_out_usb_exclusive = {
+     .options = (const struct m_option[]){
+         {"fd", OPT_INT(source_fd), M_RANGE(-1, INT_MAX)},
+         {"dop", OPT_BOOL(allow_dop)},
++        {"compatible", OPT_BOOL(compatible)},
+         {"dsd-mode", OPT_CHOICE(dsd_mode, {"no", 0}, {"dop", 1}, {"native", 2})}, {0}
+     }, .options_prefix = "usb-exclusive",
+ };
+diff --git a/audio/out/usb_audio_pcm.h b/audio/out/usb_audio_pcm.h
+new file mode 100644
+index 0000000..02c4f4d
+--- /dev/null
++++ b/audio/out/usb_audio_pcm.h
+@@ -0,0 +1,19 @@
++/* USB PCM packing policy. SPDX-License-Identifier: LGPL-2.1-or-later */
++#ifndef MP_USB_AUDIO_PCM_H
++#define MP_USB_AUDIO_PCM_H
++#include <stdbool.h>
++#include <stdint.h>
++// word is a signed PCM sample left-aligned in a 32-bit unsigned container.
++static inline bool ua_pcm_pack(uint32_t word, unsigned bytes, unsigned bits,
++                               bool compatible, uint8_t *dst)
++{
++    if (bytes < 2 || bytes > 4 || bits < 16 || bits > bytes * 8) return false;
++    unsigned precision_shift = 32 - bits;
++    uint32_t mask = precision_shift ? (1u << precision_shift) - 1 : 0;
++    if (!compatible && (word & mask)) return false;
++    word &= ~mask;
++    word >>= 32 - bytes * 8;
++    for (unsigned i = 0; i < bytes; i++) dst[i] = (uint8_t)(word >> (i * 8));
++    return true;
++}
++#endif

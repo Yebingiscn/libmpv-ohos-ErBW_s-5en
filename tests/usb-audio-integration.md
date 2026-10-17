@@ -2,6 +2,10 @@
 
 ## 实现范围
 
+- 新增 `usb-exclusive-compatible=yes`：PCM 可协商整数格式、立体声、DAC 位深及 48/96 kHz 回退采样率。此模式允许数字音量和量化，不保证 bit-perfect；默认仍为严格模式，DSD 始终不进入 PCM 转换路径。
+- 应用四种音量策略：自动优先 DAC 硬件音量，失败时仅 PCM 回退数字音量；硬件模式不回退数字音量；数字模式仅处理 PCM；原始电平保持 100% 样本电平。系统音量不修改。
+- 新增验收：同一 44.1 kHz AAC 视频在兼容模式播放、严格模式失败后静默普通播放；USB 中途断开后按进度恢复且保持暂停意图；快速切集不允许旧恢复请求加载旧文件。记录 URB 状态、包错误、队列状态和源代码行，不能仅凭通用失败日志归因于断连。
+
 - `ao=usb-exclusive`，`usb-exclusive-fd` 接收应用通过用户 USB 授权得到的文件描述符，AO 自行复制并管理副本。
 - UAC1/UAC2，Full/High Speed，单声道/立体声 Type I 整数 PCM；采样率不改变，按 DAC 格式选择容器，允许无损补零，拒绝丢弃非零低位。
 - 支持同步、适应型和带显式反馈端点的异步输出。异步反馈参与分包；只有隐式反馈的设备拒绝使用。UAC2 目前要求输入终端直连 Clock Source，不猜测 Clock Selector/Multiplier 拓扑。
@@ -10,7 +14,7 @@
 - Native DSD 使用独立 opaque 格式，按 VID/PID、备用接口、UAC2 32-bit 描述符及已知 Amanero 固件版本匹配 U32 BE/LE 传输，不按 DAC 芯片名推测能力。未知设备或固件停止；不支持 U8/U16、ITF 厂商切换和全部 DSD_RAW 设备。完整首批 ID 列表见补丁中的 `audio/out/usb_audio_dsd.h`，这些接口也从 PCM/DoP 候选中排除。
 - DST、DSD WavPack 通过 FFmpeg `dsd_raw` 私有选项输出标记过的 MSB-first DSD 字节，再封装 DoP 或 Native；不经过浮点 PCM。WavPack copy/fast/high 三种 DSD 解包路径均保留，坏 CRC 拒绝。普通 PCM WavPack 保持 PCM；正常非独占播放默认仍使用原有解码方式。
 - `ao-volume` 读取/修改 USB Feature Unit 的 master 音量，按设备 dB 范围及步长映射百分比。设备无 master 音量、只有每声道音量或无法读取范围时，返回不支持，不改软件或系统音量。不自动设置启动音量。
-- 不支持浮点解码输出、8/64-bit PCM、多声道、UAC3/4、多 AudioControl 功能复合设备；这些路径明确拒绝，不能作为“所有格式均已支持”的依据。
+- 严格模式不支持浮点解码输出、8/64-bit PCM、多声道；兼容模式由 MPV 转换为整数单声道/立体声。仍不支持 UAC3/4、多 AudioControl 功能复合设备，不能作为“所有格式均已支持”的依据。
 - 未引入 DDK、libusb 或新的系统动态库依赖。仍须设备提供 USBManager、可用的原生句柄及 usbfs ioctl 权限；仅 API 存在不能证明 HarmonyOS 商用设备接受这些操作。
 
 ## 自动检查

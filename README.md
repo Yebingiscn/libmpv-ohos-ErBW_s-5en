@@ -318,6 +318,16 @@ volume. Supported UAC1/UAC2 DACs negotiate the source rate with lossless integer
 PCM packing; unsupported formats stop rather than resample. `ao-volume` controls
 the DAC's master Feature Unit where available.
 
+`usb-exclusive-compatible=yes` opts PCM into mpv format negotiation (including
+float-to-integer conversion and stereo downmix), DAC-width quantization and,
+when the source rate is unavailable, 48/96 kHz resampling. It does not claim
+bit-perfect output. The default remains strict; DoP/native DSD never enter this
+conversion path. Applications can use software `volume` in compatible PCM mode
+when `ao-volume` is unavailable. Do not digitally scale opaque DSD frames.
+Transfer failures include source location, queue state and URB/packet errors;
+the application must handle audio-output failure by reloading ordinary output
+at the saved position, rather than leaving the video stopped or silent.
+
 `audio-spdif=dop` plus `usb-exclusive-dsd-mode=dop` preserves raw DSD, DST and
 DSD WavPack as DoP; the DAC must explicitly support DoP. The legacy
 `usb-exclusive-dop=yes` option remains compatible. `audio-spdif=native-dsd` plus
@@ -330,10 +340,11 @@ its existing PCM decoder output. Compressed DSD is unpacked losslessly before
 DoP/native framing, without a DSD-to-PCM step. PCM WavPack remains PCM.
 The current implementation supports mono
 and stereo integer PCM, direct UAC2 clocks and explicit asynchronous feedback;
-float decoded audio, implicit feedback and complex clock topologies are rejected.
+float decoded audio requires compatible mode; implicit feedback and complex
+clock topologies are rejected.
 
 The application must probe backend options before opening USB output, disable
-effects/rate conversion, retain its authorized descriptor during playback, and
+effects/rate conversion in strict mode, retain its authorized descriptor during playback, and
 keep normal AVSession/background playback management. No additional system
 shared-library dependency is introduced. USBManager availability does not imply
 usbfs transfer permission on every commercial device.
