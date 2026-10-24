@@ -14,6 +14,10 @@ if [ ! -f "$LIBMPV" ]; then
 fi
 
 elf_header=$("$READELF" -h "$LIBMPV")
+if ! "$STRINGS" "$LIBMPV" | grep -F '[OHCodecFormat] pixel=' >/dev/null; then
+  echo 'Missing OHCodec actual output format negotiation' >&2
+  exit 1
+fi
 if ! "$STRINGS" "$LIBMPV" | grep -F 'secondary-sub-scale' >/dev/null; then
   echo 'Missing independent secondary subtitle scale option' >&2
   exit 1

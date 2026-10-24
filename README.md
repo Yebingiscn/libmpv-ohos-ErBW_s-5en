@@ -124,6 +124,21 @@ a time. This keeps the zero-copy path short and prevents playback-speed changes
 from exhausting the decoder output pool. Spatial GPU shaders remain available;
 software-decoded video is unaffected and may still use temporal interpolation.
 
+Both OHCodec Surface paths identify hardware-frame depth from the decoder's
+actual `video_graphic_pixel_format` before consulting other hints. Explicit
+NV12/NV21 allocations remain 8-bit even when the input is AVC High 10; P010
+allocations remain 10-bit even if the generic `pixel_format` reports NV12.
+Older codecs that omit allocation information use an explicit 8/10-bit output
+hint first, then retain the existing input-profile compatibility fallback.
+Unsupported graphic formats are reported as errors instead of being labelled
+NV12/P010. `[OHCodecFormat]` logs identify the selected format and its source.
+This does not force AVC High 10 to software decoding or change color metadata.
+
+`scripts/verify-ohcodec-output-format.sh` compiles the patched format-selection
+and stream-change functions with mocked codec APIs, covering conflicting
+metadata and 8/10-bit output changes. Set `FFMPEG_SOURCE` to test another patched
+source tree. These host checks do not replace playback tests on a device.
+
 ## System video super resolution
 
 SDR-to-HDR takes priority over super resolution. When `ohos-sdr-to-hdr` is

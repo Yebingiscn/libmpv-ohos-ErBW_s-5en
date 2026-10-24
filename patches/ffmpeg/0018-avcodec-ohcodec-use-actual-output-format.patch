@@ -1,0 +1,197 @@
+diff --git a/libavcodec/ohdec.c b/libavcodec/ohdec.c
+--- a/libavcodec/ohdec.c
++++ b/libavcodec/ohdec.c
+@@ -39,6 +39,7 @@
+ #include "libavutil/imgutils.h"
+ #include "libavutil/mem.h"
+ #include "libavutil/opt.h"
++#include "libavutil/pixdesc.h"
+ #include "libavutil/refstruct.h"
+ #include "libavutil/thread.h"
+ 
+@@ -119,7 +120,6 @@
+     int stride;
+     int slice_height;
+     OH_AVPixelFormat pix_fmt;
+-    int bit_depth;
+ 
+     char *name;
+     int allow_sw;
+@@ -603,12 +603,103 @@
+     ff_cond_signal(&s->input_cond);
+ }
+ 
++static enum AVPixelFormat oh_decode_get_surface_format(AVCodecContext *avctx,
++                                                       OH_AVFormat *format,
++                                                       int pixel_format)
++{
++    enum AVPixelFormat sw_format = AV_PIX_FMT_NONE;
++    int32_t graphic_format = -1, output_bits = 0;
++    const char *source = "graphic";
++
++    // The codec's generic pixel_format can report NV12 even for P010.
++    // The graphic format describes the actual Surface allocation and wins
++    // over both coded bit depth and the compressed input profile.
++    if (OH_AVFormat_GetIntValue(format, "video_graphic_pixel_format",
++                               &graphic_format)) {
++        switch (graphic_format) {
++        case NATIVEBUFFER_PIXEL_FMT_YCBCR_420_SP:
++            sw_format = AV_PIX_FMT_NV12;
++            break;
++        case NATIVEBUFFER_PIXEL_FMT_YCRCB_420_SP:
++            sw_format = AV_PIX_FMT_NV21;
++            break;
++        case NATIVEBUFFER_PIXEL_FMT_YCBCR_420_P:
++            sw_format = AV_PIX_FMT_YUV420P;
++            break;
++        case NATIVEBUFFER_PIXEL_FMT_YCBCR_P010:
++        case NATIVEBUFFER_PIXEL_FMT_YCRCB_P010:
++            // Opaque Surface frames are never read as CPU planes. The
++            // external sampler resolves UV order; P010 conveys 10-bit depth.
++            sw_format = AV_PIX_FMT_P010;
++            break;
++        default:
++            av_log(avctx, AV_LOG_ERROR,
++                   "[OHCodecFormat] unsupported graphic format=%d pixel=%d\n",
++                   graphic_format, pixel_format);
++            return AV_PIX_FMT_NONE;
++        }
++    } else {
++        sw_format = pixel_format < 0 ? AV_PIX_FMT_OHCODEC
++                                    : ff_oh_pix_to_ff_pix(pixel_format);
++        if (sw_format != AV_PIX_FMT_NV12 && sw_format != AV_PIX_FMT_NV21 &&
++            sw_format != AV_PIX_FMT_YUV420P && sw_format != AV_PIX_FMT_OHCODEC) {
++            av_log(avctx, AV_LOG_ERROR,
++                   "[OHCodecFormat] unsupported surface pixel format=%d\n",
++                   pixel_format);
++            return AV_PIX_FMT_NONE;
++        }
++
++        bool has_output_bits =
++            OH_AVFormat_GetIntValue(format, OH_MD_KEY_BITS_PER_CODED_SAMPLE,
++                                   &output_bits) &&
++            (output_bits == 8 || output_bits == 10);
++        if (sw_format == AV_PIX_FMT_YUV420P) {
++            // Unlike NV12, I420 is not a known alias for 10-bit output.
++            if (has_output_bits && output_bits != 8) {
++                av_log(avctx, AV_LOG_ERROR,
++                       "[OHCodecFormat] incompatible I420 depth=%d\n",
++                       output_bits);
++                return AV_PIX_FMT_NONE;
++            }
++            source = "pixel";
++        } else {
++            source = "output-bits";
++            if (!has_output_bits) {
++                // Older codecs omit actual allocation/depth information.
++                // Retain their Main10/NV12 alias compatibility only when
++                // there is no authoritative output format to contradict it.
++                output_bits = avctx->bits_per_raw_sample > 8
++                            ? avctx->bits_per_raw_sample : 8;
++                if (avctx->profile == AV_PROFILE_HEVC_MAIN_10 ||
++                    avctx->profile == AV_PROFILE_H264_HIGH_10)
++                    output_bits = 10;
++                source = "input-hint";
++            }
++            if (output_bits != 8 && output_bits != 10) {
++                av_log(avctx, AV_LOG_ERROR,
++                       "[OHCodecFormat] unsupported surface depth=%d\n",
++                       output_bits);
++                return AV_PIX_FMT_NONE;
++            }
++            if (output_bits == 10)
++                sw_format = AV_PIX_FMT_P010;
++            else if (sw_format == AV_PIX_FMT_OHCODEC)
++                sw_format = AV_PIX_FMT_NV12;
++        }
++    }
++
++    av_log(avctx, AV_LOG_INFO,
++           "[OHCodecFormat] pixel=%d graphic=%d sw=%s source=%s\n",
++           pixel_format, graphic_format, av_get_pix_fmt_name(sw_format), source);
++    return sw_format;
++}
++
+ static void oh_decode_on_stream_changed(OH_AVCodec *codec, OH_AVFormat *format,
+                                         void *userdata)
+ {
+     AVCodecContext *avctx = userdata;
+     OHCodecDecContext *s = avctx->priv_data;
+-    int32_t n, graphic_format;
++    int32_t n;
+     double d;
+ 
+     if (!OH_AVFormat_GetIntValue(format, OH_MD_KEY_VIDEO_PIC_WIDTH, &s->width) ||
+@@ -629,54 +720,28 @@
+         goto out;
+     }
+ 
+-    s->bit_depth = avctx->bits_per_raw_sample > 8 ? avctx->bits_per_raw_sample : 8;
+-    if (avctx->profile == AV_PROFILE_HEVC_MAIN_10 ||
+-        avctx->profile == AV_PROFILE_H264_HIGH_10)
+-        s->bit_depth = 10;
+-    if (OH_AVFormat_GetIntValue(format, OH_MD_KEY_BITS_PER_CODED_SAMPLE, &n) && n > 0)
+-        s->bit_depth = n;
+-    // Surface output reports its actual allocation format separately from
+-    // OH_MD_KEY_PIXEL_FORMAT (which remains NV12 for P010 on current codecs).
+-    // This key is present in the decoder's output description on API 20.
+-    if (OH_AVFormat_GetIntValue(format, "video_graphic_pixel_format",
+-                                &graphic_format) &&
+-        (graphic_format == NATIVEBUFFER_PIXEL_FMT_YCBCR_P010 ||
+-         graphic_format == NATIVEBUFFER_PIXEL_FMT_YCRCB_P010))
+-        s->bit_depth = 10;
+-
+-    if (OH_AVFormat_GetIntValue(format, OH_MD_KEY_PIXEL_FORMAT, &n)) {
+-        enum AVPixelFormat sw_format;
+-
+-        s->pix_fmt = n;
+-        /* When use output_to_window, the returned format is the memory
+-         * layout of hardware frame, not AV_PIXEL_FORMAT_SURFACE_FORMAT as
+-         * expected.
+-         */
+-        if (s->output_to_window) {
+-            avctx->pix_fmt = AV_PIX_FMT_OHCODEC;
+-            sw_format = s->bit_depth > 8 ? AV_PIX_FMT_P010 : AV_PIX_FMT_NV12;
+-            avctx->sw_pix_fmt = sw_format;
+-            if (oh_decode_init_hwframes(s, avctx, sw_format) < 0) {
+-                av_log(avctx, AV_LOG_ERROR,
+-                       "Failed to initialize OHCodec hardware frames\n");
+-                goto out;
+-            }
+-        } else {
+-            avctx->pix_fmt = ff_oh_pix_to_ff_pix(s->pix_fmt);
+-        }
+-        // Check whether this pixel format is supported
+-        if (avctx->pix_fmt == AV_PIX_FMT_NONE) {
+-            av_log(avctx, AV_LOG_ERROR, "Unsupported OH_AVPixelFormat %d\n",
+-                   n);
++    if (s->output_to_window) {
++        int32_t pixel_format = -1;
++        OH_AVFormat_GetIntValue(format, OH_MD_KEY_PIXEL_FORMAT, &pixel_format);
++        enum AVPixelFormat sw_format =
++            oh_decode_get_surface_format(avctx, format, pixel_format);
++        if (sw_format == AV_PIX_FMT_NONE)
+             goto out;
+-        }
+-    } else if (s->output_to_window) {
+-        enum AVPixelFormat sw_format = s->bit_depth > 8
+-                                     ? AV_PIX_FMT_P010 : AV_PIX_FMT_NV12;
++
+         avctx->pix_fmt = AV_PIX_FMT_OHCODEC;
+         avctx->sw_pix_fmt = sw_format;
+-        if (oh_decode_init_hwframes(s, avctx, sw_format) < 0)
++        if (oh_decode_init_hwframes(s, avctx, sw_format) < 0) {
++            av_log(avctx, AV_LOG_ERROR,
++                   "Failed to initialize OHCodec hardware frames\n");
+             goto out;
++        }
++    } else if (OH_AVFormat_GetIntValue(format, OH_MD_KEY_PIXEL_FORMAT, &n)) {
++        s->pix_fmt = n;
++        avctx->pix_fmt = ff_oh_pix_to_ff_pix(s->pix_fmt);
++        if (avctx->pix_fmt == AV_PIX_FMT_NONE) {
++            av_log(avctx, AV_LOG_ERROR, "Unsupported OH_AVPixelFormat %d\n", n);
++            goto out;
++        }
+     } else {
+         av_log(avctx, AV_LOG_ERROR, "Failed to get pixel format\n");
+         goto out;
