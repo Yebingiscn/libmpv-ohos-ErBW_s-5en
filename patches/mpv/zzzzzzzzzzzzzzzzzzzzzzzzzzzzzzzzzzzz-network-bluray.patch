@@ -1,0 +1,234 @@
+diff --git a/options/options.h b/options/options.h
+--- a/options/options.h
++++ b/options/options.h
+@@ -165,6 +165,7 @@ struct mp_osd_render_opts {
+ 
+ struct mp_bluray_opts {
+     char *bluray_device;
++    char *bluray_network_root;
+     int angle;
+ };
+ 
+diff --git a/stream/stream_bluray.c b/stream/stream_bluray.c
+--- a/stream/stream_bluray.c
++++ b/stream/stream_bluray.c
+@@ -49,6 +49,7 @@
+ #include "sub/osd.h"
+ #include "sub/img_convert.h"
+ #include "video/mp_image.h"
++#include "bluray_network.h"
+ 
+ #define BLURAY_SECTOR_SIZE     6144
+ 
+@@ -78,6 +79,7 @@
+ const struct m_sub_options stream_bluray_conf = {
+     .opts = (const struct m_option[]) {
+         {"device", OPT_STRING(bluray_device), .flags = M_OPT_FILE},
++        {"network-root", OPT_STRING(bluray_network_root)},
+         {"angle", OPT_INT(angle), M_RANGE(1, 999)},
+         {0},
+     },
+@@ -437,7 +439,9 @@ static int bluray_stream_open_internal(stream_t *s)
+ 
+     /* open device */
+     char *device_tmp = mp_get_user_path(NULL, s->global, device);
+-    BLURAY *bd = bd_open(device_tmp, NULL);
++    const char *network_root = b->opts->bluray_network_root;
++    BLURAY *bd = network_root && network_root[0] ?
++        bd_network_open(s, device_tmp, network_root) : bd_open(device_tmp, NULL);
+     talloc_free(device_tmp);
+     if (!bd) {
+         MP_ERR(s, "Couldn't open Blu-ray device: %s\n", device);
+@@ -445,6 +449,10 @@ static int bluray_stream_open_internal(stream_t *s)
+         goto err;
+     }
+     b->bd = bd;
++    if (network_root && network_root[0]) {
++        s->streaming = true;
++        s->is_network = true;
++    }
+ 
+     if (!check_disc_info(s)) {
+         ret = STREAM_UNSUPPORTED;
+diff --git a/stream/bluray_network.h b/stream/bluray_network.h
+new file mode 100644
+--- /dev/null
++++ b/stream/bluray_network.h
+@@ -0,0 +1,177 @@
++/* Network-backed Blu-ray clips with local navigation metadata.
++ * Copyright (C) 2026 mpv contributors
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ */
++#include <dirent.h>
++#include <errno.h>
++#include <limits.h>
++#include <stdlib.h>
++#include <libbluray/filesystem.h>
++#include <libavformat/avio.h>
++#include <libavutil/dict.h>
++#include <libavutil/error.h>
++#include "misc/thread_tools.h"
++#include "osdep/io.h"
++
++struct bd_network {
++    struct stream *parent;
++    char *local_root;
++    char *remote_root;
++    AVDictionary *options;
++};
++struct bd_network_file {
++    BD_FILE_H api;
++    FILE *local;
++    AVIOContext *remote;
++};
++
++static bool bd_safe_relative(const char *path)
++{
++    if (!path || path[0] == '/' || strchr(path, '\\')) return false;
++    for (const char *p = path; *p;) {
++        const char *end = strchr(p, '/');
++        size_t len = end ? end - p : strlen(p);
++        if (!len || (len == 1 && p[0] == '.') ||
++            (len == 2 && p[0] == '.' && p[1] == '.')) return false;
++        p += len + (end != NULL);
++    }
++    return true;
++}
++
++static bool bd_network_clip(const char *path)
++{
++    if (strlen(path) != 22 || strncmp(path, "BDMV/STREAM/", 12) ||
++        strcmp(path + 17, ".m2ts")) return false;
++    for (int n = 12; n < 17; n++) if (path[n] < '0' || path[n] > '9') return false;
++    return true;
++}
++
++static int bd_network_cancel(void *opaque)
++{
++    struct bd_network *ctx = opaque;
++    return mp_cancel_test(ctx->parent->cancel);
++}
++
++static void bd_network_file_close(BD_FILE_H *handle)
++{
++    struct bd_network_file *f = (void *)handle;
++    if (f->local) fclose(f->local);
++    if (f->remote) avio_closep(&f->remote);
++    free(f);
++}
++
++static int64_t bd_network_tell(BD_FILE_H *handle)
++{
++    struct bd_network_file *f = (void *)handle;
++    return f->remote ? avio_tell(f->remote) : ftello(f->local);
++}
++
++static int64_t bd_network_seek(BD_FILE_H *handle, int64_t offset, int32_t origin)
++{
++    struct bd_network_file *f = (void *)handle;
++    if (origin != SEEK_SET && origin != SEEK_CUR && origin != SEEK_END) return -1;
++    if (f->remote) return avio_seek(f->remote, offset, origin);
++    return fseeko(f->local, offset, origin) == 0 ? ftello(f->local) : -1;
++}
++
++static int64_t bd_network_read(BD_FILE_H *handle, uint8_t *buffer, int64_t count)
++{
++    struct bd_network_file *f = (void *)handle;
++    if (count < 0 || count > INT_MAX) return -1;
++    if (!count) return 0;
++    if (f->remote) {
++        int result = avio_read(f->remote, buffer, count);
++        return result == AVERROR_EOF ? 0 : result;
++    }
++    size_t result = fread(buffer, 1, count, f->local);
++    return result || !ferror(f->local) ? (int64_t)result : -1;
++}
++
++static BD_FILE_H *bd_network_open_file(void *opaque, const char *path)
++{
++    struct bd_network *ctx = opaque;
++    if (!bd_safe_relative(path) || bd_network_cancel(ctx)) return NULL;
++    struct bd_network_file *f = calloc(1, sizeof(*f));
++    if (!f) return NULL;
++    f->api = (BD_FILE_H){.close = bd_network_file_close, .seek = bd_network_seek,
++                        .tell = bd_network_tell, .read = bd_network_read};
++    if (bd_network_clip(path)) {
++        char *url = talloc_asprintf(NULL, "%s%s", ctx->remote_root, path);
++        AVDictionary *options = NULL;
++        av_dict_copy(&options, ctx->options, 0);
++        AVIOInterruptCB cancel = {.callback = bd_network_cancel, .opaque = ctx};
++        int result = avio_open2(&f->remote, url, AVIO_FLAG_READ, &cancel, &options);
++        av_dict_free(&options);
++        talloc_free(url);
++        if (result < 0 || !(f->remote->seekable & AVIO_SEEKABLE_NORMAL)) {
++            MP_ERR(ctx->parent, "Network Blu-ray clip open/seek failed (code=%d).\n", result);
++            bd_network_file_close(&f->api);
++            return NULL;
++        }
++    } else {
++        char *local = talloc_asprintf(NULL, "%s/%s", ctx->local_root, path);
++        f->local = fopen(local, "rb");
++        talloc_free(local);
++        if (!f->local) { free(f); return NULL; }
++    }
++    return &f->api;
++}
++
++static void bd_network_dir_close(BD_DIR_H *dir)
++{
++    closedir(dir->internal);
++    free(dir);
++}
++
++static int bd_network_dir_read(BD_DIR_H *dir, BD_DIRENT *entry)
++{
++    errno = 0;
++    struct dirent *item = readdir(dir->internal);
++    if (!item) return errno ? -1 : 1;
++    if (strlen(item->d_name) >= sizeof(entry->d_name)) return -1;
++    strcpy(entry->d_name, item->d_name);
++    return 0;
++}
++
++static BD_DIR_H *bd_network_open_dir(void *opaque, const char *path)
++{
++    struct bd_network *ctx = opaque;
++    if (!bd_safe_relative(path) || bd_network_cancel(ctx)) return NULL;
++    char *local = talloc_asprintf(NULL, "%s/%s", ctx->local_root, path);
++    DIR *dir = opendir(local);
++    talloc_free(local);
++    if (!dir) return NULL;
++    BD_DIR_H *handle = calloc(1, sizeof(*handle));
++    if (!handle) { closedir(dir); return NULL; }
++    *handle = (BD_DIR_H){.internal = dir, .read = bd_network_dir_read, .close = bd_network_dir_close};
++    return handle;
++}
++
++static void bd_network_free(void *opaque)
++{
++    struct bd_network *ctx = opaque;
++    av_dict_free(&ctx->options);
++}
++
++static BLURAY *bd_network_open(struct stream *s, const char *local, const char *remote)
++{
++    if ((strncmp(remote, "http://", 7) && strncmp(remote, "https://", 8)) ||
++        strpbrk(remote, "@?#\r\n") || remote[strlen(remote) - 1] != '/') return NULL;
++    struct bd_network *ctx = talloc_zero(s, struct bd_network);
++    talloc_set_destructor(ctx, bd_network_free);
++    ctx->parent = s;
++    ctx->local_root = talloc_strdup(ctx, local);
++    ctx->remote_root = talloc_strdup(ctx, remote);
++    mp_setup_av_network_options(&ctx->options, NULL, s->global, s->log);
++    // A WebDAV endpoint may return redirects for individual clips. Do not forward credentials.
++    av_dict_set(&ctx->options, "max_redirects", "0", 0);
++    av_dict_set(&ctx->options, "protocol_whitelist", "http,https,tcp,tls", 0);
++    av_dict_set(&ctx->options, "rw_timeout", "15000000", 0);
++    av_dict_set(&ctx->options, "timeout", "15000000", 0);
++    BLURAY *bd = bd_init();
++    if (bd && !bd_open_files(bd, ctx, bd_network_open_dir, bd_network_open_file)) {
++        bd_close(bd);
++        bd = NULL;
++    }
++    return bd;
++}

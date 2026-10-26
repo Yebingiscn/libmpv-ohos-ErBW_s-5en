@@ -22,6 +22,25 @@ the final binary check also requires the `ohaudiosuite-hoa` feature.
 
 Scripts are compatible with macOS, Linux and WSL, Windows is not supported.
 
+### Network Blu-ray folders
+
+The optional `bluray-network-root` option accepts an HTTP(S) directory URL ending
+in `/`. `bluray-device` points at an application-owned local cache containing
+`BDMV/index.bdmv`, `BDMV/PLAYLIST/*.mpls` and `BDMV/CLIPINF/*.clpi`.
+The application downloads navigation files only; `BDMV/STREAM/00000.m2ts` files
+are opened on demand through FFmpeg's seekable HTTP reader. SMB uses the app's
+loopback directory proxy, while WebDAV uses the configured server and session
+headers. The existing libbluray title selection, chapter and multi-clip timeline
+remain in use. This does not add Blu-ray menus, BD-J or encrypted-disc support.
+
+Network requests are cancelled with their MPV stream, use bounded timeouts and
+disable redirects to avoid forwarding WebDAV authorization to another endpoint.
+Clear `bluray-network-root` before loading ordinary files or local discs.
+An app using this option must report unsupported older cores instead of falling
+back to opening `index.bdmv` as a video. This adapter adds no system-library dependency.
+`scripts/verify-network-bluray.sh` checks the patched sources and FFmpeg redirect
+option; `verify.sh` checks that the adapter is present in the final library.
+
 This tree is based on the `20260715` mpv-arkts binary baseline and pins
 `ErBWs/mpv` to commit `6edeee00a07b9b76f197aa71eee3d029fb090de4`.
 

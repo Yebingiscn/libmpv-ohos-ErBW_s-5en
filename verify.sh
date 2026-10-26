@@ -14,6 +14,10 @@ if [ ! -f "$LIBMPV" ]; then
 fi
 
 elf_header=$("$READELF" -h "$LIBMPV")
+if ! "$STRINGS" "$LIBMPV" | grep -F 'Network Blu-ray clip open/seek failed' >/dev/null; then
+  echo 'Missing network Blu-ray file access adapter' >&2
+  exit 1
+fi
 if ! "$STRINGS" "$LIBMPV" | grep -F '[OHCodecFormat] pixel=' >/dev/null; then
   echo 'Missing OHCodec actual output format negotiation' >&2
   exit 1
