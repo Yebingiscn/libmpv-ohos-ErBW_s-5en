@@ -92,4 +92,10 @@ grep -Fx "CC=fixture-clang --target=$TARGET_TRIPLE" "$CHECK_DIR/.sweetvideo-make
 grep -Fx "CFLAGS=$MAKE_LTO_CFLAGS" "$CHECK_DIR/.sweetvideo-make-lto-inputs" >/dev/null
 grep -Fx "LDFLAGS=$MAKE_LTO_LDFLAGS" "$CHECK_DIR/.sweetvideo-make-lto-inputs" >/dev/null
 grep -Fx "AR=fixture-llvm-ar rcu" "$CHECK_DIR/.sweetvideo-make-lto-inputs" >/dev/null
+# The SDK ABI fixture also exercises this mode. Do not reintroduce a later
+# nghttp3-specific STATIC_LIBRARY override that hides layout markers in IR.
+grep -F -- '-DCMAKE_TRY_COMPILE_TARGET_TYPE=EXECUTABLE' scripts/nghttp3.sh >/dev/null
+if grep -Eq '^[[:space:]]*-DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY' scripts/nghttp3.sh; then
+  echo 'nghttp3 must link CMake ABI probes when using ThinLTO' >&2; exit 1
+fi
 echo 'ThinLTO defaults, resource bounds, Make inputs and mixed-cache guards passed'

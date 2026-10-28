@@ -50,6 +50,10 @@ its own repository; this bundle does not build or package that wrapper.
 All bitcode/archive/link tools come from the selected SDK. A small target
 compile/archive/ranlib/LLD link probe checks module summaries and actual
 cross-module inlining before each participating component is configured.
+The bundle also tests CMake's linked ABI probes: target executables are linked,
+never executed, so byte order, pointer size and `ssize_t` remain detectable with
+ThinLTO. nghttp3 rejects old static-only probe caches; use a fresh checkout after
+a failed build with the older settings rather than reusing incomplete ABI data.
 `MPV_LTO_JOBS` bounds backend link parallelism (default `4`, allowed `1`–`64`).
 `verify.sh` checks effective build settings and installed bitcode archives,
 including the exact FFmpeg HEVC core object, Meson compile/link options, final
