@@ -2,8 +2,11 @@
 set -euo pipefail
 ROOT_DIR=$(cd "$(dirname "$0")/.."; pwd)
 . "$ROOT_DIR/env.sh"
+. "$ROOT_DIR/scripts/build-lto.sh"
 test "${1:-}" = build
+prepare_lto_build nghttp3 "$ROOT_DIR/libmpv/nghttp3/.build"
 cmake -S "$ROOT_DIR/libmpv/nghttp3" -B "$ROOT_DIR/libmpv/nghttp3/.build" \
+  "${CMAKE_LTO_ARGS[@]}" \
   -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR="$FFMPEG_ARCH" \
   -DCMAKE_C_COMPILER="$OHOS_NDK_HOME/native/llvm/bin/clang" \

@@ -1,0 +1,44 @@
+# mpv/libplacebo strong imports from SweetVideo's ARM64 libmpvnative.so.
+# These remain public across the two independently linked shared libraries.
+# Extend when the native wrapper adds API imports; N-API names are unrelated.
+mpv_command
+mpv_command_async
+mpv_command_ret
+mpv_create
+mpv_create_weak_client
+mpv_destroy
+mpv_error_string
+mpv_event_name
+mpv_free
+mpv_free_node_contents
+mpv_get_property
+mpv_get_property_string
+mpv_initialize
+mpv_load_config_file
+mpv_observe_property
+mpv_request_log_messages
+mpv_set_option
+mpv_set_option_string
+mpv_set_property
+mpv_set_property_async
+mpv_set_property_string
+mpv_terminate_destroy
+mpv_unobserve_property
+mpv_wait_event
+mpv_wakeup
+pl_bit_encoding_equal
+pl_color_system_guess_ycbcr
+pl_color_system_is_ycbcr_like
+pl_find_fourcc
+pl_fmt_has_modifier
+pl_frame_set_chroma_location
+pl_hdr_rescale
+pl_icc_profile_compute_signature
+pl_plane_data_align
+pl_plane_data_from_comps
+pl_recreate_plane
+pl_tex_create
+pl_tex_destroy
+pl_tex_download
+pl_tex_poll
+pl_upload_plane

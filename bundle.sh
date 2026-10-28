@@ -9,4 +9,4 @@ set -eu
 
 . ./env.sh
 cd "$DEST"
-zip "libmpv_$ARCHIVE_ARCH.zip" libmpv.so
+zip "libmpv_$ARCHIVE_ARCH.zip" libmpv.so build-optimization.json

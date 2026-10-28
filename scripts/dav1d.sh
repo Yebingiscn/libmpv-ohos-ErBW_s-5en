@@ -5,6 +5,7 @@ set -eu
 ROOT_DIR=$(cd $(dirname "$0")/..; pwd)
 
 . $ROOT_DIR/env.sh
+. "$ROOT_DIR/scripts/build-lto.sh"
 
 pushd $ROOT_DIR/libmpv/dav1d
 
@@ -17,13 +18,13 @@ else
 	exit 1
 fi
 
-mkdir -p .build
+prepare_lto_build dav1d "$PWD/.build"
 cd .build
 
 meson setup .. \
   --cross-file "$CROSS_FILE" \
   --prefix=$DEST \
-  -Db_lto=true \
+  "${MESON_LTO_ARGS[@]}" \
   -Denable_tests=false \
   -Denable_tools=false
 ninja -j$CORES

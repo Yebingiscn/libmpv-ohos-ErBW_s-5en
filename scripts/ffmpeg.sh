@@ -5,6 +5,7 @@ set -eu
 ROOT_DIR=$(cd $(dirname "$0")/..; pwd)
 
 . $ROOT_DIR/env.sh
+. "$ROOT_DIR/scripts/build-lto.sh"
 
 pushd $ROOT_DIR/libmpv/ffmpeg
 
@@ -17,7 +18,7 @@ else
 	exit 1
 fi
 
-mkdir -p .build
+prepare_lto_build FFmpeg "$PWD/.build"
 cd .build
 
 ../configure \
@@ -34,8 +35,14 @@ cd .build
   \
   --enable-cross-compile \
   --cc="$CC" \
+  --ld="$CC" \
+  --ar="$AR" \
+  --ranlib="$RANLIB" \
+  --nm="$NM" \
+  --optflags=-O3 \
+  "${FFMPEG_LTO_ARGS[@]}" \
   --extra-cflags="-I$DEST/include" \
-  --extra-ldflags="-L$DEST/lib" \
+  --extra-ldflags="-L$DEST/lib $FFMPEG_LTO_LDFLAGS" \
   --enable-libdav1d \
   --enable-mbedtls \
   --enable-ohos-http3 \

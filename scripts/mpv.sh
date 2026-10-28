@@ -5,6 +5,7 @@ set -eu
 ROOT_DIR=$(cd $(dirname "$0")/..; pwd)
 
 . $ROOT_DIR/env.sh
+. "$ROOT_DIR/scripts/build-lto.sh"
 
 pushd $ROOT_DIR/libmpv/mpv
 
@@ -17,7 +18,7 @@ else
 	exit 1
 fi
 
-mkdir -p .build
+prepare_lto_build mpv "$PWD/.build"
 cd .build
 
 meson setup .. \
@@ -25,6 +26,7 @@ meson setup .. \
   --prefix=$DEST/mpv \
   --default-library shared \
   --strip \
+  "${MPV_LTO_ARGS[@]}" \
   -Dopensles=disabled \
   -Dohos=enabled \
   -Degl-ohos=enabled \

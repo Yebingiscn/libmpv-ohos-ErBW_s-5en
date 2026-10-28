@@ -5,6 +5,7 @@ set -eu
 ROOT_DIR=$(cd $(dirname "$0")/..; pwd)
 
 . $ROOT_DIR/env.sh
+. "$ROOT_DIR/scripts/build-lto.sh"
 
 pushd $ROOT_DIR/libmpv/shaderc
 
@@ -17,10 +18,11 @@ else
 	exit 1
 fi
 
-mkdir -p .build
+prepare_lto_build shaderc "$PWD/.build"
 cd .build
 
 cmake -L \
+  "${CMAKE_LTO_ARGS[@]}" \
   -DOHOS_ARCH="$OHOS_ARCH" \
   -DCMAKE_TOOLCHAIN_FILE=$OHOS_NDK_HOME/native/build/cmake/ohos.toolchain.cmake \
   -DBUILD_SHARED_LIBS=OFF \

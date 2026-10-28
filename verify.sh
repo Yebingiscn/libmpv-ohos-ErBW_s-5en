@@ -54,6 +54,19 @@ for symbol in mpv_create ohos_osd_set_global_surface; do
   fi
 done
 
+# The native wrapper uses FFmpeg, mpv and libplacebo entry points through
+# libmpv. Retain all of these across the shared-library boundary, not only
+# entry points referenced inside mpv itself.
+for manifest in app-ffmpeg-exports.txt app-native-exports.txt; do
+  while IFS= read -r symbol; do
+    case "$symbol" in ''|'#'*) continue ;; esac
+    if ! grep -Eq "[[:space:]]$symbol(@.*)?$" <<< "$symbols"; then
+      echo "Missing application native API after final link: $symbol ($manifest)" >&2
+      exit 1
+    fi
+  done < "$ROOT_DIR/scripts/$manifest"
+done
+
 dynamic_section=$("$READELF" -d "$LIBMPV")
 workgroup_imports=$("$NM" -D --undefined-only "$LIBMPV")
 if grep -Eq '[[:space:]](OH_AudioWorkgroup_[A-Za-z0-9_]+|OH_AudioResourceManager_(Create|Release)Workgroup|OH_AudioManager_GetAudioResourceManager)(@.*)?$' <<< "$workgroup_imports"; then
@@ -275,6 +288,7 @@ if ! "$STRINGS" "$LIBMPV" | grep -F \
 fi
 echo "$configuration"
 grep -E "NEEDED|SONAME" <<< "$dynamic_section"
+python3 "$ROOT_DIR/scripts/verify-build-lto.py" "$ROOT_DIR" "$DEST" "$MPV_BUILD_ARCH"
 if command -v sha256sum >/dev/null 2>&1; then
   sha256sum "$LIBMPV"
 else

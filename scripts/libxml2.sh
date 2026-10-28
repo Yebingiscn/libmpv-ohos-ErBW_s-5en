@@ -5,6 +5,7 @@ set -eu
 ROOT_DIR=$(cd $(dirname "$0")/..; pwd)
 
 . $ROOT_DIR/env.sh
+. "$ROOT_DIR/scripts/build-lto.sh"
 
 pushd $ROOT_DIR/libmpv/libxml2
 
@@ -17,12 +18,13 @@ else
 	exit 1
 fi
 
-mkdir -p .build
+prepare_lto_build libxml2 "$PWD/.build"
 cd .build
 
 meson setup .. \
   --cross-file "$CROSS_FILE" \
   --prefix=$DEST \
+  "${MESON_LTO_ARGS[@]}" \
   -Ddocs=disabled \
   -Dzlib=enabled \
   -Dsax1=enabled

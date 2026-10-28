@@ -6,6 +6,10 @@ ROOT_DIR=$(cd $(dirname "$0")/..; pwd)
 
 . $ROOT_DIR/env.sh
 
+# Explicit ThinLTO exception: Rust stays on its own release/staticlib path.
+# Do not pass C/C++ -flto=thin or linker-plugin-lto here without matching the
+# Rust compiler's LLVM to the OHOS SDK. Host proc-macros must remain host code.
+
 pushd $ROOT_DIR/libmpv/dovi_tools/dolby_vision
 
 if [ "$1" == "build" ]; then

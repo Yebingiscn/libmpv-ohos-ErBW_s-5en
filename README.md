@@ -22,6 +22,53 @@ the final binary check also requires the `ohaudiosuite-hoa` feature.
 
 Scripts are compatible with macOS, Linux and WSL, Windows is not supported.
 
+### Default native C/C++ ThinLTO
+
+`MPV_BUILD_ARCH=arm64 ./bundle.sh` always builds the self-built target C/C++
+components with ThinLTO: FFmpeg (including the HEVC software decoder), mpv,
+dav1d, Mbed TLS, nghttp3, the DVD/Blu-ray/archive libraries, libxml2,
+libass and its font dependencies, lcms, shaderc and its C/C++ dependencies,
+libplacebo, and Lua. Meson, CMake and Make receive their own explicit compile,
+archive and link settings; there is no enable/disable switch or silent fallback
+to a non-LTO build. CI uses the same default build.
+Use a fresh, separate checkout for each architecture. Switching the SDK path
+or reusing untracked old build caches is rejected; the scripts never
+delete/rebuild unknown cached objects on the user's behalf.
+
+The build retains `-O3`, assembly/NEON and normal bitstream safety. There is no
+fast-math, unsafe decoder flag, PGO, CPU-specific device tuning or new runtime
+dependency. ThinLTO is not exported through global CFLAGS to Rust or host-side
+tests/tools. Rust's `dovi_tools` keeps its existing release static-library build:
+cross-language LTO requires a separately matched rustc/LLVM toolchain. System
+libraries and prebuilt binaries remain native code, and hand-written NEON/NASM
+assembly is not rewritten into bitcode. These native objects can still link
+with the ThinLTO objects. Optimization can cross participating static-library
+boundaries at the final libmpv link, but not an already-linked shared-library
+boundary. The application's separate `libmpvnative.so` build is maintained in
+its own repository; this bundle does not build or package that wrapper.
+
+All bitcode/archive/link tools come from the selected SDK. A small target
+compile/archive/ranlib/LLD link probe checks module summaries and actual
+cross-module inlining before each participating component is configured.
+`MPV_LTO_JOBS` bounds backend link parallelism (default `4`, allowed `1`–`64`).
+`verify.sh` checks effective build settings and installed bitcode archives,
+including the exact FFmpeg HEVC core object, Meson compile/link options, final
+exported FFmpeg APIs and existing optional-library protections.
+`scripts/app-ffmpeg-exports.txt` lists the wrapper's required decoder, frame,
+demuxer, IO and swscale exports; `scripts/app-native-exports.txt` covers its mpv
+and libplacebo imports. Update these when the wrapper's imported APIs change.
+The archive includes `build-optimization.json`, which records ThinLTO verification
+and the verified final ELF's SHA-256; an environment flag or a string in an old
+library alone is not evidence that ThinLTO was used.
+
+This changes build scripts only until a complete Linux/macOS/WSL build succeeds
+and its library is installed into the application. A Windows SDK probe is not
+a full FFmpeg/mpv build. Device decode performance and regressions still need
+measurement; ThinLTO does not guarantee a fixed screenshot speedup. Cross-module
+inlining may make debugging harder, and target links can take more time and
+memory, especially for shaderc/SPIRV. No minimum device API or CPU baseline is
+raised by this build policy.
+
 ### Network Blu-ray folders
 
 The optional `bluray-network-root` option accepts an HTTP(S) directory URL ending

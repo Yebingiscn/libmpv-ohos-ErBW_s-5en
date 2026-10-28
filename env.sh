@@ -53,3 +53,15 @@ export STRINGS=$OHOS_NDK_HOME/native/llvm/bin/llvm-strings
 export AR=$OHOS_NDK_HOME/native/llvm/bin/llvm-ar
 export CFLAGS='-fPIC -D__MUSL__=1'
 export CXXFLAGS='-fPIC -D__MUSL__=1'
+
+# Self-built target C/C++ components always use ThinLTO via build-lto.sh.
+# Keep flags scoped to their build systems, not Rust or host-side test tools.
+# This controls build-resource use, not whether ThinLTO is enabled.
+export MPV_LTO_JOBS=${MPV_LTO_JOBS:-4}
+case "$MPV_LTO_JOBS" in
+  ''|*[!0-9]*) echo 'MPV_LTO_JOBS must be an integer from 1 to 64' >&2; exit 1 ;;
+esac
+if [ "$MPV_LTO_JOBS" -lt 1 ] || [ "$MPV_LTO_JOBS" -gt 64 ]; then
+  echo 'MPV_LTO_JOBS must be an integer from 1 to 64' >&2
+  exit 1
+fi
