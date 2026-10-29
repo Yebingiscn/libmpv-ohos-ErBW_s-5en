@@ -53,4 +53,20 @@ for line in C_BYTE_ORDER=LITTLE_ENDIAN CXX_BYTE_ORDER=LITTLE_ENDIAN C_ABI=ELF CX
 done
 magic=$(od -An -tx1 -N4 "$CHECK_DIR/linked/CMakeFiles/abi_bitcode.dir/entry.c.o" | tr -d '[:space:]')
 test "$magic" = 4243c0de
+
+# Exercise the production verifier against a real generated CMakeCache, not
+# only a simplified unit-test cache. This runs before the expensive full build.
+"${MPV_TEST_PYTHON:-python3}" - "$ROOT_DIR" "$CHECK_DIR/linked" "$TRIPLE" <<'PY'
+import importlib.util
+import pathlib
+import sys
+
+sys.dont_write_bytecode = True
+root, build = map(pathlib.Path, sys.argv[1:3])
+spec = importlib.util.spec_from_file_location("lto_verify", root / "scripts/verify-build-lto.py")
+verify = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(verify)
+count = verify.verify_cmake(build, "CMake ABI fixture", sys.argv[3])
+print("Production CMake ThinLTO verifier passed on generated cache (" + str(count) + " target sources)")
+PY
 echo "CMake ThinLTO ABI regression passed: $TRIPLE (linked probes, target bitcode retained)"

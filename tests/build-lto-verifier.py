@@ -58,6 +58,27 @@ class VerifyLto(unittest.TestCase):
             commands = [{"file": "client.c", "command": "clang --target=" + triple + " -O3 -flto=thin -c client.c"}]
         (build / "compile_commands.json").write_text(json.dumps(commands), encoding="utf-8")
 
+    def cmake_cache_fixture(self, newline="\n"):
+        # Match CMake's generated format, not just three adjacent records:
+        # the old multiline regex consumed blank lines and // help into keys.
+        return newline.join((
+            "# This is the CMakeCache file.",
+            "# KEY:TYPE=VALUE",
+            "",
+            "########################",
+            "# EXTERNAL cache entries",
+            "########################",
+            "",
+            "//Flags used by the C compiler during all build types.",
+            "CMAKE_C_FLAGS:STRING=-fPIC -flto=thin",
+            "",
+            "//Path to a program.",
+            "CMAKE_AR:FILEPATH=/sdk/llvm-ar",
+            "",
+            "//Generate index for LLVM archive.",
+            "CMAKE_RANLIB:FILEPATH=/sdk/llvm-ranlib",
+            ""))
+
     def configure_dependencies(self):
         for name, archives in verify.MESON_ARCHIVES.items():
             build = self.root / "libmpv" / name / ".build"
@@ -71,7 +92,7 @@ class VerifyLto(unittest.TestCase):
             build = self.root / "libmpv" / name / ".build"
             build.mkdir(parents=True)
             (build / "CMakeCache.txt").write_text(
-                "CMAKE_C_FLAGS:STRING=-fPIC -flto=thin\nCMAKE_AR:FILEPATH=/sdk/llvm-ar\nCMAKE_RANLIB:FILEPATH=/sdk/llvm-ranlib\n", encoding="utf-8")
+                self.cmake_cache_fixture(), encoding="utf-8")
             self.save_commands(build)
             for archive in archives:
                 self.save_archive(self.bitcode, archive)
@@ -208,6 +229,90 @@ class VerifyLto(unittest.TestCase):
                 cache.write_text(original.replace(old, new))
                 with self.assertRaises(SystemExit): self.run_verify()
                 cache.write_text(original)
+
+    def test_real_cmake_comments_and_blank_lines_accept_lf_and_crlf(self):
+        expected = {"CMAKE_C_FLAGS": "-fPIC -flto=thin",
+                    "CMAKE_AR": "/sdk/llvm-ar", "CMAKE_RANLIB": "/sdk/llvm-ranlib"}
+        for newline in ("\n", "\r\n"):
+            with self.subTest(newline=repr(newline)):
+                text = self.cmake_cache_fixture(newline)
+                self.assertEqual(verify.parse_cmake_cache(text), expected)
+                # Exercise the file reader and the full verification path too.
+                for name in verify.CMAKE_ARCHIVES:
+                    cache = self.root / "libmpv" / name / ".build/CMakeCache.txt"
+                    cache.write_bytes(text.encode("utf-8"))
+                self.run_verify()
+
+    def test_cmake_cache_preserves_empty_values_and_value_equals(self):
+        text = ("# Entries below contain values, not further records.\n\n"
+                "CMAKE_C_FLAGS:STRING=-DPAIR=left=right -flto=thin\n"
+                "EMPTY:STRING=\nURL:STRING=https://example.invalid/path?a=b=c\n")
+        parsed = verify.parse_cmake_cache(text)
+        self.assertEqual(parsed["CMAKE_C_FLAGS"], "-DPAIR=left=right -flto=thin")
+        self.assertEqual(parsed["EMPTY"], "")
+        self.assertEqual(parsed["URL"], "https://example.invalid/path?a=b=c")
+        verify.require_thin(parsed["CMAKE_C_FLAGS"], "fixture")
+
+    def test_cmake_comment_examples_cannot_supply_missing_required_keys(self):
+        build = self.root / "libmpv/nghttp3/.build"
+        cache = build / "CMakeCache.txt"
+        entries = (("CMAKE_C_FLAGS:STRING=-fPIC -flto=thin", "CMAKE_C_FLAGS",
+                    "nghttp3 CMake cache is missing CMAKE_C_FLAGS"),
+                   ("CMAKE_AR:FILEPATH=/sdk/llvm-ar", "CMAKE_AR",
+                    "nghttp3 must archive with SDK llvm-ar"),
+                   ("CMAKE_RANLIB:FILEPATH=/sdk/llvm-ranlib", "CMAKE_RANLIB",
+                    "nghttp3 must archive with SDK llvm-ranlib"))
+        for entry, key, message in entries:
+            with self.subTest(key=key):
+                text = ("\n# " + entry + "\n\n  // " + entry + "\n\n" +
+                        self.cmake_cache_fixture().replace(entry + "\n", ""))
+                self.assertNotIn(key, verify.parse_cmake_cache(text))
+                cache.write_text(text, encoding="utf-8")
+                with self.assertRaises(SystemExit) as error:
+                    verify.verify_cmake(build, "nghttp3", "aarch64-linux-ohos")
+                self.assertEqual(str(error.exception), message)
+
+    def test_cmake_empty_required_values_fail_for_the_actual_reason(self):
+        build = self.root / "libmpv/nghttp3/.build"
+        cache = build / "CMakeCache.txt"
+        for value, key, message in (
+                ("-fPIC -flto=thin", "CMAKE_C_FLAGS", "nghttp3 CMake C flags lost ThinLTO or overrides it"),
+                ("/sdk/llvm-ar", "CMAKE_AR", "nghttp3 must archive with SDK llvm-ar"),
+                ("/sdk/llvm-ranlib", "CMAKE_RANLIB", "nghttp3 must archive with SDK llvm-ranlib")):
+            with self.subTest(key=key):
+                text = self.cmake_cache_fixture().replace("=" + value + "\n", "=\n")
+                self.assertEqual(verify.parse_cmake_cache(text)[key], "")
+                cache.write_text(text, encoding="utf-8")
+                with self.assertRaises(SystemExit) as error:
+                    verify.verify_cmake(build, "nghttp3", "aarch64-linux-ohos")
+                self.assertEqual(str(error.exception), message)
+
+    def test_cmake_invalid_values_are_not_masked_by_valid_comment_examples(self):
+        build = self.root / "libmpv/nghttp3/.build"
+        cache = build / "CMakeCache.txt"
+        for old, new, message in (
+                ("-flto=thin", "-flto=full", "nghttp3 CMake C flags lost ThinLTO or overrides it"),
+                ("-flto=thin", "-flto=thin -fno-lto", "nghttp3 CMake C flags lost ThinLTO or overrides it"),
+                ("/sdk/llvm-ar", "/usr/bin/ar", "nghttp3 must archive with SDK llvm-ar"),
+                ("/sdk/llvm-ranlib", "/usr/bin/ranlib", "nghttp3 must archive with SDK llvm-ranlib")):
+            with self.subTest(new=new):
+                text = self.cmake_cache_fixture().replace(old, new)
+                text += ("\n//CMAKE_C_FLAGS:STRING=-flto=thin\n"
+                         "# CMAKE_AR:FILEPATH=/sdk/llvm-ar\n"
+                         "//CMAKE_RANLIB:FILEPATH=/sdk/llvm-ranlib\n")
+                cache.write_text(text, encoding="utf-8")
+                with self.assertRaises(SystemExit) as error:
+                    verify.verify_cmake(build, "nghttp3", "aarch64-linux-ohos")
+                self.assertEqual(str(error.exception), message)
+
+    def test_cmake_valid_cache_cannot_hide_non_lto_compile_command(self):
+        build = self.root / "libmpv/nghttp3/.build"
+        self.save_commands(build, [{"file": "client.c", "command":
+            "clang --target=aarch64-linux-ohos -O3 -fno-lto -c client.c"}])
+        with self.assertRaises(SystemExit) as error:
+            verify.verify_cmake(build, "nghttp3", "aarch64-linux-ohos")
+        self.assertEqual(str(error.exception),
+                         "nghttp3 compile command for client.c lost ThinLTO or overrides it")
 
     def test_make_effective_flags_are_verified(self):
         inputs = self.root / "libmpv/lua/.build/.sweetvideo-make-lto-inputs"

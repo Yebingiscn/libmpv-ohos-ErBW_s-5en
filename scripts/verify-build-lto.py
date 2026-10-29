@@ -133,9 +133,24 @@ def verify_meson(build, name, triple, final_link=False):
     return verify_commands(build, name, triple)
 
 
+def parse_cmake_cache(text):
+    """Read KEY:TYPE=VALUE entries without consuming adjacent help/comments."""
+    options = {}
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith(("#", "//")):
+            continue
+        typed_name, equals, value = line.partition("=")
+        name, colon, cache_type = typed_name.partition(":")
+        if equals and colon and name and cache_type:
+            # Values may be empty, or contain further '=' (for compiler flags).
+            options[name] = value
+    return options
+
+
 def verify_cmake(build, name, triple):
     cache = (build / "CMakeCache.txt").read_text(encoding="utf-8")
-    options = dict(re.findall(r"^([^#/:][^:=]*):[^=]*=(.*)$", cache, re.M))
+    options = parse_cmake_cache(cache)
+    require("CMAKE_C_FLAGS" in options, name + " CMake cache is missing CMAKE_C_FLAGS")
     require_thin(options.get("CMAKE_C_FLAGS", ""), name + " CMake C flags")
     for key, tool in (("CMAKE_AR", "llvm-ar"), ("CMAKE_RANLIB", "llvm-ranlib")):
         require(tool in options.get(key, ""), name + " must archive with SDK " + tool)

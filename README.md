@@ -58,6 +58,9 @@ a failed build with the older settings rather than reusing incomplete ABI data.
 `verify.sh` checks effective build settings and installed bitcode archives,
 including the exact FFmpeg HEVC core object, Meson compile/link options, final
 exported FFmpeg APIs and existing optional-library protections.
+The early CMake ABI fixture also runs the production ThinLTO verifier against
+its generated cache, including CMake's comments and blank lines; unit tests
+cover both LF and CRLF cache files without weakening flag/archive checks.
 `scripts/app-ffmpeg-exports.txt` lists the wrapper's required decoder, frame,
 demuxer, IO and swscale exports; `scripts/app-native-exports.txt` covers its mpv
 and libplacebo imports. Update these when the wrapper's imported APIs change.
