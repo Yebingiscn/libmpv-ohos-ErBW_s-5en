@@ -1,0 +1,142 @@
+diff --git a/filters/f_decoder_wrapper.c b/filters/f_decoder_wrapper.c
+index d0943b5..657f861 100644
+--- a/filters/f_decoder_wrapper.c
++++ b/filters/f_decoder_wrapper.c
+@@ -233,6 +233,7 @@ struct priv {
+     mp_mutex cache_lock;
+ 
+     // --- Protected by cache_lock.
++    bool playback_sync;
+     char *cur_hwdec;
+     bool try_spdif;
+     bool attached_picture;
+@@ -307,9 +308,12 @@ static void update_decode_hints(struct priv *p)
+ {
+     if (p->codec->type != STREAM_VIDEO || !p->decoder || !p->decoder->control)
+         return;
++    mp_mutex_lock(&p->cache_lock);
++    bool playback_sync = p->playback_sync;
++    mp_mutex_unlock(&p->cache_lock);
+     int hints[2] = {
+         p->play_dir > 0 && (p->codec_pts == MP_NOPTS_VALUE ||
+-                           p->start_pts != MP_NOPTS_VALUE),
++                           p->start_pts != MP_NOPTS_VALUE || playback_sync),
+         p->play_dir > 0 && p->opts->correct_pts && p->opts->repair_dts_pts &&
+             mp_dts_pts_no_drop(&p->dts_pts_repair),
+     };
+@@ -351,6 +355,7 @@ static void decf_reset(struct mp_filter *f)
+     p->last_format = p->fixed_format = (struct mp_image_params){0};
+ 
+     mp_mutex_lock(&p->cache_lock);
++    p->playback_sync = false;
+     p->pts_reset = false;
+     p->attempt_framedrops = 0;
+     p->dropped_frames = 0;
+@@ -925,6 +930,20 @@ void mp_decoder_wrapper_set_start_pts(struct mp_decoder_wrapper *d, double pts)
+     p->start_pts = pts;
+ }
+ 
++void mp_decoder_wrapper_set_playback_sync(struct mp_decoder_wrapper *d, bool active)
++{
++    struct priv *p = d->f->priv;
++    mp_mutex_lock(&p->cache_lock);
++    bool changed = p->playback_sync != active;
++    p->playback_sync = active;
++    mp_mutex_unlock(&p->cache_lock);
++    // Publish the hint even when the output queue is full or input is empty.
++    // Platform policy is applied on the next decoder receive call.
++    // Unlike thread_lock(), this never waits for hardware decoding to finish.
++    if (changed)
++        mp_filter_wakeup(p->decf);
++}
++
+ static bool is_new_segment(struct priv *p, struct mp_frame frame)
+ {
+     if (frame.type != MP_FRAME_PACKET)
+@@ -1191,6 +1210,7 @@ static void decf_process(struct mp_filter *f)
+     if (m_config_cache_update(p->opt_cache))
+         update_queue_config(p);
+ 
++    update_decode_hints(p);
+     feed_packet(p);
+     read_frame(p);
+ }
+diff --git a/filters/f_decoder_wrapper.h b/filters/f_decoder_wrapper.h
+index 0dfe931..6a78564 100644
+--- a/filters/f_decoder_wrapper.h
++++ b/filters/f_decoder_wrapper.h
+@@ -67,6 +67,10 @@ struct mp_decoder_list *audio_decoder_list(void);
+ // This is automatically unset if the target is reached, or on reset.
+ void mp_decoder_wrapper_set_start_pts(struct mp_decoder_wrapper *d, double pts);
+ 
++// Performance hint while the player skips video to the running audio clock.
++// Does not change timestamps, playback speed, or decoder frame dropping.
++void mp_decoder_wrapper_set_playback_sync(struct mp_decoder_wrapper *d, bool active);
++
+ enum dec_ctrl {
+     VDCTRL_FORCE_HWDEC_FALLBACK, // force software decoding fallback
+     VDCTRL_GET_HWDEC,
+diff --git a/player/video.c b/player/video.c
+index 6cc7937..51ef3c8 100644
+--- a/player/video.c
++++ b/player/video.c
+@@ -101,8 +101,10 @@ void reset_video_state(struct MPContext *mpctx)
+     if (mpctx->vo_chain) {
+         vo_chain_reset_state(mpctx->vo_chain);
+         struct track *t = mpctx->vo_chain->track;
+-        if (t && t->dec)
++        if (t && t->dec) {
+             mp_decoder_wrapper_set_play_dir(t->dec, mpctx->play_dir);
++            mp_decoder_wrapper_set_playback_sync(t->dec, false);
++        }
+     }
+ 
+     for (int n = 0; n < mpctx->num_next_frames; n++)
+@@ -1060,6 +1062,22 @@ static void apply_video_crop(struct MPContext *mpctx, struct vo *vo)
+     }
+ }
+ 
++// Track re-enabling has a moving sync target in video_output_image(), unlike
++// an explicit seek's decoder start_pts. Keep preroll demand until the player
++// has submitted a current frame, including lookahead and VO reconfiguration.
++static void update_playback_sync(struct MPContext *mpctx)
++{
++    struct vo_chain *vo_c = mpctx->vo_chain;
++    if (!vo_c || !vo_c->track || !vo_c->track->dec)
++        return;
++    bool active = mpctx->video_status == STATUS_SYNCING &&
++                  mpctx->audio_status == STATUS_PLAYING &&
++                  mpctx->playback_pts != MP_NOPTS_VALUE &&
++                  !mpctx->hrseek_active && mpctx->play_dir > 0 &&
++                  !vo_c->is_sparse;
++    mp_decoder_wrapper_set_playback_sync(vo_c->track->dec, active);
++}
++
+ void write_video(struct MPContext *mpctx)
+ {
+     struct MPOpts *opts = mpctx->opts;
+@@ -1070,6 +1088,7 @@ void write_video(struct MPContext *mpctx)
+     struct vo_chain *vo_c = mpctx->vo_chain;
+     struct vo *vo = vo_c->vo;
+ 
++    update_playback_sync(mpctx);
+     if (vo_c->filter->reconfig_happened) {
+         mp_notify(mpctx, MPV_EVENT_VIDEO_RECONFIG, NULL);
+         vo_c->filter->reconfig_happened = false;
+@@ -1105,6 +1124,8 @@ void write_video(struct MPContext *mpctx)
+     }
+ 
+     if (r == VD_EOF) {
++        if (track && track->dec)
++            mp_decoder_wrapper_set_playback_sync(track->dec, false);
+         if (check_for_hwdec_fallback(mpctx))
+             return;
+         if (check_for_forced_eof(mpctx)) {
+@@ -1299,6 +1320,7 @@ void write_video(struct MPContext *mpctx)
+     mpctx->shown_vframes++;
+     if (mpctx->video_status < STATUS_PLAYING) {
+         mpctx->video_status = STATUS_READY;
++        update_playback_sync(mpctx);
+         // After a seek, make sure to wait until the first frame is visible.
+         if (!opts->video_latency_hacks) {
+             vo_wait_frame(vo);

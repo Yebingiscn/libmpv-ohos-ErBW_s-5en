@@ -304,6 +304,15 @@ reported as successfully disabled. Current official VRR documentation only
 guarantees hardware-decoded direct presentation. Retaining a request in the GPU
 buffer path does not establish that final display presentation benefits from it.
 
+When video is re-enabled after audio-only playback, preroll demand now follows
+the player's moving audio synchronization phase through first-frame submission,
+rather than ending at the first decoded picture. The cross-thread flag uses a
+short cache lock and wakes the decoder filter without waiting for hardware.
+It changes only decode demand; reference-frame dependencies, timestamps and
+playback speed remain intact. Long-GOP recovery still depends on decoder speed.
+`scripts/verify-mpv-playback-sync.py` tests the patched mpv functions and lifecycle
+call sites; device acceptance is described in `tests/ohcodec-decode-hints.md`.
+
 See Huawei's [smart fluency guide](https://developer.huawei.com/consumer/cn/doc/harmonyos-guides/video-smart-fluency-decoding)
 and [VRR guide](https://developer.huawei.com/consumer/cn/doc/harmonyos-guides/video-variable-refreshrate).
 

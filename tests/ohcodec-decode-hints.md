@@ -19,6 +19,38 @@ higher playback speed. Normal video still uses the previous adaptive policy
 after preroll. Setters deduplicate unchanged hints and platform updates remain
 on the decoder thread.
 
+## Audio-only background return
+
+Disabling `vid` releases the video decoder. Re-enabling it while audio keeps
+playing restarts decoding from a previous random-access point. The player skips
+old pictures against the moving playback clock, independently of the decoder's
+one-shot precise-seek `start_pts`. Keep the preroll performance hint active until
+the player submits its first synchronized frame and enters `STATUS_READY`, not
+merely until the decoder produces its first picture. This includes time spent
+filling lookahead or waiting for VO reconfiguration.
+
+The player publishes only a boolean through the decoder wrapper's existing
+cache mutex; updates never lock/wait for the decoding thread. A changed flag
+wakes the decoder filter, which publishes the hint on its own thread even when
+no packet is available or its output queue is full. OHCodec applies the pending
+platform policy on its next decoder receive call. Reset, EOF, explicit seek,
+reverse playback, sparse/cover-art streams and inactive audio clear/exclude this
+extra hint. Ordinary startup/precise-seek hints and timestamp repair are unchanged.
+
+`scripts/verify-mpv-playback-sync.py` compiles the actual patched hint, setter,
+decoder process and player predicate against recording stubs, and checks the
+reset/EOF/READY call sites. It runs after patch application alongside the
+existing FFmpeg policy tests.
+
+Device acceptance: use long-GOP 4K60 HEVC 10bit and ordinary H.264 files in both
+direct Surface and GPU buffer modes. Enter audio-only background playback and
+return repeatedly, including paused playback, rapid app switching, near EOF,
+seeking and switching media during recovery. Check first decoded frame versus
+first surface submission, sustained preroll until submission, normal-policy
+restoration, uninterrupted audio, video sync, subtitles and OSD. A long GOP
+still requires rebuilding reference pictures; a performance request cannot
+guarantee instant recovery or that the device can decode faster than real time.
+
 `[Perf] codec-decode-hints` reports the requested frame rate, preroll/full-frame
 flags and platform result for rate-only changes. Transitions from adaptive
 retention also use the existing codec-policy diagnostics. Existing runtime
