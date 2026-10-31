@@ -489,6 +489,16 @@ See [software upload acceptance](tests/gles-upload-integration.md) for limits,
 runtime confirmation and device performance checks. Host tests do not establish
 a CPU or power reduction on real hardware.
 
+HDR Vivid raw metadata transport is automatic for eligible Vulkan OHCodec frames;
+there is no configuration switch. The original bytes follow the selected frame
+and are staged before output acquire. Only neutral, single-frame, 10-bit output
+is eligible; incompatible filters, LUT/ICC/color overrides, VPE and missing
+metadata retain ordinary rendering. Seek/reset invalidates prior metadata.
+This is not a new tone mapper. Setter success and last-flushed readback do not
+prove that vendor WSI paired the correct frame or that the panel applied dynamic
+mapping. See [HDR Vivid acceptance](tests/ohos-vivid-integration.md) for the
+remaining device checks. This requires rebuilding `libmpv.so`.
+
 ## Build Dependencies
 
 - git

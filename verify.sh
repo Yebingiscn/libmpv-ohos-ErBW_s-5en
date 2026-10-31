@@ -287,6 +287,13 @@ if ! "$STRINGS" "$LIBMPV" | grep -F \
   exit 1
 fi
 echo "$configuration"
+for marker in "[Vivid] source epoch=" \
+              "[Vivid] staged-before-acquire" "[Vivid] last-flushed"; do
+  if ! "$STRINGS" "$LIBMPV" | grep -F "$marker" >/dev/null; then
+    echo "Missing HDR Vivid transport prototype: $marker" >&2
+    exit 1
+  fi
+done
 grep -E "NEEDED|SONAME" <<< "$dynamic_section"
 python3 "$ROOT_DIR/scripts/verify-build-lto.py" "$ROOT_DIR" "$DEST" "$MPV_BUILD_ARCH"
 if command -v sha256sum >/dev/null 2>&1; then
