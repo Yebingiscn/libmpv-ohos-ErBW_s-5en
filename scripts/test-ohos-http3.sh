@@ -53,12 +53,15 @@ cd "$TMP_DIR/ffmpeg"
   --disable-avfilter --disable-swscale --disable-swresample \
   --enable-protocol=http --enable-network --cc="$CC_FOR_BUILD" >configure.log 2>&1
 make -j4 libavutil/libavutil.a >build.log 2>&1
-"$CC_FOR_BUILD" -std=c17 -ffunction-sections -fdata-sections -I. -I"$FFMPEG_SOURCE" \
+# Direct compiles bypass FFmpeg's configured CPPFLAGS. Keep POSIX declarations
+# visible under strict C17, as they were during configure's feature checks.
+host_cflags=(-std=c17 -D_POSIX_C_SOURCE=200809L -Werror=implicit-function-declaration)
+"$CC_FOR_BUILD" "${host_cflags[@]}" -ffunction-sections -fdata-sections -I. -I"$FFMPEG_SOURCE" \
   -c "$FFMPEG_SOURCE/libavformat/utils.c" -o utils.o
-"$CC_FOR_BUILD" -std=c17 -I. -I"$FFMPEG_SOURCE" -include "$ROOT/tests/http3-enable.h" \
-  -Werror=implicit-function-declaration -c "$FFMPEG_SOURCE/libavformat/http.c" -o http.o
-"$CC_FOR_BUILD" -std=c17 -DNGHTTP3_STATICLIB -ffunction-sections -fdata-sections \
-  -Werror=implicit-function-declaration -I. -I"$FFMPEG_SOURCE" \
+"$CC_FOR_BUILD" "${host_cflags[@]}" -I. -I"$FFMPEG_SOURCE" -include "$ROOT/tests/http3-enable.h" \
+  -c "$FFMPEG_SOURCE/libavformat/http.c" -o http.o
+"$CC_FOR_BUILD" "${host_cflags[@]}" -DNGHTTP3_STATICLIB -ffunction-sections -fdata-sections \
+  -I. -I"$FFMPEG_SOURCE" \
   -I"$NGHTTP3_SOURCE/lib/includes" -I"$TMP_DIR/nghttp3/lib/includes" \
   -I"$MBEDTLS_SOURCE/include" "$ROOT/tests/ohos-http3.c" utils.o \
   libavutil/libavutil.a "$TMP_DIR/nghttp3/lib/libnghttp3.a" \

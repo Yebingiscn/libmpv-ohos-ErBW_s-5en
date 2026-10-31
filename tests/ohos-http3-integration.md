@@ -3,6 +3,8 @@
 The host regression uses real nghttp3 framing/QPACK and a mocked RCP transport.
 It is not a real QUIC/TLS handshake, a device test, or a weak-network benchmark.
 Run `bash scripts/test-ohos-http3.sh` after download and patching on Linux.
+Its direct FFmpeg/test compilations use strict C17 with POSIX.1-2008 declarations
+enabled, and treat implicit function declarations as errors.
 
 ## Device coverage
 
