@@ -56,6 +56,7 @@ done
 
 "$ROOT/scripts/verify-ohos-osd-source.sh"
 bash "$ROOT/scripts/verify-vpe-adapter.sh"
+python3 "$ROOT/scripts/verify-ohcodec-surface-aspect.py"
 bash "$ROOT/scripts/verify-ohaudio-clock.sh"
 bash "$ROOT/scripts/verify-audio-output-timeline.sh"
 bash "$ROOT/scripts/verify-osd-font-worker.sh"

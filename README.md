@@ -226,6 +226,15 @@ decoding, including both OpenGL and Vulkan GPU contexts. GPU processing enhances
 the rendered output; direct decoding feeds the VPE input Surface before display.
 Direct-mode subtitles remain on their separate OSD Surface.
 
+Direct-mode VPE buffers are prepared on the VO thread after codec headers are
+available and before opening OHCodec. Their dimensions retain the unrotated
+source display aspect ratio, including sample aspect ratio, for that decoder.
+Remembered 4:3/stretch modes and later window resizes only change the final
+Surface fit/stretch operation. Switching to another source geometry retires
+the old output producer and uses a new device; retained old frames cannot
+render into the new generation. VPE initialization failure keeps ordinary
+Surface hardware decoding available.
+
 Changing the option recreates the video output and decoder through mpv's normal
 VO update path, restoring the current playback position. The VPE input remains
 alive until its producer is released. Unsupported initialization uses normal
@@ -241,6 +250,9 @@ Successful buffer submission is logged once; it does not prove physical display.
 
 `scripts/verify-vpe-adapter.sh` exercises initialization failures, fixed HIGH
 quality, output callbacks, resize, fallback, and failed vendor destruction.
+`scripts/verify-ohcodec-surface-aspect.py` host-tests the production decoder
+preparation, aspect geometry, generation ownership, and resize path. See
+`tests/ohcodec-surface-aspect.md` for the device acceptance scenarios.
 `verify.sh` requires the final binary to include the option and VPE dependency.
 
 ## Runtime performance diagnostics

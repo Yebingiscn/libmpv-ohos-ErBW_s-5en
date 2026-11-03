@@ -125,6 +125,10 @@ if ! "$STRINGS" "$LIBMPV" | grep -Fx "ohos-super-resolution" >/dev/null; then
   echo "Missing super-resolution option in libmpv" >&2
   exit 1
 fi
+if ! "$STRINGS" "$LIBMPV" | grep -F '[SuperResolution] source=%dx%d sar=%d:%d output=%dx%d before decoder open' >/dev/null; then
+  echo "Missing source-aspect preparation before OHCodec/VPE startup" >&2
+  exit 1
+fi
 if ! grep -Eq "NEEDED.*libGLESv2\.so" <<< "$dynamic_section"; then
   echo "Direct OSD renderer is not linked to GLESv2" >&2
   exit 1
@@ -242,7 +246,7 @@ for marker in "[OSDGLES]" "OSD GLES Surface attached" \
 done
 
 for marker in "[SuperResolution] submitted input=" \
-              "[SuperResolution] configured input/output=" \
+              "[SuperResolution] configured output=" \
               "[SuperResolution] VPE high quality started after Surface configuration" \
               "[SuperResolution] Bypassed: SDR-to-HDR takes priority" \
               "[SuperResolution] No first output; requesting normal output"; do

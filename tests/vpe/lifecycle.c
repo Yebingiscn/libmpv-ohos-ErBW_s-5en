@@ -22,8 +22,8 @@ static OH_NativeBuffer_ColorSpace expected_color = OH_COLORSPACE_DISPLAY_SRGB;
 static int output_format, input_format;
 static bool output_color_set, input_color_set;
 static int fail_at, processors, formats, callbacks, inputs, running, quality;
-static int stage, resize_count, destroy_error, width, height;
-static atomic_int rendered, render_error;
+static int stage, resize_count, destroy_error, stop_error, stop_calls, width, height;
+static atomic_int rendered, render_error, render_active;
 static atomic_bool hold_render;
 static atomic_int wakeups;
 static void wake_vo(void *data) { atomic_fetch_add(&wakeups, 1); }
@@ -108,7 +108,13 @@ VideoProcessing_ErrorCode OH_VideoProcessing_Start(OH_VideoProcessing *p)
     int r = step(START); if (!r) running++; return r;
 }
 VideoProcessing_ErrorCode OH_VideoProcessing_Stop(OH_VideoProcessing *p)
-{ assert(running == 1); running--; return 0; }
+{
+    assert(running == 1 && !atomic_load(&render_active));
+    stop_calls++;
+    if (stop_error) return VIDEO_PROCESSING_ERROR_OPERATION_NOT_PERMITTED;
+    running--;
+    return 0;
+}
 VideoProcessing_ErrorCode OH_VideoProcessing_Destroy(OH_VideoProcessing *p)
 {
     if (destroy_error) return VIDEO_PROCESSING_ERROR_OPERATION_NOT_PERMITTED;
@@ -119,9 +125,12 @@ void OH_NativeWindow_DestroyNativeWindow(OHNativeWindow *w)
 VideoProcessing_ErrorCode OH_VideoProcessing_RenderOutputBuffer(OH_VideoProcessing *p, uint32_t index)
 {
     assert(!in_callback && index == 7);
+    atomic_fetch_add(&render_active, 1);
     atomic_fetch_add(&rendered, 1);
     while (atomic_load(&hold_render)) test_sleep();
-    return atomic_load(&render_error);
+    int result = atomic_load(&render_error);
+    atomic_fetch_sub(&render_active, 1);
+    return result;
 }
 
 static void emit_output(void)
@@ -166,8 +175,68 @@ int main(void)
     struct ohos_vpe *prepared = ohos_vpe_create_configured(NULL, WINDOW, 1920, 1080,
                                                          expected_format, expected_color);
     assert(prepared && !running && processors == 1 && inputs == 1);
+    int previous_stops = stop_calls;
+    assert(ohos_vpe_stop(NULL) && ohos_vpe_stop(prepared));
+    assert(stop_calls == previous_stops && inputs == 1 && processors == 1);
     ohos_vpe_destroy(prepared);
     assert(!processors && !inputs && !running);
+
+    // Retiring output must keep the decoder's input Surface and callback
+    // context alive until the final device owner destroys the processor.
+    struct ohos_vpe *retired = create_and_start(NULL, WINDOW, 1920, 1080);
+    assert(retired && running == 1);
+    ohos_vpe_set_wakeup(retired, wake_vo, NULL);
+    previous_stops = stop_calls;
+    assert(ohos_vpe_stop(retired));
+    assert(stop_calls == previous_stops + 1 && !running);
+    assert(inputs == 1 && processors == 1 && ohos_vpe_input(retired) == INPUT);
+    int previous_wakeups = atomic_load(&wakeups);
+    int previous_rendered = atomic_load(&rendered);
+    emit_output();
+    error_cb(PROCESSOR, VIDEO_PROCESSING_ERROR_PROCESS_FAILED, callback_data);
+    assert(atomic_load(&wakeups) == previous_wakeups);
+    assert(atomic_load(&rendered) == previous_rendered);
+    assert(ohos_vpe_stop(retired) && stop_calls == previous_stops + 1);
+    ohos_vpe_destroy(retired);
+    assert(stop_calls == previous_stops + 1 && !processors && !inputs);
+
+    // A vendor Stop failure must not release an input Surface still owned
+    // by an old decoder. Repeated retirement can retry Stop safely.
+    retired = create_and_start(NULL, WINDOW, 1920, 1080);
+    ohos_vpe_set_wakeup(retired, wake_vo, NULL);
+    stop_error = 1;
+    previous_stops = stop_calls;
+    assert(!ohos_vpe_stop(retired));
+    assert(stop_calls == previous_stops + 1 && running == 1);
+    assert(ohos_vpe_take_error(retired)); // queue ordinary-output fallback
+    assert(inputs == 1 && processors == 1 && ohos_vpe_input(retired) == INPUT);
+    previous_wakeups = atomic_load(&wakeups);
+    error_cb(PROCESSOR, VIDEO_PROCESSING_ERROR_PROCESS_FAILED, callback_data);
+    emit_output();
+    assert(atomic_load(&wakeups) == previous_wakeups);
+    assert(!ohos_vpe_stop(retired) && stop_calls == previous_stops + 2);
+    stop_error = 0;
+    assert(ohos_vpe_stop(retired) && stop_calls == previous_stops + 3);
+    assert(!running && inputs == 1 && processors == 1);
+    ohos_vpe_destroy(retired);
+    assert(!processors && !inputs);
+
+    // If both Stop and Destroy fail, retain the callback context and input
+    // until a later successful destruction; no late callback may wake VO.
+    retired = create_and_start(NULL, WINDOW, 1920, 1080);
+    ohos_vpe_set_wakeup(retired, wake_vo, NULL);
+    stop_error = destroy_error = 1;
+    assert(!ohos_vpe_stop(retired));
+    previous_wakeups = atomic_load(&wakeups);
+    ohos_vpe_destroy(retired);
+    assert(processors == 1 && inputs == 1 && running == 1);
+    error_cb(PROCESSOR, VIDEO_PROCESSING_ERROR_PROCESS_FAILED, callback_data);
+    emit_output();
+    assert(atomic_load(&wakeups) == previous_wakeups);
+    stop_error = destroy_error = 0;
+    ohos_vpe_destroy(retired);
+    assert(!processors && !inputs && !running);
+
     struct ohos_vpe *vpe = create_and_start(NULL, WINDOW, 1920, 1080);
     assert(vpe && running == 1 && inputs == 1 && processors == 1);
     assert(!formats && !callbacks && ohos_vpe_input(vpe) == INPUT);
@@ -247,6 +316,6 @@ int main(void)
     assert(processors == 1 && inputs == 1 && !running);
     error_cb(PROCESSOR, VIDEO_PROCESSING_ERROR_PROCESS_FAILED, callback_data);
     assert(ohos_vpe_take_error(vpe));
-    puts("VPE lifecycle: SDR/PQ/HLG format negotiation before Start, setup failures, prepared teardown, worker output, timeout, resize and teardown passed");
+    puts("VPE lifecycle: SDR/PQ/HLG format negotiation before Start, setup failures, retirement lifetime, Stop failures/retry/idempotence, worker output, timeout, resize and teardown passed");
     return 0;
 }

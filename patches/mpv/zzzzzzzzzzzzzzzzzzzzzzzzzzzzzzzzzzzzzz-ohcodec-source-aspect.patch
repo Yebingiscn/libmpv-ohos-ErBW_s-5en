@@ -1,0 +1,292 @@
+diff --git a/video/decode/vd_lavc.c b/video/decode/vd_lavc.c
+index b5599dd..8c97d55 100644
+--- a/video/decode/vd_lavc.c
++++ b/video/decode/vd_lavc.c
+@@ -865,6 +865,43 @@ static void init_avctx(struct mp_filter *vd)
+         talloc_free(mpopts);
+     }
+ 
++    // Direct Surface processing must know the source DAR before a decoder
++    // binds its output. Preparing on the VO thread also serializes this with
++    // resize/uninit; other VOs simply leave their device unchanged.
++    if (ctx->vo && avctx->hw_device_ctx && lavc_codec->wrapper_name &&
++        strcmp(lavc_codec->wrapper_name, "ohcodec") == 0) {
++        struct mp_image_params source = {
++            .w = avctx->width, .h = avctx->height,
++            .p_w = avctx->sample_aspect_ratio.num,
++            .p_h = avctx->sample_aspect_ratio.den,
++        };
++        // Match the default container-SAR preference in fix_image_params().
++        if (c->par_w > 0 && c->par_h > 0) {
++            source.p_w = c->par_w;
++            source.p_h = c->par_h;
++        }
++        if (source.p_w <= 0 || source.p_h <= 0)
++            source.p_w = source.p_h = 1;
++        struct voctrl_prepare_decoder prepare = {
++            .device_ref = avctx->hw_device_ctx,
++            .params = &source,
++        };
++        int ret = vo_control(ctx->vo, VOCTRL_PREPARE_DECODER, &prepare);
++        if (ret == VO_ERROR)
++            goto error;
++        if (prepare.replacement) {
++            AVBufferRef *cached = av_buffer_ref(prepare.replacement);
++            if (!cached) {
++                av_buffer_unref(&prepare.replacement);
++                goto error;
++            }
++            av_buffer_unref(&avctx->hw_device_ctx);
++            avctx->hw_device_ctx = prepare.replacement;
++            av_buffer_unref(&ctx->hwdec_dev);
++            ctx->hwdec_dev = cached;
++        }
++    }
++
+     /* open it */
+     if (avcodec_open2(avctx, lavc_codec, NULL) < 0)
+         goto error;
+diff --git a/video/out/ohos_vpe.c b/video/out/ohos_vpe.c
+index 847ad3c..1fccb64 100644
+--- a/video/out/ohos_vpe.c
++++ b/video/out/ohos_vpe.c
+@@ -153,6 +153,24 @@ void ohos_vpe_stop_output(struct ohos_vpe *vpe)
+     }
+ }
+ 
++bool ohos_vpe_stop(struct ohos_vpe *vpe)
++{
++    if (!vpe)
++        return true;
++    ohos_vpe_set_wakeup(vpe, NULL, NULL);
++    ohos_vpe_stop_output(vpe);
++    if (vpe->running) {
++        int ret = OH_VideoProcessing_Stop(vpe->processor);
++        if (ret) {
++            atomic_store(&vpe->error, ret);
++            mp_warn(vpe->log, "[SuperResolution] Stop failed: %d\n", ret);
++            return false;
++        }
++        vpe->running = false;
++    }
++    return true;
++}
++
+ void ohos_vpe_destroy(struct ohos_vpe *vpe)
+ {
+     if (!vpe)
+@@ -279,7 +297,7 @@ struct ohos_vpe *ohos_vpe_create_configured(struct mp_log *log, OHNativeWindow *
+     ret = pixel_format >= 0 ? configure_window(vpe->input, pixel_format, color_space, width, height) : 0;
+     if (ret)
+         goto fail;
+-    mp_warn(log, "[SuperResolution] configured input/output=%dx%d format=%d color=%d; awaiting Start\n",
++    mp_warn(log, "[SuperResolution] configured output=%dx%d format=%d color=%d; awaiting Start\n",
+             width, height, pixel_format, (int)color_space);
+     return vpe;
+ fail:
+diff --git a/video/out/ohos_vpe.h b/video/out/ohos_vpe.h
+index c46d622..8b56d38 100644
+--- a/video/out/ohos_vpe.h
++++ b/video/out/ohos_vpe.h
+@@ -21,6 +21,9 @@ bool ohos_vpe_start(struct ohos_vpe *vpe);
+ OHNativeWindow *ohos_vpe_input(struct ohos_vpe *vpe);
+ void ohos_vpe_destroy(struct ohos_vpe *vpe);
+ void ohos_vpe_stop_output(struct ohos_vpe *vpe);
++// Retire a producer before reusing its output Surface. Keep the input alive
++// until all decoder/frame references to its owning device are released.
++bool ohos_vpe_stop(struct ohos_vpe *vpe);
+ void ohos_vpe_resize(struct ohos_vpe *vpe, int width, int height);
+ int ohos_vpe_take_error(struct ohos_vpe *vpe);
+ void ohos_vpe_note_input(struct ohos_vpe *vpe);
+diff --git a/video/out/vo.h b/video/out/vo.h
+index e6a3e96..debb7e0 100644
+--- a/video/out/vo.h
++++ b/video/out/vo.h
+@@ -75,6 +75,9 @@ enum mp_voctrl {
+     /* private to vo_gpu */
+     VOCTRL_LOAD_HWDEC_API,
+ 
++    // Prepare a decoder's output before avcodec_open2(), on the VO thread.
++    VOCTRL_PREPARE_DECODER,             // struct voctrl_prepare_decoder*
++
+     // Only used internally in vo_libmpv
+     VOCTRL_PREINIT,
+     VOCTRL_UNINIT,
+@@ -184,6 +187,12 @@ struct voctrl_screenshot {
+     struct mp_image *res;
+ };
+ 
++struct voctrl_prepare_decoder {
++    struct AVBufferRef *device_ref;     // borrowed current device
++    struct AVBufferRef *replacement;    // owned by caller, if replaced
++    const struct mp_image_params *params; // unrotated source dimensions/SAR
++};
++
+ struct voctrl_clipboard {
+     struct clipboard_data data;
+     struct clipboard_access_params params;
+diff --git a/video/out/vo_ohcodec.c b/video/out/vo_ohcodec.c
+index dac3a70..bb29448 100644
+--- a/video/out/vo_ohcodec.c
++++ b/video/out/vo_ohcodec.c
+@@ -141,6 +141,9 @@ static int64_t get_surface_time_ns(void)
+ struct ohcodec_output {
+     OHNativeWindow *window;
+     struct ohos_vpe *vpe;
++    struct mp_image_params source;
++    bool prepared;
++    bool retired;
+ };
+ 
+ static void free_ohcodec_device(AVHWDeviceContext *ctx)
+@@ -198,12 +201,9 @@ static AVBufferRef *create_ohcodec_device_ref(struct vo *vo)
+     if (ret != 0)
+         MP_VERBOSE(vo, "Failed to mark video Surface source type: %d\n", ret);
+ 
+-    if (vo->opts->ohos_super_resolution && !vo->opts->ohos_sdr_to_hdr) {
+-        output->vpe = ohos_vpe_create(vo->log, window,
+-            vo->opts->ohos_surface_size.w, vo->opts->ohos_surface_size.h);
+-        ohos_vpe_attach(output->vpe, vo);
+-    }
+-    hwctx->native_window = output->vpe ? ohos_vpe_input(output->vpe) : window;
++    // VPE is prepared once the decoder supplies source dimensions. The
++    // initial container may already be 4:3 or stretched from a saved mode.
++    hwctx->native_window = window;
+ 
+     if (av_hwdevice_ctx_init(device_ref) < 0)
+         av_buffer_unref(&device_ref);
+@@ -211,6 +211,91 @@ static AVBufferRef *create_ohcodec_device_ref(struct vo *vo)
+     return device_ref;
+ }
+ 
++static int prepare_decoder(struct vo *vo, struct voctrl_prepare_decoder *request)
++{
++    struct priv *p = vo->priv;
++    AVBufferRef *ref = p->hwctx.av_device_ref;
++    if (!ref || !request->device_ref || request->device_ref->data != ref->data)
++        return VO_ERROR;
++    const struct mp_image_params *source = request->params;
++    if (!source || source->w <= 0 || source->h <= 0)
++        return VO_ERROR;
++    AVHWDeviceContext *device = (void *)ref->data;
++    struct ohcodec_output *output = device->user_opaque;
++    if (output->retired)
++        return VO_ERROR;
++    if (output->prepared && mp_image_params_equal(&output->source, source))
++        return VO_TRUE;
++    bool want_vpe = vo->opts->ohos_super_resolution && !vo->opts->ohos_sdr_to_hdr;
++    if (!output->vpe && !want_vpe) {
++        output->source = *source;
++        output->prepared = true;
++        return VO_TRUE;
++    }
++
++    if (output->prepared) {
++        // Frames can keep the old decoder/device/input Surface alive. Stop
++        // its output producer, but let its last owner destroy the input.
++        AVBufferRef *next = create_ohcodec_device_ref(vo);
++        AVBufferRef *decoder_ref = next ? av_buffer_ref(next) : NULL;
++        if (!decoder_ref) {
++            av_buffer_unref(&next);
++            return VO_ERROR;
++        }
++        output->retired = true;
++        if (!ohos_vpe_stop(output->vpe)) {
++            ohos_vpe_check(output->vpe, vo);
++            av_buffer_unref(&decoder_ref);
++            av_buffer_unref(&next);
++            return VO_ERROR;
++        }
++        av_buffer_unref(&p->hwctx.av_device_ref);
++        p->hwctx.av_device_ref = next;
++        request->replacement = decoder_ref;
++        device = (void *)next->data;
++        output = device->user_opaque;
++    }
++
++    output->source = *source;
++    output->prepared = true;
++    if (want_vpe) {
++        int source_w = 0, source_h = 0;
++        mp_image_params_get_dsize(source, &source_w, &source_h);
++        int width = vo->opts->ohos_surface_size.w;
++        int height = vo->opts->ohos_surface_size.h;
++        if (width <= 0 || height <= 0) {
++            width = source_w;
++            height = source_h;
++        }
++        double scale = MPMIN((double)width / source_w,
++                            (double)height / source_h);
++        width = MPMAX(2, (int)(source_w * scale)) & ~1;
++        height = MPMAX(2, (int)(source_h * scale)) & ~1;
++        MP_WARN(vo, "[SuperResolution] source=%dx%d sar=%d:%d output=%dx%d before decoder open\n",
++                source->w, source->h, source->p_w, source->p_h, width, height);
++        output->vpe = ohos_vpe_create(vo->log, output->window, width, height);
++        ohos_vpe_attach(output->vpe, vo);
++        AVOHCodecDeviceContext *hwctx = device->hwctx;
++        hwctx->native_window = output->vpe ? ohos_vpe_input(output->vpe)
++                                         : output->window;
++    }
++    return VO_TRUE;
++}
++
++static bool frame_uses_current_device(struct vo *vo, struct mp_image *image)
++{
++    struct priv *p = vo->priv;
++    if (!image->hwctx || !p->hwctx.av_device_ref)
++        return false;
++    AVHWFramesContext *frames = (void *)image->hwctx->data;
++    if (!frames->device_ref ||
++        frames->device_ref->data != p->hwctx.av_device_ref->data)
++        return false;
++    AVHWDeviceContext *device = (void *)frames->device_ref->data;
++    struct ohcodec_output *output = device->user_opaque;
++    return output && !output->retired;
++}
++
+ static void update_osd_resolution(struct vo *vo)
+ {
+     struct priv *p = vo->priv;
+@@ -296,20 +381,8 @@ static void resize(struct vo *vo)
+     if (get_video_surface_size(vo, &width, &height)) {
+         vo->dwidth = width;
+         vo->dheight = height;
+-        struct priv *p = vo->priv;
+-        AVHWDeviceContext *device = (void *)p->hwctx.av_device_ref->data;
+-        struct ohcodec_output *output = device->user_opaque;
+-        // Keep the enhanced buffers' aspect ratio; the display Surface applies
+-        // fit/stretch afterwards, just as it does for unprocessed decoder frames.
+-        int source_w = 0, source_h = 0;
+-        if (vo->params)
+-            mp_image_params_get_dsize(vo->params, &source_w, &source_h);
+-        if (source_w > 0 && source_h > 0) {
+-            double scale = MPMIN((double)width / source_w, (double)height / source_h);
+-            width = MPMAX(2, (int)(source_w * scale)) & ~1;
+-            height = MPMAX(2, (int)(source_h * scale)) & ~1;
+-        }
+-        ohos_vpe_resize(output->vpe, width, height);
++        // The processing buffers retain their source DAR for this decoder.
++        // Window changes only affect final fit/stretch, never VPE geometry.
+     }
+     update_video_scaling_mode(vo);
+     update_osd_resolution(vo);
+@@ -906,6 +979,10 @@ static void flip_page(struct vo *vo)
+         (AVOHCodecBuffer *)p->next_image->planes[3];
+     if (!buffer) {
+         MP_ERR(vo, "OHCodec frame is missing its output token\n");
++    } else if (!frame_uses_current_device(vo, p->next_image)) {
++        // A retained frame from a previous decoder generation must not be
++        // rendered to its retired VPE or counted as new-generation input.
++        av_ohcodec_release_buffer(buffer, 0);
+     } else {
+         AVHWDeviceContext *device = (void *)p->hwctx.av_device_ref->data;
+         struct ohcodec_output *output = device->user_opaque;
+@@ -937,6 +1014,8 @@ static int control(struct vo *vo, uint32_t request, void *data)
+     }
+ 
+     switch (request) {
++    case VOCTRL_PREPARE_DECODER:
++        return prepare_decoder(vo, data);
+     case VOCTRL_SET_PANSCAN:
+     case VOCTRL_VO_OPTS_CHANGED:
+         resize(vo);
