@@ -1,0 +1,62 @@
+diff --git a/sub/osd.c b/sub/osd.c
+--- a/sub/osd.c
++++ b/sub/osd.c
+@@ -544,7 +544,8 @@
+ // is <0, strictly letter-box the subtitles according to the supplied aspect
+ // ratio. If it is 0, stretch them.
+ void osd_rescale_bitmaps(struct sub_bitmaps *imgs, int frame_w, int frame_h,
+-                         struct mp_osd_res res, double compensate_par)
++                         struct mp_osd_res res, double compensate_par,
++                         bool fit_width)
+ {
+     int vidw = res.w - res.ml - res.mr;
+     int vidh = res.h - res.mt - res.mb;
+@@ -556,7 +557,20 @@
+     }
+     if (compensate_par > 0)
+         xscale /= compensate_par;
+-    int cx = vidw / 2 - (int)(frame_w * xscale) / 2;
++
++    // Fit a height-scaled subtitle canvas inside the output without changing
++    // its pixel aspect ratio or the center of its reference video rectangle.
++    double scaled_width = frame_w * xscale;
++    if (fit_width && res.ml >= 0 && res.mr >= 0 && res.mt >= 0 && res.mb >= 0) {
++        int max_width = vidw + 2 * MPMIN(res.ml, res.mr);
++        if (max_width > 0 && scaled_width > max_width) {
++            xscale = (double)max_width / frame_w;
++            yscale *= max_width / scaled_width;
++            scaled_width = max_width;
++        }
++    }
++
++    int cx = vidw / 2 - (int)scaled_width / 2;
+     int cy = vidh / 2 - (int)(frame_h * yscale) / 2;
+     for (int i = 0; i < imgs->num_parts; i++) {
+         struct sub_bitmap *bi = &imgs->parts[i];
+diff --git a/sub/osd.h b/sub/osd.h
+--- a/sub/osd.h
++++ b/sub/osd.h
+@@ -234,7 +234,8 @@
+ struct mp_osd_res osd_get_vo_res(struct osd_state *osd);
+ 
+ void osd_rescale_bitmaps(struct sub_bitmaps *imgs, int frame_w, int frame_h,
+-                         struct mp_osd_res res, double compensate_par);
++                         struct mp_osd_res res, double compensate_par,
++                         bool fit_width);
+ 
+ struct osd_external_ass {
+     void *owner; // unique pointer (NULL is also allowed)
+diff --git a/sub/sd_lavc.c b/sub/sd_lavc.c
+--- a/sub/sd_lavc.c
++++ b/sub/sd_lavc.c
+@@ -524,7 +524,9 @@
+         }
+     }
+ 
+-    osd_rescale_bitmaps(res, w, h, d, video_par);
++    bool fit_width = priv->avctx->codec_id == AV_CODEC_ID_HDMV_PGS_SUBTITLE &&
++                     !opts->stretch_image_subs;
++    osd_rescale_bitmaps(res, w, h, d, video_par, fit_width);
+ 
+     float sub_scale = sd->order == 1 ? shared_opts->secondary_sub_scale : opts->sub_scale;
+     if (sub_scale != 1.0 && shared_opts->ass_style_override[sd->order]) {
