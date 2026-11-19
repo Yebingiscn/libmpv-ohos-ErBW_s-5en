@@ -1,0 +1,15 @@
+diff --git a/src/opengl/formats.c b/src/opengl/formats.c
+--- a/src/opengl/formats.c
++++ b/src/opengl/formats.c
+@@ -183,10 +183,10 @@
+     {GL_RG16UI,         RGI,   U16, FMT("rg16u",   16, UINT, S|F|V)},
+     {GL_RGB16UI,        RGBI,  U16, FMT("rgb16u",  16, UINT, S|V)},
+     {GL_RGBA16UI,       RGBAI, U16, FMT("rgba16u", 16, UINT, S|F|V)},
++    {GL_R32UI,          RI,    U32, FMT("r32u",    32, UINT, S|F|V)},
+ };
+ 
+ /* TODO
+-    {GL_R32UI,          RI,    U32, FMT("r32u",    32, UINT)},
+     {GL_RG32UI,         RGI,   U32, FMT("rg32u",   32, UINT)},
+     {GL_RGB32UI,        RGBI,  U32, FMT("rgb32u",  32, UINT)},
+     {GL_RGBA32UI,       RGBAI, U32, FMT("rgba32u", 32, UINT)},
