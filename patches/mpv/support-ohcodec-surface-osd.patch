@@ -1,8 +1,8 @@
 diff --git a/meson.build b/meson.build
-index 1e9c7c4579b51d199988c12ac3bac55b1249086c..dbc74f969df638536e25bc868ddbc90024b06eb2 100644
+index 830066234c1cf9a0e71b7a0e3d560ab33d57e709..fa357cef616267607b95f19eb13f7aa3f1df0f85 100644
 --- a/meson.build
 +++ b/meson.build
-@@ -488,7 +488,8 @@ if features['ohos']
+@@ -514,7 +514,8 @@ if features['ohos']
                       cc.find_library('native_window')]
      sources += files('audio/out/ao_ohaudio.c',
                       'video/out/ohos_common.c',
@@ -12,11 +12,25 @@ index 1e9c7c4579b51d199988c12ac3bac55b1249086c..dbc74f969df638536e25bc868ddbc900
  endif
  
  uwp_opt = get_option('uwp').require(
+diff --git a/video/out/hwdec/hwdec_ohcodec_pl.c b/video/out/hwdec/hwdec_ohcodec_pl.c
+index c92432cacfaedb4937351f6fcfd5b103190aab54..39789ebdf2d780b36f65c5daebecf7f3bb7ecc0e 100644
+--- a/video/out/hwdec/hwdec_ohcodec_pl.c
++++ b/video/out/hwdec/hwdec_ohcodec_pl.c
+@@ -1,6 +1,7 @@
+ /* HarmonyOS ConsumerSurface + Vulkan NativeBuffer zero-copy interop. */
+ 
+ #include <inttypes.h>
++#include <stdbool.h>
+ #include <string.h>
+ #include <unistd.h>
+ 
 diff --git a/video/out/opengl/context_ohos.c b/video/out/opengl/context_ohos.c
-index 45aa145adc..3651696bea 100644
+index 5d71cfb275795d79566e5ff1d70a4bd8dd20ba41..03ac7e6bc20f5b1d4e6569a420454ff86cc102ed 100644
 --- a/video/out/opengl/context_ohos.c
 +++ b/video/out/opengl/context_ohos.c
-@@ -82,2 +82,21 @@ static bool ohos_init(struct ra_ctx *ctx)
+@@ -80,11 +80,32 @@ static bool ohos_init(struct ra_ctx *ctx)
+         goto fail;
+ 
      OHNativeWindow *native_window = vo_ohos_native_window(ctx->vo);
 +    EGLint native_visual_id = 0;
 +    if (!eglGetConfigAttrib(p->egl_display, config, EGL_NATIVE_VISUAL_ID,
@@ -38,15 +52,18 @@ index 45aa145adc..3651696bea 100644
 +    }
 +
      p->egl_surface = eglCreateWindowSurface(p->egl_display, config,
-@@ -86,3 +105,5 @@ static bool ohos_init(struct ra_ctx *ctx)
+                                     (EGLNativeWindowType)native_window, NULL);
+ 
      if (p->egl_surface == EGL_NO_SURFACE) {
 -        MP_FATAL(ctx, "Could not create EGL surface!\n");
 +        MP_FATAL(ctx,
 +                 "Could not create EGL surface (error=0x%x, format=%d)!\n",
 +                 eglGetError(), native_visual_id);
          goto fail;
+     }
+ 
 diff --git a/video/out/vo.c b/video/out/vo.c
-index c9cde3047838c84e80a6a875e5b8e21dd971539e..78837cd197c402885ee729027325ef5bfed1dc3e 100644
+index c90a55cc4cac51a25c042f4ba04c51a8194d3266..e3090a7fe1a757b81737a6cef8ab391fc6e9b7e8 100644
 --- a/video/out/vo.c
 +++ b/video/out/vo.c
 @@ -47,6 +47,7 @@
@@ -57,7 +74,7 @@ index c9cde3047838c84e80a6a875e5b8e21dd971539e..78837cd197c402885ee729027325ef5b
  extern const struct vo_driver video_out_x11;
  extern const struct vo_driver video_out_vdpau;
  extern const struct vo_driver video_out_xv;
-@@ -88,6 +89,9 @@ static const struct vo_driver *const video_out_drivers[] =
+@@ -91,6 +92,9 @@ static const struct vo_driver *const video_out_drivers[] =
  #if HAVE_ANDROID
      &video_out_mediacodec_embed,
  #endif
@@ -69,7 +86,7 @@ index c9cde3047838c84e80a6a875e5b8e21dd971539e..78837cd197c402885ee729027325ef5b
  #endif
 diff --git a/video/out/vo_ohcodec.c b/video/out/vo_ohcodec.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..d1391d862cadafb2b969a301f337832bd0ea721c
+index 0000000000000000000000000000000000000000..70c832fb69ca4815b2bd6c0561365b45f1b75cc5
 --- /dev/null
 +++ b/video/out/vo_ohcodec.c
 @@ -0,0 +1,667 @@
@@ -740,11 +757,3 @@ index 0000000000000000000000000000000000000000..d1391d862cadafb2b969a301f337832b
 +    .uninit = uninit,
 +    .priv_size = sizeof(struct priv),
 +};
-diff --git a/video/out/hwdec/hwdec_ohcodec_pl.c b/video/out/hwdec/hwdec_ohcodec_pl.c
---- a/video/out/hwdec/hwdec_ohcodec_pl.c
-+++ b/video/out/hwdec/hwdec_ohcodec_pl.c
-@@ -3,3 +3,4 @@
- #include <inttypes.h>
-+#include <stdbool.h>
- #include <string.h>
- #include <unistd.h>

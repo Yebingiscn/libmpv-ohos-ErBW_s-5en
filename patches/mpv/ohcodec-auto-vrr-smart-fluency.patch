@@ -1,8 +1,8 @@
 diff --git a/filters/f_decoder_wrapper.c b/filters/f_decoder_wrapper.c
-index 5e2e8d74c0..e2a7485821 100644
+index 4a2a3e4a185b967b67e6ce82e3cb13bdcccdadc6..4bbb350c04ad68032275bd9235fb0918a9a91705 100644
 --- a/filters/f_decoder_wrapper.c
 +++ b/filters/f_decoder_wrapper.c
-@@ -212,6 +212,8 @@ struct priv {
+@@ -213,6 +213,8 @@ struct priv {
      int coverart_returned; // 0: no, 1: coverart frame itself, 2: EOF returned
  
      int play_dir;
@@ -11,9 +11,9 @@ index 5e2e8d74c0..e2a7485821 100644
  
      // --- The following fields can be accessed only from the mp_decoder_wrapper
      //     user thread.
-@@ -350,6 +352,10 @@ int mp_decoder_wrapper_control(struct mp_decoder_wrapper *d,
-     struct priv *p = d->f->priv;
-     int res = CONTROL_UNKNOWN;
+@@ -376,6 +378,10 @@ int mp_decoder_wrapper_control(struct mp_decoder_wrapper *d,
+         return res;
+     }
      thread_lock(p);
 +    if (cmd == VDCTRL_SET_PLAYBACK_SPEED) {
 +        p->playback_speed = *(double *)arg;
@@ -22,7 +22,7 @@ index 5e2e8d74c0..e2a7485821 100644
      if (cmd == VDCTRL_GET_HWDEC) {
          res = update_cached_values(p);
          mp_mutex_lock(&p->cache_lock);
-@@ -455,6 +461,10 @@ static bool reinit_decoder(struct priv *p)
+@@ -489,6 +495,10 @@ static bool reinit_decoder(struct priv *p)
  
          p->decoder = driver->create(p->decf, p->codec, sel->decoder);
          if (p->decoder) {
@@ -30,23 +30,23 @@ index 5e2e8d74c0..e2a7485821 100644
 +                p->decoder->control(p->decoder->f,
 +                                    VDCTRL_SET_PLAYBACK_SPEED,
 +                                    &p->playback_speed);
-             p->codec->decoder = talloc_strdup(p, sel->decoder);
-             p->codec->decoder_desc = talloc_strdup(p, sel->desc && sel->desc[0] ? sel->desc : NULL);
+             p->codec->decoder = talloc_strdup(p->codec, sel->decoder);
+             p->codec->decoder_desc = talloc_strdup(p->codec, sel->desc && sel->desc[0] ? sel->desc : NULL);
              MP_VERBOSE(p, "Selected decoder: %s", sel->decoder);
 diff --git a/filters/f_decoder_wrapper.h b/filters/f_decoder_wrapper.h
-index a352dc0c4d..d0a79a1b47 100644
+index b39d3f5f2a90dc65187084a0c4c4563102b215e1..52f55912ec3f0f1ac33315a2f26b0ddd5a460154 100644
 --- a/filters/f_decoder_wrapper.h
 +++ b/filters/f_decoder_wrapper.h
-@@ -75,6 +75,7 @@ enum dec_ctrl {
-     // framedrop mode: 0=none, 1=standard, 2=hrseek
-     VDCTRL_SET_FRAMEDROP,
+@@ -81,6 +81,7 @@ enum dec_ctrl {
+     // int*: extra hw surfaces retained
+     VDCTRL_SET_EXTRA_HW_FRAMES,
      VDCTRL_CHECK_FORCED_EOF,
 +    VDCTRL_SET_PLAYBACK_SPEED,
  };
  
  int mp_decoder_wrapper_control(struct mp_decoder_wrapper *d,
 diff --git a/player/audio.c b/player/audio.c
-index b3e975dd2e..9f90460d0e 100644
+index 553873b6e1fa9268d6ae9f3507c252112f7a9999..767b5a4f74dbada14d45809d289fb59fc2a7c799 100644
 --- a/player/audio.c
 +++ b/player/audio.c
 @@ -199,6 +199,13 @@ void update_playback_speed(struct MPContext *mpctx)
@@ -64,10 +64,10 @@ index b3e975dd2e..9f90460d0e 100644
  }
  
 diff --git a/player/video.c b/player/video.c
-index 0e1ac290d2..5f802f71e9 100644
+index a4fb7e635857d27c8ba817c66e3e4af15726837a..a811cf34081f9b623e5571fe0fa28fb9f111692b 100644
 --- a/player/video.c
 +++ b/player/video.c
-@@ -191,6 +191,9 @@ int init_video_decoder(struct MPContext *mpctx, struct track *track)
+@@ -199,6 +199,9 @@ int init_video_decoder(struct MPContext *mpctx, struct track *track)
      if (!mp_decoder_wrapper_reinit(track->dec))
          goto err_out;
  
@@ -78,10 +78,10 @@ index 0e1ac290d2..5f802f71e9 100644
  
  err_out:
 diff --git a/video/decode/vd_lavc.c b/video/decode/vd_lavc.c
-index 224d522e6b..0901923078 100644
+index d9ab554c205eab6d20e49da86975453fe6bb098e..28f800e17b9c729271ff2103a842cd2deb40959d 100644
 --- a/video/decode/vd_lavc.c
 +++ b/video/decode/vd_lavc.c
-@@ -845,6 +845,11 @@ static void init_avctx(struct mp_filter *vd)
+@@ -868,6 +868,11 @@ static void init_avctx(struct mp_filter *vd)
          goto error;
      }
  
@@ -93,7 +93,7 @@ index 224d522e6b..0901923078 100644
  #ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
      if (avctx->width > 8192 || avctx->height > 8192) {
          MP_ERR(vd, "Frame size too big %" PRIu32 "x%" PRIu32 ".\n", avctx->width, avctx->height);
-@@ -1392,6 +1397,13 @@ static int control(struct mp_filter *vd, enum dec_ctrl cmd, void *arg)
+@@ -1458,6 +1463,13 @@ static int control(struct mp_filter *vd, enum dec_ctrl cmd, void *arg)
      case VDCTRL_REINIT:
          reinit(vd);
          return CONTROL_TRUE;

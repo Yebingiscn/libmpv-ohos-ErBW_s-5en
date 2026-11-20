@@ -1,130 +1,6 @@
-diff --git a/filters/f_decoder_wrapper.c b/filters/f_decoder_wrapper.c
---- a/filters/f_decoder_wrapper.c
-+++ b/filters/f_decoder_wrapper.c
-@@ -49,6 +49,7 @@
- 
- #include "f_async_queue.h"
- #include "f_decoder_wrapper.h"
-+#include "dts_pts_repair.h"
- #include "f_demux_in.h"
- #include "filter_internal.h"
- 
-@@ -97,6 +98,7 @@ struct dec_wrapper_opts {
-     int aspect_method;
-     double fps_override;
-     bool correct_pts;
-+    bool repair_dts_pts;
-     int video_rotate;
-     char *audio_decoders;
-     char *video_decoders;
-@@ -113,6 +115,7 @@ static int decoder_list_help(struct mp_log *log, const m_option_t *opt,
- const struct m_sub_options dec_wrapper_conf = {
-     .opts = (const struct m_option[]){
-         {"correct-pts", OPT_BOOL(correct_pts)},
-+        {"video-repair-dts-pts", OPT_BOOL(repair_dts_pts), .flags = UPDATE_VD},
-         {"container-fps-override", OPT_DOUBLE(fps_override), M_RANGE(0, DBL_MAX)},
-         {"ad", OPT_STRING(audio_decoders),
-             .flags = UPDATE_AD,
-@@ -141,6 +144,7 @@ const struct m_sub_options dec_wrapper_conf = {
-     .size = sizeof(struct dec_wrapper_opts),
-     .defaults = &(const struct dec_wrapper_opts){
-         .correct_pts = true,
-+        .repair_dts_pts = true,
-         .movie_aspect = -2.,
-         .aspect_method = 2,
-         .video_reverse_size = 1 * 1024 * 1024 * 1024,
-@@ -172,6 +176,7 @@ struct priv {
- 
-     // Last PTS from decoder (set with each vd_driver->decode() call)
-     double codec_pts;
-+    struct mp_dts_pts_repair dts_pts_repair;
-     int num_codec_pts_problems;
- 
-     // Last packet DTS from decoder (passed through from source packets)
-@@ -302,6 +307,7 @@ static void thread_unlock(struct priv *p)
- // some of the user-relevant state.
- static void reset_decoder(struct priv *p)
- {
-+    mp_dts_pts_reset(&p->dts_pts_repair);
-     p->first_packet_pdts = MP_NOPTS_VALUE;
-     p->start_pts = MP_NOPTS_VALUE;
-     p->codec_pts = MP_NOPTS_VALUE;
-@@ -407,6 +413,7 @@ static bool reinit_decoder(struct priv *p)
-         talloc_free(p->decoder->f);
-     p->decoder = NULL;
- 
-+    p->dts_pts_repair = (struct mp_dts_pts_repair){0};
-     reset_decoder(p);
-     p->has_broken_packet_pts = -10; // needs 10 packets to reach decision
- 
-@@ -731,6 +738,23 @@ static bool process_decoded_frame(struct priv *p, struct mp_frame *frame)
-     if (frame->type == MP_FRAME_VIDEO) {
-         struct mp_image *mpi = frame->data;
- 
-+        if (p->opts->correct_pts && p->opts->repair_dts_pts && p->play_dir > 0) {
-+            bool active = p->dts_pts_repair.active;
-+            double raw_pts = mpi->pts;
-+            mpi->pts = mp_dts_pts_frame(&p->dts_pts_repair, raw_pts,
-+                                      raw_pts != MP_NOPTS_VALUE);
-+            if (p->dts_pts_repair.active) {
-+                // The reconstructed clock must also drive captions and seek
-+                // clipping below, before the usual DTS fallback can run.
-+                mpi->dts = MP_NOPTS_VALUE;
-+                p->has_broken_packet_pts = 1;
-+                if (!active)
-+                    MP_WARN(p, "[TimestampRepair] enabled fps=%.6f packets=%u "
-+                            "regressions=%u raw=%.6f repaired=%.6f\n",
-+                            p->fps, p->dts_pts_repair.packets,
-+                            p->dts_pts_repair.regressions, raw_pts, mpi->pts);
-+            }
-+        }
-         crazy_video_pts_stuff(p, mpi);
- 
-         struct demux_packet *ccpkt = new_demux_packet_from_buf(p->public.f->packet_pool,
-@@ -922,6 +946,19 @@ static void feed_packet(struct priv *p)
-     struct demux_packet *packet =
-         p->packet.type == MP_FRAME_PACKET ? p->packet.data : NULL;
- 
-+    bool repair = p->codec->type == STREAM_VIDEO && p->play_dir > 0 &&
-+                  p->opts->correct_pts && p->opts->repair_dts_pts;
-+    if (repair && packet) {
-+        bool active = p->dts_pts_repair.active;
-+        // Inspect the original timestamps before the missing-DTS fallback.
-+        mp_dts_pts_packet(&p->dts_pts_repair, packet->pts, packet->dts,
-+                          packet->duration, p->fps,
-+                          packet->pts != MP_NOPTS_VALUE &&
-+                          packet->dts != MP_NOPTS_VALUE);
-+        if (active && !p->dts_pts_repair.active)
-+            MP_WARN(p, "[TimestampRepair] disabled: packet cadence changed\n");
-+    }
-+
-     // For video framedropping, including parts of the hr-seek logic.
-     if (p->decoder->control) {
-         double start_pts = p->start_pts;
-@@ -940,6 +977,10 @@ static void feed_packet(struct priv *p)
-             packet->pts < start_pts - .005 && !p->has_broken_packet_pts)
-             framedrop_type = 2;
- 
-+        // Counting decoded frames requires every frame, including seek
-+        // preroll. Presentation can still drop late frames after timestamping.
-+        if (repair && mp_dts_pts_no_drop(&p->dts_pts_repair))
-+            framedrop_type = 0;
-         p->decoder->control(p->decoder->f, VDCTRL_SET_FRAMEDROP, &framedrop_type);
-     }
- 
-@@ -1035,7 +1076,9 @@ static void read_frame(struct priv *p)
-     mp_mutex_lock(&p->cache_lock);
-     if (p->attached_picture && frame.type == MP_FRAME_VIDEO)
-         p->decoded_coverart = frame;
--    if (p->attempt_framedrops) {
-+    if (p->attempt_framedrops &&
-+        !(p->opts->correct_pts && p->opts->repair_dts_pts && p->play_dir > 0 &&
-+          mp_dts_pts_no_drop(&p->dts_pts_repair))) {
-         int dropped = MPMAX(0, p->packets_without_output - 1);
-         p->attempt_framedrops = MPMAX(0, p->attempt_framedrops - dropped);
-         p->dropped_frames += dropped;
 diff --git a/filters/dts_pts_repair.h b/filters/dts_pts_repair.h
 new file mode 100644
+index 0000000000000000000000000000000000000000..82fb0ad9471045d4a0fc3a215344825464d8f8f2
 --- /dev/null
 +++ b/filters/dts_pts_repair.h
 @@ -0,0 +1,80 @@
@@ -208,3 +84,129 @@ new file mode 100644
 +    s->frames++;
 +    return result;
 +}
+diff --git a/filters/f_decoder_wrapper.c b/filters/f_decoder_wrapper.c
+index 4bbb350c04ad68032275bd9235fb0918a9a91705..56b3d8e62d01f48ef3d54a5ee1358002b4701613 100644
+--- a/filters/f_decoder_wrapper.c
++++ b/filters/f_decoder_wrapper.c
+@@ -49,6 +49,7 @@
+ 
+ #include "f_async_queue.h"
+ #include "f_decoder_wrapper.h"
++#include "dts_pts_repair.h"
+ #include "f_demux_in.h"
+ #include "f_lavfi.h"
+ #include "filter_internal.h"
+@@ -98,6 +99,7 @@ struct dec_wrapper_opts {
+     int aspect_method;
+     double fps_override;
+     bool correct_pts;
++    bool repair_dts_pts;
+     int video_rotate;
+     char *audio_decoders;
+     char *video_decoders;
+@@ -114,6 +116,7 @@ static int decoder_list_help(struct mp_log *log, const m_option_t *opt,
+ const struct m_sub_options dec_wrapper_conf = {
+     .opts = (const struct m_option[]){
+         {"correct-pts", OPT_BOOL(correct_pts)},
++        {"video-repair-dts-pts", OPT_BOOL(repair_dts_pts), .flags = UPDATE_VD},
+         {"container-fps-override", OPT_DOUBLE(fps_override), M_RANGE(0, DBL_MAX)},
+         {"ad", OPT_STRING(audio_decoders),
+             .flags = UPDATE_AD,
+@@ -142,6 +145,7 @@ const struct m_sub_options dec_wrapper_conf = {
+     .size = sizeof(struct dec_wrapper_opts),
+     .defaults = &(const struct dec_wrapper_opts){
+         .correct_pts = true,
++        .repair_dts_pts = true,
+         .movie_aspect = -2.,
+         .aspect_method = 2,
+         .video_reverse_size = 1 * 1024 * 1024 * 1024,
+@@ -173,6 +177,7 @@ struct priv {
+ 
+     // Last PTS from decoder (set with each vd_driver->decode() call)
+     double codec_pts;
++    struct mp_dts_pts_repair dts_pts_repair;
+     int num_codec_pts_problems;
+ 
+     // Last packet DTS from decoder (passed through from source packets)
+@@ -315,6 +320,7 @@ static void thread_unlock(struct priv *p)
+ // some of the user-relevant state.
+ static void reset_decoder(struct priv *p)
+ {
++    mp_dts_pts_reset(&p->dts_pts_repair);
+     p->first_packet_pdts = MP_NOPTS_VALUE;
+     p->start_pts = MP_NOPTS_VALUE;
+     p->codec_pts = MP_NOPTS_VALUE;
+@@ -433,6 +439,7 @@ static bool reinit_decoder(struct priv *p)
+         talloc_free(p->decoder->f);
+     p->decoder = NULL;
+ 
++    p->dts_pts_repair = (struct mp_dts_pts_repair){0};
+     reset_decoder(p);
+     p->has_broken_packet_pts = -10; // needs 10 packets to reach decision
+ 
+@@ -802,6 +809,23 @@ static bool process_decoded_frame(struct priv *p, struct mp_frame *frame)
+     if (frame->type == MP_FRAME_VIDEO) {
+         struct mp_image *mpi = frame->data;
+ 
++        if (p->opts->correct_pts && p->opts->repair_dts_pts && p->play_dir > 0) {
++            bool active = p->dts_pts_repair.active;
++            double raw_pts = mpi->pts;
++            mpi->pts = mp_dts_pts_frame(&p->dts_pts_repair, raw_pts,
++                                      raw_pts != MP_NOPTS_VALUE);
++            if (p->dts_pts_repair.active) {
++                // The reconstructed clock must also drive captions and seek
++                // clipping below, before the usual DTS fallback can run.
++                mpi->dts = MP_NOPTS_VALUE;
++                p->has_broken_packet_pts = 1;
++                if (!active)
++                    MP_WARN(p, "[TimestampRepair] enabled fps=%.6f packets=%u "
++                            "regressions=%u raw=%.6f repaired=%.6f\n",
++                            p->fps, p->dts_pts_repair.packets,
++                            p->dts_pts_repair.regressions, raw_pts, mpi->pts);
++            }
++        }
+         crazy_video_pts_stuff(p, mpi);
+ 
+         struct demux_packet *ccpkt = new_demux_packet_from_buf(p->public.f->packet_pool,
+@@ -1003,6 +1027,19 @@ static void feed_packet(struct priv *p)
+     struct demux_packet *packet =
+         p->packet.type == MP_FRAME_PACKET ? p->packet.data : NULL;
+ 
++    bool repair = p->codec->type == STREAM_VIDEO && p->play_dir > 0 &&
++                  p->opts->correct_pts && p->opts->repair_dts_pts;
++    if (repair && packet) {
++        bool active = p->dts_pts_repair.active;
++        // Inspect the original timestamps before the missing-DTS fallback.
++        mp_dts_pts_packet(&p->dts_pts_repair, packet->pts, packet->dts,
++                          packet->duration, p->fps,
++                          packet->pts != MP_NOPTS_VALUE &&
++                          packet->dts != MP_NOPTS_VALUE);
++        if (active && !p->dts_pts_repair.active)
++            MP_WARN(p, "[TimestampRepair] disabled: packet cadence changed\n");
++    }
++
+     // For video framedropping, including parts of the hr-seek logic.
+     if (p->decoder->control) {
+         double start_pts = p->start_pts;
+@@ -1021,6 +1058,10 @@ static void feed_packet(struct priv *p)
+             packet->pts < start_pts - .005 && !p->has_broken_packet_pts)
+             framedrop_type = 2;
+ 
++        // Counting decoded frames requires every frame, including seek
++        // preroll. Presentation can still drop late frames after timestamping.
++        if (repair && mp_dts_pts_no_drop(&p->dts_pts_repair))
++            framedrop_type = 0;
+         p->decoder->control(p->decoder->f, VDCTRL_SET_FRAMEDROP, &framedrop_type);
+     }
+ 
+@@ -1121,7 +1162,9 @@ static void read_frame(struct priv *p)
+     mp_mutex_lock(&p->cache_lock);
+     if (p->attached_picture && frame.type == MP_FRAME_VIDEO)
+         p->decoded_coverart = frame;
+-    if (p->attempt_framedrops) {
++    if (p->attempt_framedrops &&
++        !(p->opts->correct_pts && p->opts->repair_dts_pts && p->play_dir > 0 &&
++          mp_dts_pts_no_drop(&p->dts_pts_repair))) {
+         int dropped = MPMAX(0, p->packets_without_output - 1);
+         p->attempt_framedrops = MPMAX(0, p->attempt_framedrops - dropped);
+         p->dropped_frames += dropped;

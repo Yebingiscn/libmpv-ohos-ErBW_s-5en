@@ -1,9 +1,9 @@
 diff --git a/filters/f_decoder_wrapper.h b/filters/f_decoder_wrapper.h
-index 7747067..0dfe931 100644
+index 5d2c4ae713ab9b307a5b87a08284aa5dba245882..0df98bed0729222f9fc8b539bdeed3b8dccbfe63 100644
 --- a/filters/f_decoder_wrapper.h
 +++ b/filters/f_decoder_wrapper.h
-@@ -76,6 +76,7 @@ enum dec_ctrl {
-     VDCTRL_SET_FRAMEDROP,
+@@ -82,6 +82,7 @@ enum dec_ctrl {
+     VDCTRL_SET_EXTRA_HW_FRAMES,
      VDCTRL_CHECK_FORCED_EOF,
      VDCTRL_SET_PLAYBACK_SPEED,
 +    VDCTRL_SET_VRR_ENABLED,
@@ -11,10 +11,10 @@ index 7747067..0dfe931 100644
      VDCTRL_SET_DECODE_HINTS,
  };
 diff --git a/options/options.c b/options/options.c
-index 4745620..37e1bb4 100644
+index 3c6691ed326ffcdbee3a17b523cc04e21b8f718f..f67a80a1900a0b60fb3e14a20ff28ebec56b310c 100644
 --- a/options/options.c
 +++ b/options/options.c
-@@ -684,6 +684,8 @@ static const m_option_t mp_opts[] = {
+@@ -701,6 +701,8 @@ static const m_option_t mp_opts[] = {
      {"audio-channels", OPT_CHANNELS(audio_output_channels), .flags = UPDATE_AUDIO},
      {"audio-format", OPT_AUDIOFORMAT(audio_output_format), .flags = UPDATE_AUDIO},
      {"speed", OPT_DOUBLE(playback_speed), M_RANGE(0.01, 100.0)},
@@ -23,7 +23,7 @@ index 4745620..37e1bb4 100644
      {"pitch", OPT_DOUBLE(playback_pitch), M_RANGE(0.01, 100.0)},
  
      {"audio-pitch-correction", OPT_BOOL(pitch_correction)},
-@@ -1066,6 +1068,7 @@ static const struct MPOpts mp_default_opts = {
+@@ -1093,6 +1095,7 @@ static const struct MPOpts mp_default_opts = {
      .audio_display = 1,
      .audio_output_format = 0,  // AF_FORMAT_UNKNOWN
      .playback_speed = 1.,
@@ -32,10 +32,10 @@ index 4745620..37e1bb4 100644
      .pitch_correction = true,
      .audiofile_auto = -1,
 diff --git a/options/options.h b/options/options.h
-index 89d0c71..6ff62e6 100644
+index 6bb973707bfb1366b57150bd36adb42e486096df..1e9a7ad416fbcd4db573ea1db184967bfdec5ce7 100644
 --- a/options/options.h
 +++ b/options/options.h
-@@ -339,6 +339,7 @@ typedef struct MPOpts {
+@@ -353,6 +353,7 @@ typedef struct MPOpts {
      int audio_output_format;
      int force_srate;
      double playback_speed;
@@ -44,10 +44,10 @@ index 89d0c71..6ff62e6 100644
      bool pitch_correction;
      struct m_obj_settings *vf_settings;
 diff --git a/player/command.c b/player/command.c
-index 1f6253f..2365c7f 100644
+index b83657a5c1b8bde7a96514b2e1004ef163544967..ff50b38c99f32a52b38cb88cff07fc88ac61f0d8 100644
 --- a/player/command.c
 +++ b/player/command.c
-@@ -8043,6 +8043,14 @@ void mp_option_run_callback(struct MPContext *mpctx, struct mp_option_callback *
+@@ -8595,6 +8595,14 @@ void mp_option_run_callback(struct MPContext *mpctx, struct mp_option_callback *
          run_command_opts(mpctx);
      }
  
@@ -63,11 +63,11 @@ index 1f6253f..2365c7f 100644
          opt_ptr == &opts->pitch_correction) {
          update_playback_speed(mpctx);
 diff --git a/video/decode/vd_lavc.c b/video/decode/vd_lavc.c
-index 8163bb0..b5599dd 100644
+index 94e64196a0a27ddadf13502cf866ec78fcbf4f87..6b9ddc447d472bc44619886351ebc70b98c0efab 100644
 --- a/video/decode/vd_lavc.c
 +++ b/video/decode/vd_lavc.c
-@@ -858,6 +858,13 @@ static void init_avctx(struct mp_filter *vd)
-     }
+@@ -882,6 +882,13 @@ static void init_avctx(struct mp_filter *vd)
+     avctx->max_pixels = 2048 * 2048;
  #endif
  
 +    if (lavc_codec->wrapper_name &&
@@ -80,7 +80,7 @@ index 8163bb0..b5599dd 100644
      /* open it */
      if (avcodec_open2(avctx, lavc_codec, NULL) < 0)
          goto error;
-@@ -1422,6 +1429,12 @@ static int control(struct mp_filter *vd, enum dec_ctrl cmd, void *arg)
+@@ -1488,6 +1495,12 @@ static int control(struct mp_filter *vd, enum dec_ctrl cmd, void *arg)
          int ret = avcodec_ohcodec_set_decode_hints(ctx->avctx, hints[0], hints[1]);
          return ret >= 0 ? CONTROL_TRUE : CONTROL_FALSE;
      }

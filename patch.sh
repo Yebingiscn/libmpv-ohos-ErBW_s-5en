@@ -6,7 +6,7 @@ PATCHES=(patches/*)
 ROOT=$(pwd)
 
 # The public AVS+ integration also contains an unrelated DRA decoder. Import
-# only the three libcavs files, then let our FFmpeg 8.1 patch wire them into
+# only the three libcavs files, then let our FFmpeg patch wire them into
 # the build and apply the OpenHarmony portability fixes.
 CAVS_PATCH=$ROOT/libmpv/ffmpeg_cavs_dra/ffmpeg-7.1.2_cavs_dra.patch
 if [ ! -f "$CAVS_PATCH" ]; then
@@ -23,7 +23,7 @@ git -C ./libmpv/ffmpeg apply -p2 --recount \
   "$CAVS_PATCH"
 
 # The upstream patch stores these added files with CRLF line endings. Normalize
-# them before applying our LF-based FFmpeg 8.1/OpenHarmony compatibility patch;
+# them before applying our LF-based FFmpeg/OpenHarmony compatibility patch;
 # otherwise git apply fails on Linux runners even though the source is intact.
 sed -i 's/\r$//' \
   ./libmpv/ffmpeg/libavcodec/libcavs.c \

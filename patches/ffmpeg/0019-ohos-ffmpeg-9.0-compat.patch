@@ -1,0 +1,60 @@
+diff --git a/libavcodec/dstdec.c b/libavcodec/dstdec.c
+--- a/libavcodec/dstdec.c
++++ b/libavcodec/dstdec.c
+@@ -25,6 +25,7 @@
+  * ISO/IEC 14496-3 Part 3 Subpart 10: Technical description of lossless coding of oversampled audio
+  */
+ 
++#include "libavutil/internal.h"
+ #include "libavutil/intreadwrite.h"
+ #include "libavutil/mem_internal.h"
+ #include "libavutil/reverse.h"
+diff --git a/libavformat/av3adec.c b/libavformat/av3adec.c
+--- a/libavformat/av3adec.c
++++ b/libavformat/av3adec.c
+@@ -25,6 +25,7 @@
+ #include "rawdec.h"
+ #include "libavutil/opt.h"
+ #include "libavutil/avassert.h"
++#include "libavutil/internal.h"
+ #include "libavutil/intreadwrite.h"
+ #include "libavutil/channel_layout.h"
+ #include "libavcodec/get_bits.h"
+diff --git a/libavformat/ohos_http3.c b/libavformat/ohos_http3.c
+--- a/libavformat/ohos_http3.c
++++ b/libavformat/ohos_http3.c
+@@ -19,7 +19,6 @@
+ #include "avformat.h"
+ #include "ohos_http3.h"
+ #include "ohos_rcp_quic.h"
+-#include "tls.h"
+ 
+ #define H3_SLOTS 64
+ #define H3_BLOCK 4096
+@@ -174,6 +173,7 @@
+     pthread_mutex_t lock;
+     Rcp_QuicSession *session;
+     Rcp_QuicConn *conn;
++    char alpn[3];
+     nghttp3_conn *http;
+     H3Packet input[H3_SLOTS];
+     unsigned head, count;
+@@ -665,7 +665,7 @@
+     mbedtls_x509_crt_init(&s->ca);
+     av_bprint_init(&s->headers, 1024, 65536);
+     av_strlcpy(s->host, host, sizeof(s->host)); s->port = port;
+-    s->verify = TLS_VERIFY_DEFAULT;
++    s->verify = 1; /* Keep the FFmpeg TLS client default. */
+     entry = av_dict_get(options, "tls_verify", NULL, 0);
+     if (!entry) entry = av_dict_get(options, "verify", NULL, 0);
+     if (entry) {
+@@ -692,7 +692,8 @@
+     s->initial_deadline = now + FFMIN(H3_INITIAL_US, s->idle_us);
+     s->last_activity = now;
+     s->session = quic.CreateSession();
+-    s->conn = quic.ConnCreate("h3", s);
++    memcpy(s->alpn, "h3", sizeof(s->alpn));
++    s->conn = quic.ConnCreate(s->alpn, s);
+     if (!s->session || !s->conn) goto fail;
+     pthread_mutex_lock(&origin_lock);
+     s->next = active_connections; active_connections = s;

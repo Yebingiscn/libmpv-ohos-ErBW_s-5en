@@ -1,18 +1,5 @@
-diff --git a/audio/aframe.c b/audio/aframe.c
-index 16fb46e390..642e5d62f7 100644
---- a/audio/aframe.c
-+++ b/audio/aframe.c
-@@ -308,7 +308,7 @@ bool mp_aframe_set_format(struct mp_aframe *frame, int format)
-     if (av_format == AV_SAMPLE_FMT_NONE && format) {
-         if (!af_fmt_is_spdif(format))
-             return false;
--        av_format = format == AF_FORMAT_S_DOP ? AV_SAMPLE_FMT_S32 : AV_SAMPLE_FMT_S16;
-+        av_format = (format == AF_FORMAT_S_DOP || format == AF_FORMAT_S_DSD) ? AV_SAMPLE_FMT_S32 : AV_SAMPLE_FMT_S16;
-     }
-     frame->format = format;
-     frame->av_frame->format = av_format;
 diff --git a/audio/decode/ad_dop.c b/audio/decode/ad_dop.c
-index 95fec25028..7a71e2497c 100644
+index 95fec250289e57b91cd8c0cd56486d7fb93c2632..7a71e2497c5a0d93af5fa8be6e954d5cd85e432b 100644
 --- a/audio/decode/ad_dop.c
 +++ b/audio/decode/ad_dop.c
 @@ -1,92 +1,190 @@
@@ -254,7 +241,7 @@ index 95fec25028..7a71e2497c 100644
  const struct mp_decoder_fns ad_dop = {.create = create};
 diff --git a/audio/decode/dsd_packer.h b/audio/decode/dsd_packer.h
 new file mode 100644
-index 0000000000..aa1ac7212f
+index 0000000000000000000000000000000000000000..aa1ac7212fd0ec472d86ca74127a5c98b080583b
 --- /dev/null
 +++ b/audio/decode/dsd_packer.h
 @@ -0,0 +1,31 @@
@@ -290,42 +277,43 @@ index 0000000000..aa1ac7212f
 +}
 +#endif
 diff --git a/audio/format.c b/audio/format.c
-index 4d9d0e3ca8..087a17e8b2 100644
+index 053674d4fb860a96487da4e63a79b915a7cd673f..c5838522cac313356b6f5f8f0137779997c16c32 100644
 --- a/audio/format.c
 +++ b/audio/format.c
-@@ -25,7 +25,7 @@
- // number of bytes per sample, 0 if invalid/unknown
- int af_fmt_to_bytes(int format)
- {
--    if (format == AF_FORMAT_S_DOP) return 4;
-+    if ((format == AF_FORMAT_S_DOP || format == AF_FORMAT_S_DSD)) return 4;
-     switch (af_fmt_from_planar(format)) {
-     case AF_FORMAT_U8:      return 1;
-     case AF_FORMAT_S16:     return 2;
-@@ -59,7 +59,7 @@ bool af_fmt_is_int(int format)
- 
+@@ -33,7 +33,7 @@ int af_fmt_to_bytes(int format)
+     case AF_FORMAT_FLOAT:   return 4;
+     case AF_FORMAT_DOUBLE:  return 8;
+     }
+-    if (format == AF_FORMAT_S_DOP)
++    if (format == AF_FORMAT_S_DOP || format == AF_FORMAT_S_DSD)
+         return 4;
+     if (format == AF_FORMAT_DSD)
+         return 1;
+@@ -64,7 +64,8 @@ bool af_fmt_is_int(int format)
+ // true for IEC61937 wrapped formats only (not other bitstream formats)
  bool af_fmt_is_spdif(int format)
  {
 -    return format == AF_FORMAT_S_DOP || af_format_sample_alignment(format) > 1;
-+    return (format == AF_FORMAT_S_DOP || format == AF_FORMAT_S_DSD) || af_format_sample_alignment(format) > 1;
++    return format == AF_FORMAT_S_DOP || format == AF_FORMAT_S_DSD ||
++           af_format_sample_alignment(format) > 1;
  }
  
  bool af_fmt_is_pcm(int format)
-@@ -136,6 +136,7 @@ const char *af_fmt_to_str(int format)
+@@ -142,6 +143,7 @@ const char *af_fmt_to_str(int format)
      case AF_FORMAT_S_EAC3:      return "spdif-eac3";
      case AF_FORMAT_S_MP3:       return "spdif-mp3";
      case AF_FORMAT_S_TRUEHD:    return "spdif-truehd";
 +    case AF_FORMAT_S_DSD:       return "dsd-native";
      case AF_FORMAT_S_DOP:       return "dsd-dop";
+     case AF_FORMAT_DSD:         return "dsd";
      }
-     return "??";
 diff --git a/audio/format.h b/audio/format.h
-index 2ed89f33aa..6b05442a38 100644
+index 8e46642480e1c01b0e9cd8b99868735f94468647..ba16988511aeeddc803b5795f448fca410f1d60b 100644
 --- a/audio/format.h
 +++ b/audio/format.h
-@@ -50,6 +50,8 @@ enum af_format {
- 
-     AF_FORMAT_S_DOP, // Opaque DoP in a left-aligned 32-bit carrier.
+@@ -55,6 +55,8 @@ enum af_format {
+     // Raw DSD bitstream, MSBF interleaved.
+     AF_FORMAT_DSD,
  
 +    AF_FORMAT_S_DSD, // Opaque four-byte MSB-first native DSD carrier.
 +
@@ -333,7 +321,7 @@ index 2ed89f33aa..6b05442a38 100644
  };
  
 diff --git a/audio/out/ao.c b/audio/out/ao.c
-index f37c751510..a825a514d8 100644
+index f37c751510e049e4e9112ca139743a53107b96dd..a825a514d86768d800e6489cfc1b080393c75235 100644
 --- a/audio/out/ao.c
 +++ b/audio/out/ao.c
 @@ -319,7 +319,7 @@ struct ao *ao_init_best(struct mpv_global *global,
@@ -346,7 +334,7 @@ index f37c751510..a825a514d8 100644
          // A rejected bitstream must reach the player's PCM decoder fallback;
          // never pass compressed bytes through the ordinary PCM AO list.
 diff --git a/audio/out/ao_usb_exclusive.c b/audio/out/ao_usb_exclusive.c
-index a7439339a6..494ec29a55 100644
+index a7439339a6f7b2ac101f95230160bfb2a9fc4c20..494ec29a559185372282a75914f0b68ddbda33cb 100644
 --- a/audio/out/ao_usb_exclusive.c
 +++ b/audio/out/ao_usb_exclusive.c
 @@ -16,12 +16,14 @@
@@ -451,7 +439,7 @@ index a7439339a6..494ec29a55 100644
  };
 diff --git a/audio/out/usb_audio_dsd.h b/audio/out/usb_audio_dsd.h
 new file mode 100644
-index 0000000000..61de4bb51b
+index 0000000000000000000000000000000000000000..61de4bb51b37357cf3e96e53ec7ae075a8761a0c
 --- /dev/null
 +++ b/audio/out/usb_audio_dsd.h
 @@ -0,0 +1,48 @@
@@ -504,10 +492,10 @@ index 0000000000..61de4bb51b
 +}
 +#endif
 diff --git a/filters/f_decoder_wrapper.c b/filters/f_decoder_wrapper.c
-index 6fd47e0b72..d0943b54e6 100644
+index 8953030d0ebf4749d9556874c30b3822254cb425..8ae0ef87a554619602d6ee84fd984d8272d27250 100644
 --- a/filters/f_decoder_wrapper.c
 +++ b/filters/f_decoder_wrapper.c
-@@ -450,11 +450,13 @@ static bool reinit_decoder(struct priv *p)
+@@ -476,11 +476,13 @@ static bool reinit_decoder(struct priv *p)
          bool try_spdif = p->try_spdif;
          mp_mutex_unlock(&p->cache_lock);
  
@@ -525,10 +513,10 @@ index 6fd47e0b72..d0943b54e6 100644
              struct mp_decoder_list *spdif =
                  select_spdif_codec(p->codec->codec, p->opts->audio_spdif);
 diff --git a/player/audio.c b/player/audio.c
-index 10465cdedd..b1b2919d5c 100644
+index c04b15737825f680216ac2467f166c56a80f0f6f..aaefa95cb91eb1181af271c7c6fce31e2c29fddc 100644
 --- a/player/audio.c
 +++ b/player/audio.c
-@@ -508,7 +508,7 @@ static int reinit_audio_filters_and_output(struct MPContext *mpctx)
+@@ -510,7 +510,7 @@ static int reinit_audio_filters_and_output(struct MPContext *mpctx)
  
      if (!mpctx->ao) {
          // If spdif was used, try to fallback to PCM.

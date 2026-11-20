@@ -1,7 +1,8 @@
 diff --git a/sub/osd.c b/sub/osd.c
+index 0fb0a942c62879601f69afc3d1a0c9bfd6161d94..b59d6ed2df6349e6970a78e0a278298cd36e0b72 100644
 --- a/sub/osd.c
 +++ b/sub/osd.c
-@@ -544,7 +544,8 @@
+@@ -548,7 +548,8 @@ struct mp_osd_res osd_get_vo_res(struct osd_state *osd)
  // is <0, strictly letter-box the subtitles according to the supplied aspect
  // ratio. If it is 0, stretch them.
  void osd_rescale_bitmaps(struct sub_bitmaps *imgs, int frame_w, int frame_h,
@@ -11,7 +12,7 @@ diff --git a/sub/osd.c b/sub/osd.c
  {
      int vidw = res.w - res.ml - res.mr;
      int vidh = res.h - res.mt - res.mb;
-@@ -556,7 +557,20 @@
+@@ -560,7 +561,20 @@ void osd_rescale_bitmaps(struct sub_bitmaps *imgs, int frame_w, int frame_h,
      }
      if (compensate_par > 0)
          xscale /= compensate_par;
@@ -34,9 +35,10 @@ diff --git a/sub/osd.c b/sub/osd.c
      for (int i = 0; i < imgs->num_parts; i++) {
          struct sub_bitmap *bi = &imgs->parts[i];
 diff --git a/sub/osd.h b/sub/osd.h
+index ddb1c1efebc3019cd1a149e5c7066f500e493728..bcf477c718e85662dbaeb2d7e9e9641ef44fa84f 100644
 --- a/sub/osd.h
 +++ b/sub/osd.h
-@@ -234,7 +234,8 @@
+@@ -253,7 +253,8 @@ struct mp_osd_res osd_res_from_image_params(const struct mp_image_params *p);
  struct mp_osd_res osd_get_vo_res(struct osd_state *osd);
  
  void osd_rescale_bitmaps(struct sub_bitmaps *imgs, int frame_w, int frame_h,
@@ -47,9 +49,10 @@ diff --git a/sub/osd.h b/sub/osd.h
  struct osd_external_ass {
      void *owner; // unique pointer (NULL is also allowed)
 diff --git a/sub/sd_lavc.c b/sub/sd_lavc.c
+index ce9416e8dae049e06f62001b5aaddaf0bd8f3d54..48ca8d3237b0456d82100daf35b3d33db226d33d 100644
 --- a/sub/sd_lavc.c
 +++ b/sub/sd_lavc.c
-@@ -524,7 +524,9 @@
+@@ -568,7 +568,9 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res d,
          }
      }
  
@@ -58,5 +61,5 @@ diff --git a/sub/sd_lavc.c b/sub/sd_lavc.c
 +                     !opts->stretch_image_subs;
 +    osd_rescale_bitmaps(res, w, h, d, video_par, fit_width);
  
-     float sub_scale = sd->order == 1 ? shared_opts->secondary_sub_scale : opts->sub_scale;
-     if (sub_scale != 1.0 && shared_opts->ass_style_override[sd->order]) {
+     if (shared_opts->sub_scale[sd->order] != 1.0 && shared_opts->ass_style_override[sd->order]) {
+         for (int n = 0; n < res->num_parts; n++) {

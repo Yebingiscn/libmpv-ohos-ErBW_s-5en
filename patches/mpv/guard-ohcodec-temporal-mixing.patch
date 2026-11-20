@@ -1,11 +1,11 @@
 diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
-index cfa74c74e7..8e542c3008 100644
+index a5a060bb9f065b4704612bd3fc0f8e8225b41852..a3f019fb20aac9d7209428d2b43fe23c5158b41e 100644
 --- a/video/out/vo_gpu_next.c
 +++ b/video/out/vo_gpu_next.c
-@@ -134,6 +134,10 @@ struct priv {
-     bool is_interpolated;
-     bool want_reset;
-     bool frame_pending;
+@@ -157,6 +157,10 @@ struct priv {
+     bool paused;
+     int last_ref_white;
+     int last_srgb_power22;
 +    // OHCodec's NativeImage interop exposes one mutable external image. Keep
 +    // temporal mixing disabled until the interop can retain independently
 +    // addressable source images; this does not restrict the decoder queue.
@@ -13,17 +13,16 @@ index cfa74c74e7..8e542c3008 100644
  
      pl_options pars;
      struct m_config_cache *opts_cache;
-@@ -1042,7 +1046,8 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -1370,7 +1374,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
      const struct gl_video_opts *opts = p->opts_cache->opts;
      bool will_redraw = frame->display_synced && frame->num_vsyncs > 1;
-     bool cache_frame = will_redraw || frame->still;
+     bool cache_frame = will_redraw || frame->still || p->paused;
 -    bool can_interpolate = opts->interpolation && frame->display_synced &&
-+    bool can_interpolate = !p->mutable_image_hwdec && opts->interpolation &&
-+                           frame->display_synced &&
-                            !frame->still && frame->num_frames > 1;
++    bool can_interpolate = !p->mutable_image_hwdec && opts->interpolation && frame->display_synced &&
+                            !frame->still && frame->num_frames > 1 && !p->paused;
      double pts_offset = can_interpolate ? frame->ideal_frame_vsync : 0;
      params.info_callback = info_callback;
-@@ -1534,6 +1539,18 @@ static void resize(struct vo *vo)
+@@ -1874,6 +1878,18 @@ static void resize(struct vo *vo)
  static int reconfig(struct vo *vo, struct mp_image_params *params)
  {
      struct priv *p = vo->priv;
@@ -42,7 +41,7 @@ index cfa74c74e7..8e542c3008 100644
      if (!p->ra_ctx->fns->reconfig(p->ra_ctx))
          return -1;
  
-@@ -2548,7 +2565,8 @@ static void update_render_options(struct vo *vo)
+@@ -2899,7 +2915,8 @@ static void update_render_options(struct vo *vo)
      pars->params.upscaler = map_scaler(p, SCALER_SCALE);
      pars->params.downscaler = map_scaler(p, SCALER_DSCALE);
      pars->params.plane_upscaler = map_scaler(p, SCALER_CSCALE);

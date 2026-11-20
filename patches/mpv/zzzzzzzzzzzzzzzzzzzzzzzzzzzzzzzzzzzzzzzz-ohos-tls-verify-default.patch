@@ -1,0 +1,29 @@
+diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
+index dddff27f69afa5ed8de1549fbcbaedfba1e03281..5f2ebf8e7b6972e24c5d884b7964b548ae51c33a 100644
+--- a/DOCS/man/options.rst
++++ b/DOCS/man/options.rst
+@@ -5812,8 +5812,9 @@ Network
+     known-good reason (e.g. an outdated CA bundle, a corporate proxy, a
+     development server with a self-signed certificate).
+ 
+-    This is disabled by default, if mpv is built without libcurl and
+-    libavformat is older than 63.0.100.
++    OpenHarmony builds default to ``no``. On other platforms the default
++    is ``no`` if mpv is built without libcurl and libavformat is older
++    than 63.0.100.
+ 
+ ``--tls-cert-file``
+     A file containing a certificate to use in the handshake with the
+diff --git a/stream/network.c b/stream/network.c
+index 0087d3846d739b7feb9459c8c329129743979d57..4b835ab25f8ae2f9125dfe3bc44e10d29c2217cc 100644
+--- a/stream/network.c
++++ b/stream/network.c
+@@ -51,7 +51,7 @@ const struct m_sub_options mp_network_conf = {
+     .defaults = &(const struct mp_network_opts){
+         .useragent = "libmpv",
+         .timeout = 60,
+-#if HAVE_LIBCURL || LIBAVFORMAT_VERSION_MAJOR >= 63
++#if !HAVE_OHOS && (HAVE_LIBCURL || LIBAVFORMAT_VERSION_MAJOR >= 63)
+         .tls_verify = true,
+ #endif
+     },

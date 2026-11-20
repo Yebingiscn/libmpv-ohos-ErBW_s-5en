@@ -1,27 +1,8 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: SweetVideo <sweetvideo@local>
-Date: Thu, 3 Sep 2026 00:00:00 +0800
-Subject: [PATCH] vo_gpu_next: add adaptive OHOS SDR to HDR output
-
-Prefer a 10-bit EGL surface for opt-in SDR-to-HDR rendering, fall back to
-the normal SDR surface when unavailable, and expose PQ/HLG target color
-spaces to libplacebo so inverse tone mapping stays inside gpu-next.
-Native PQ/HLG streams take precedence and bypass inverse tone mapping; the
-source HDR state is cached only when the video format is reconfigured.
----
- options/options.c                 |  2 ++
- options/options.h                 |  1 +
- video/out/ohos_common.c           | 19 +++++++++++
- video/out/ohos_common.h           |  1 +
- video/out/opengl/context_ohos.c   | 38 +++++++++++++++++++++-
- video/out/vo_gpu_next.c            | 25 +++++++++++---
- 6 files changed, 81 insertions(+), 5 deletions(-)
-
 diff --git a/options/options.c b/options/options.c
-index caa702e..858f7cd 100644
+index ceaa398b79dc24b0bba0b57ad4f7f49cc2437098..ed4a90aada496d0bb3429aac1b0acd24c6739455 100644
 --- a/options/options.c
 +++ b/options/options.c
-@@ -247,6 +247,8 @@ static const m_option_t mp_vo_opt_list[] = {
+@@ -253,6 +253,8 @@ static const m_option_t mp_vo_opt_list[] = {
  #endif
  #if HAVE_EGL_OHOS
      {"ohos-surface-size", OPT_SIZE_BOX(ohos_surface_size)},
@@ -31,10 +12,10 @@ index caa702e..858f7cd 100644
  #if HAVE_D3D11
      {"d3d11-composition-size", OPT_SIZE_BOX(d3d11_composition_size)},
 diff --git a/options/options.h b/options/options.h
-index 58fe0eb..9ab7592 100644
+index 70d77764e7cee4f0d248ba00e6d4e98af07c5429..788f45d3aa1051aedc6aabf46874af39cd6d455b 100644
 --- a/options/options.h
 +++ b/options/options.h
-@@ -87,6 +87,7 @@ typedef struct mp_vo_opts {
+@@ -88,6 +88,7 @@ typedef struct mp_vo_opts {
      struct m_geometry android_surface_size;
  
      struct m_geometry ohos_surface_size;
@@ -43,7 +24,7 @@ index 58fe0eb..9ab7592 100644
      struct m_geometry d3d11_composition_size;
  
 diff --git a/video/out/ohos_common.c b/video/out/ohos_common.c
-index 6d769af..ebba662 100644
+index 6d769af7475293c0f24b7651688a1c7f727daff8..ebba6627d111476cf57b502fc69fe4df4613c6b3 100644
 --- a/video/out/ohos_common.c
 +++ b/video/out/ohos_common.c
 @@ -30,6 +30,7 @@ struct vo_ohos_state {
@@ -95,7 +76,7 @@ index 6d769af..ebba662 100644
  }
  
 diff --git a/video/out/ohos_common.h b/video/out/ohos_common.h
-index 4791a4d..93f0495 100644
+index 4791a4d328a5b2d46803d3f94f352c566d131eaf..93f049565fb498b1b73400364c910cc36ff477d9 100644
 --- a/video/out/ohos_common.h
 +++ b/video/out/ohos_common.h
 @@ -31,6 +31,7 @@ void vo_ohos_uninit(struct vo *vo);
@@ -107,7 +88,7 @@ index 4791a4d..93f0495 100644
  bool vo_ohos_set_color(struct vo *vo, struct mp_image_params *params);
  void vo_ohos_invalidate_color(struct vo *vo);
 diff --git a/video/out/opengl/context_ohos.c b/video/out/opengl/context_ohos.c
-index 1eb5166..f4d3c49 100644
+index fbb97dbeb995fd7de767a140f2155e12fe1b8dab..699f8cc2be9b49a81b79942e6b9ba078e0ed7837 100644
 --- a/video/out/opengl/context_ohos.c
 +++ b/video/out/opengl/context_ohos.c
 @@ -30,6 +30,29 @@ struct priv {
@@ -165,10 +146,10 @@ index 1eb5166..f4d3c49 100644
      EGLint native_visual_id = 0;
      if (!eglGetConfigAttrib(p->egl_display, config, EGL_NATIVE_VISUAL_ID,
 diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
-index 8e542c3..d578fdd 100644
+index a3f019fb20aac9d7209428d2b43fe23c5158b41e..d99809f2e8174e39e82038814456557155a6632a 100644
 --- a/video/out/vo_gpu_next.c
 +++ b/video/out/vo_gpu_next.c
-@@ -138,6 +138,7 @@ struct priv {
+@@ -161,6 +161,7 @@ struct priv {
      // temporal mixing disabled until the interop can retain independently
      // addressable source images; this does not restrict the decoder queue.
      bool mutable_image_hwdec;
@@ -176,7 +157,7 @@ index 8e542c3..d578fdd 100644
  
      pl_options pars;
      struct m_config_cache *opts_cache;
-@@ -1044,6 +1045,9 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -1372,6 +1373,9 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
  
      struct pl_render_params params = pars->params;
      const struct gl_video_opts *opts = p->opts_cache->opts;
@@ -184,11 +165,11 @@ index 8e542c3..d578fdd 100644
 +    struct pl_color_map_params frame_color_map_params = pars->color_map_params;
 +    params.color_map_params = &frame_color_map_params;
      bool will_redraw = frame->display_synced && frame->num_vsyncs > 1;
-     bool cache_frame = will_redraw || frame->still;
-     bool can_interpolate = !p->mutable_image_hwdec && opts->interpolation &&
-@@ -1154,6 +1158,18 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
-         target_csp = (struct pl_color_space){
-             .transfer = opts->target_trc ? opts->target_trc : pl_color_space_hdr10.transfer };
+     bool cache_frame = will_redraw || frame->still || p->paused;
+     bool can_interpolate = !p->mutable_image_hwdec && opts->interpolation && frame->display_synced &&
+@@ -1488,6 +1492,18 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+     } else {
+         target_ref_luma = get_ref_luma(p);
      }
 +
 +    // OHOS SDR expansion follows the stream format cached by reconfig().
@@ -202,11 +183,11 @@ index 8e542c3..d578fdd 100644
 +    }
 +    frame_color_map_params.inverse_tone_mapping = inverse_tone_mapping;
 +
+     bool external_params = false;
      if (target_hint && frame->current) {
          const struct pl_color_space *source = &frame->current->params.color;
-         const struct pl_color_space *target = &target_csp;
-@@ -1209,7 +1225,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
-         struct pl_color_space source_csp = *source;
+@@ -1537,7 +1553,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+         bool min_luma_known = hint.hdr.min_luma > 0;
          pl_color_space_infer_map(&source_csp, &hint);
          // Always prefer target luminance and transfer for inverse tone mapping
 -        if (pl_color_transfer_is_hdr(target->transfer) && opts->tone_map.inverse) {
@@ -214,7 +195,7 @@ index 8e542c3..d578fdd 100644
              hint.transfer     = target->transfer;
              hint.hdr.max_luma = target->hdr.max_luma;
              hint.hdr.min_luma = target->hdr.min_luma;
-@@ -1238,9 +1254,9 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -1564,9 +1580,9 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
          if (!hint.hdr.max_cll)
              hint.hdr.max_cll = hint.hdr.max_luma;
          // If tone mapping is required, adjust maxCLL and maxFALL
@@ -226,16 +207,25 @@ index 8e542c3..d578fdd 100644
                  hint.hdr.max_cll = hint.hdr.max_luma;
              // There's no reliable way to estimate maxFALL here
              hint.hdr.max_fall = 0;
-@@ -1343,7 +1359,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
-                     (frame->current && opts->blend_subs) ? OSD_DRAW_OSD_ONLY : 0,
-                     PL_OVERLAY_COORDS_DST_FRAME, &p->osd_state, &target, frame->current);
+@@ -1660,7 +1676,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+         // Windows assumes the display is sRGB. It doesn't perform gamma
+         // conversion, or any conversions would roundtrip back to sRGB.
+         // In which case the EOTF depends on the display.
+-        // Ideally, compositors would agree on how to handle sRGB, but I’ll
++        // Ideally, compositors would agree on how to handle sRGB, but I鈥檒l
+         // leave that part of the story for the reader to explore.
+         // Note: Older Windows versions, without ACM, were not able to convert
+         // sRGB to PQ output. We are not concerned about this case, as it would
+@@ -1677,7 +1693,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+                     frame->current ? frame->current->params.stereo3d : 0, get_ref_luma(p));
+     stats_time_end(p->stats, "osd-update");
      apply_crop(&target, p->dst, swframe.fbo->params.w, swframe.fbo->params.h);
 -    update_tm_viz(&pars->color_map_params, &target);
 +    update_tm_viz(&frame_color_map_params, &target);
  
      struct pl_frame_mix mix = {0};
      if (frame->current) {
-@@ -1542,6 +1558,7 @@ static int reconfig(struct vo *vo, struct mp_image_params *params)
+@@ -1881,6 +1897,7 @@ static int reconfig(struct vo *vo, struct mp_image_params *params)
      // External window resizes intentionally call reconfig(vo, NULL). Only a
      // real video reconfiguration carries image parameters.
      if (params) {
@@ -243,5 +233,3 @@ index 8e542c3..d578fdd 100644
          bool mutable_image_hwdec = params->imgfmt == IMGFMT_OHCODEC;
          if (mutable_image_hwdec != p->mutable_image_hwdec) {
              p->mutable_image_hwdec = mutable_image_hwdec;
--- 
-2.50.1

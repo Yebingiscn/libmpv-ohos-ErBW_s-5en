@@ -12,10 +12,10 @@ V_SDK_NATIVE_VERSION=26.0.0.38
 
 # FFmpeg TLS/AV1 dependencies. Keep Mbed TLS on the supported 3.6 LTS ABI;
 # moving to the 4.x ABI needs a separate FFmpeg adapter validation.
-V_MBEDTLS=3.6.7
-V_DAV1D=1.5.4
-V_NGHTTP3=v1.18.0
-V_NGHTTP3_COMMIT=dbfc24286138cb0b6490160e7ca87fe1ce6722a0
+V_MBEDTLS=3.6.8
+V_DAV1D=1.5.5
+V_NGHTTP3=v1.19.0
+V_NGHTTP3_COMMIT=dc83309ca5fd2beb91cc5c030a2d30525e9f2a00
 
 # AVS1-P16 (AVS+) software decoder imported into FFmpeg's CAVS decoder.
 # Keep this pinned because the upstream integration is distributed as a patch.
@@ -26,28 +26,27 @@ V_LIBDVDCSS=1.6.0
 V_LIBDVDREAD=7.1.1
 V_LIBDVDNAV=7.0.0
 V_LIBBLURAY=1.5.0
-V_LIBARCHIVE=v3.8.9
+V_LIBARCHIVE=v3.8.11
 
 # fontconfig
-V_LIBXML2=v2.15.3
+V_LIBXML2=v2.15.4
 
 # libass
-V_FRIBIDI=v1.0.16
-V_FREETYPE=VER-2-14-3
-V_HARFBUZZ=14.3.0
-V_FONTCONFIG=2.18.2
+V_FRIBIDI=v1.0.18
+V_FREETYPE=VER-2-15-0
+V_HARFBUZZ=15.2.0
+V_FONTCONFIG=2.18.4
 
 # libplacebo
-V_DOVI_TOOLS=2.3.3
-V_LCMS=lcms2.19.1
-V_SHADERC=v2026.3
+V_DOVI_TOOLS=2.3.4
+V_LCMS=lcms2.20
+V_SHADERC=v2026.4
 
-# mpv and its tightly-coupled dependencies. The OHCodec, zero-copy and Audio
-# Vivid patches are rebased on FFmpeg 8.1.2. The OHOS mpv 0.41 branch accepts
-# generic Lua only below 5.3, so keep the final Lua 5.2 release for now.
-V_FFMPEG=n8.1.2
+# mpv and its tightly coupled dependencies. Keep Lua on the supported 5.2 ABI.
+V_FFMPEG=n9.0.2
 V_LIBASS=0.17.5
-V_LIBPLACEBO=v7.360.1
+V_LIBPLACEBO=v7.387.0
 V_LUA=5.2.4
-V_MPV=feat-ohos-0.41.0
-V_MPV_COMMIT=6edeee00a07b9b76f197aa71eee3d029fb090de4
+V_MPV=v0.42.0
+V_MPV_REPOSITORY=https://github.com/mpv-player/mpv.git
+V_MPV_COMMIT=b0841e8c4d156b8403dc1876c4cbd9011eb583f3

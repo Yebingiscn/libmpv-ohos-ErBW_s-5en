@@ -50,17 +50,16 @@ index 1410bd8..84965da 100644
  OBJS-$(CONFIG_CAVSVIDEO_PARSER)        += cavs_parser.o
  OBJS-$(CONFIG_COOK_PARSER)             += cook_parser.o
 diff --git a/libavcodec/allcodecs.c b/libavcodec/allcodecs.c
-index 695214f..aca5887 100644
 --- a/libavcodec/allcodecs.c
 +++ b/libavcodec/allcodecs.c
-@@ -882,6 +882,7 @@ extern const FFCodec ff_h264_d3d12va_encoder;
+@@ -868,6 +868,7 @@
  extern const FFCodec ff_h264_mf_encoder;
  extern const FFCodec ff_h264_nvenc_encoder;
  extern const FFCodec ff_h264_oh_decoder;
 +extern const FFCodec ff_av3a_oh_decoder;
  extern const FFCodec ff_h264_oh_encoder;
- extern const FFCodec ff_h264_omx_encoder;
  extern const FFCodec ff_h264_qsv_encoder;
+ extern const FFCodec ff_h264_v4l2m2m_encoder;
 diff --git a/libavcodec/av3a.h b/libavcodec/av3a.h
 new file mode 100644
 index 0000000..01a3682
@@ -626,12 +625,11 @@ index 0000000..8425453
 +    .parse = raw_av3a_parse,
 +};
 diff --git a/libavcodec/codec_desc.c b/libavcodec/codec_desc.c
-index a9f21f8..ae101db 100644
 --- a/libavcodec/codec_desc.c
 +++ b/libavcodec/codec_desc.c
-@@ -3567,6 +3567,13 @@ static const AVCodecDescriptor codec_descriptors[] = {
-         .long_name = NULL_IF_CONFIG_SMALL("CRI AHX"),
-         .props     = AV_CODEC_PROP_INTRA_ONLY | AV_CODEC_PROP_LOSSY,
+@@ -3557,6 +3557,13 @@ static const AVCodecDescriptor codec_descriptors[] = {
+         .long_name = NULL_IF_CONFIG_SMALL("Apple Positional Audio Codec"),
+         .props     = AV_CODEC_PROP_LOSSY,
      },
 +    {
 +        .id        = AV_CODEC_ID_AVS3DA,
@@ -644,13 +642,12 @@ index a9f21f8..ae101db 100644
      /* subtitle codecs */
      {
 diff --git a/libavcodec/codec_id.h b/libavcodec/codec_id.h
-index 6529f0a..4ca40d8 100644
 --- a/libavcodec/codec_id.h
 +++ b/libavcodec/codec_id.h
-@@ -566,6 +566,7 @@ enum AVCodecID {
-     AV_CODEC_ID_LC3,
+@@ -559,6 +559,7 @@
      AV_CODEC_ID_G728,
      AV_CODEC_ID_AHX,
+     AV_CODEC_ID_APPLE_APAC,
 +    AV_CODEC_ID_AVS3DA,
  
      /* subtitle codecs */

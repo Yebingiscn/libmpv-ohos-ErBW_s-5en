@@ -204,7 +204,7 @@ def inspect(root, dest, arch):
         require(tool in variable(config, name), "FFmpeg must use SDK " + tool)
     components = {"mpv": {"build_system": "meson", "target_compile_commands":
         verify_meson(mpv, "mpv", triple, final_link=True)}}
-    # Pinned n8.1.2 decoder core, not merely a parser/DSP sibling that may have
+    # Pinned FFmpeg decoder core, not merely a parser/DSP sibling that may have
     # been rebuilt while an old native hevcdec.o remains in the tree/archive.
     core = ffmpeg / "libavcodec/hevc/hevcdec.o"
     require(core.is_file(), "Missing HEVC decoder core object")

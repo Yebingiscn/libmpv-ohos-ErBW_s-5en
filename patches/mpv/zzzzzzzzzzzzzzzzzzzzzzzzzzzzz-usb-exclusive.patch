@@ -1,19 +1,6 @@
-diff --git a/audio/aframe.c b/audio/aframe.c
-index fbba7a3b10..16fb46e390 100644
---- a/audio/aframe.c
-+++ b/audio/aframe.c
-@@ -308,7 +308,7 @@ bool mp_aframe_set_format(struct mp_aframe *frame, int format)
-     if (av_format == AV_SAMPLE_FMT_NONE && format) {
-         if (!af_fmt_is_spdif(format))
-             return false;
--        av_format = AV_SAMPLE_FMT_S16;
-+        av_format = format == AF_FORMAT_S_DOP ? AV_SAMPLE_FMT_S32 : AV_SAMPLE_FMT_S16;
-     }
-     frame->format = format;
-     frame->av_frame->format = av_format;
 diff --git a/audio/decode/ad_dop.c b/audio/decode/ad_dop.c
 new file mode 100644
-index 0000000000..95fec25028
+index 0000000000000000000000000000000000000000..95fec250289e57b91cd8c0cd56486d7fb93c2632
 --- /dev/null
 +++ b/audio/decode/ad_dop.c
 @@ -0,0 +1,92 @@
@@ -110,19 +97,11 @@ index 0000000000..95fec25028
 +}
 +const struct mp_decoder_fns ad_dop = {.create = create};
 diff --git a/audio/format.c b/audio/format.c
-index 4441456ede..4d9d0e3ca8 100644
+index 5fa9a99d537097f686bb5d6fc0dfa8051f4746e7..053674d4fb860a96487da4e63a79b915a7cd673f 100644
 --- a/audio/format.c
 +++ b/audio/format.c
-@@ -25,6 +25,7 @@
- // number of bytes per sample, 0 if invalid/unknown
- int af_fmt_to_bytes(int format)
- {
-+    if (format == AF_FORMAT_S_DOP) return 4;
-     switch (af_fmt_from_planar(format)) {
-     case AF_FORMAT_U8:      return 1;
-     case AF_FORMAT_S16:     return 2;
-@@ -58,7 +59,7 @@ bool af_fmt_is_int(int format)
- 
+@@ -64,7 +64,7 @@ bool af_fmt_is_int(int format)
+ // true for IEC61937 wrapped formats only (not other bitstream formats)
  bool af_fmt_is_spdif(int format)
  {
 -    return af_format_sample_alignment(format) > 1;
@@ -130,29 +109,17 @@ index 4441456ede..4d9d0e3ca8 100644
  }
  
  bool af_fmt_is_pcm(int format)
-@@ -135,6 +136,7 @@ const char *af_fmt_to_str(int format)
+@@ -142,7 +142,7 @@ const char *af_fmt_to_str(int format)
      case AF_FORMAT_S_EAC3:      return "spdif-eac3";
      case AF_FORMAT_S_MP3:       return "spdif-mp3";
      case AF_FORMAT_S_TRUEHD:    return "spdif-truehd";
+-    case AF_FORMAT_S_DOP:       return "dop";
 +    case AF_FORMAT_S_DOP:       return "dsd-dop";
+     case AF_FORMAT_DSD:         return "dsd";
      }
      return "??";
- }
-diff --git a/audio/format.h b/audio/format.h
-index bdd4744ae3..2ed89f33aa 100644
---- a/audio/format.h
-+++ b/audio/format.h
-@@ -48,6 +48,8 @@ enum af_format {
-     AF_FORMAT_S_MP3,
-     AF_FORMAT_S_TRUEHD,
- 
-+    AF_FORMAT_S_DOP, // Opaque DoP in a left-aligned 32-bit carrier.
-+
-     AF_FORMAT_COUNT
- };
- 
 diff --git a/audio/out/ao.c b/audio/out/ao.c
-index 2200afa581..f37c751510 100644
+index 2200afa581ad5c9f6644782848783cb28d539270..f37c751510e049e4e9112ca139743a53107b96dd 100644
 --- a/audio/out/ao.c
 +++ b/audio/out/ao.c
 @@ -51,6 +51,7 @@ extern const struct ao_driver audio_out_opensles;
@@ -196,7 +163,7 @@ index 2200afa581..f37c751510 100644
  
 diff --git a/audio/out/ao_usb_exclusive.c b/audio/out/ao_usb_exclusive.c
 new file mode 100644
-index 0000000000..a7439339a6
+index 0000000000000000000000000000000000000000..a7439339a6f7b2ac101f95230160bfb2a9fc4c20
 --- /dev/null
 +++ b/audio/out/ao_usb_exclusive.c
 @@ -0,0 +1,399 @@
@@ -601,7 +568,7 @@ index 0000000000..a7439339a6
 +};
 diff --git a/audio/out/usb_audio_protocol.h b/audio/out/usb_audio_protocol.h
 new file mode 100644
-index 0000000000..4055d490db
+index 0000000000000000000000000000000000000000..4055d490dbcb7d87f5fb78a68a4358bbbefbe494
 --- /dev/null
 +++ b/audio/out/usb_audio_protocol.h
 @@ -0,0 +1,132 @@
@@ -738,10 +705,10 @@ index 0000000000..4055d490db
 +}
 +#endif
 diff --git a/filters/f_decoder_wrapper.c b/filters/f_decoder_wrapper.c
-index c1743386fc..6fd47e0b72 100644
+index 8c806acf4e2cfa80f676a034f3dcae167616097c..8953030d0ebf4749d9556874c30b3822254cb425 100644
 --- a/filters/f_decoder_wrapper.c
 +++ b/filters/f_decoder_wrapper.c
-@@ -450,7 +450,12 @@ static bool reinit_decoder(struct priv *p)
+@@ -476,7 +476,12 @@ static bool reinit_decoder(struct priv *p)
          bool try_spdif = p->try_spdif;
          mp_mutex_unlock(&p->cache_lock);
  
@@ -756,30 +723,30 @@ index c1743386fc..6fd47e0b72 100644
                  select_spdif_codec(p->codec->codec, p->opts->audio_spdif);
              if (spdif->num_entries) {
 diff --git a/filters/f_decoder_wrapper.h b/filters/f_decoder_wrapper.h
-index ac195b04e3..7747067951 100644
+index 7d475d8906562d30f31bbafa275d3f37c8cd7384..5d2c4ae713ab9b307a5b87a08284aa5dba245882 100644
 --- a/filters/f_decoder_wrapper.h
 +++ b/filters/f_decoder_wrapper.h
-@@ -109,6 +109,7 @@ struct mp_decoder_fns {
- extern const struct mp_decoder_fns vd_lavc;
+@@ -116,6 +116,7 @@ extern const struct mp_decoder_fns vd_lavc;
  extern const struct mp_decoder_fns ad_lavc;
  extern const struct mp_decoder_fns ad_spdif;
+ extern const struct mp_decoder_fns ad_dsd;
 +extern const struct mp_decoder_fns ad_dop;
  
  // Convenience wrapper for lavc based decoders. Treat lavc_state as private;
  // init to all-0 on init and resets.
 diff --git a/meson.build b/meson.build
-index 49aef42ad1..7970f7c7bb 100644
+index b0911d0f7a468c82b765e17630fd4e12d18ab71c..2e20ce787aec94387b227866d46fa280b900f856 100644
 --- a/meson.build
 +++ b/meson.build
-@@ -61,6 +61,7 @@ sources = files(
-     'audio/chmap_sel.c',
+@@ -63,6 +63,7 @@ sources = files(
+     'audio/decode/ad_dsd.c',
      'audio/decode/ad_lavc.c',
      'audio/decode/ad_spdif.c',
 +    'audio/decode/ad_dop.c',
      'audio/filter/af_drop.c',
      'audio/filter/af_format.c',
      'audio/filter/af_lavcac3enc.c',
-@@ -494,6 +495,7 @@ if features['ohos']
+@@ -520,6 +521,7 @@ if features['ohos']
      sources += files('audio/out/ao_ohaudio.c',
                       'audio/out/ao_ohaudio_vivid.c',
                       'audio/out/ao_ohaudio_eac3.c',
@@ -788,10 +755,10 @@ index 49aef42ad1..7970f7c7bb 100644
                       'video/out/ohos_vpe.c',
                       'video/out/hwdec/hwdec_ohcodec.c',
 diff --git a/player/audio.c b/player/audio.c
-index a23ddad9c8..10465cdedd 100644
+index 3c08ef7de4c2f5c961ba3abb5f7b76875aeb1593..c04b15737825f680216ac2467f166c56a80f0f6f 100644
 --- a/player/audio.c
 +++ b/player/audio.c
-@@ -508,7 +508,7 @@ static int reinit_audio_filters_and_output(struct MPContext *mpctx)
+@@ -510,7 +510,7 @@ static int reinit_audio_filters_and_output(struct MPContext *mpctx)
  
      if (!mpctx->ao) {
          // If spdif was used, try to fallback to PCM.

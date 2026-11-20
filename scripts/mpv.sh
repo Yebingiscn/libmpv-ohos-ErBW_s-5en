@@ -36,6 +36,7 @@ meson setup .. \
   -Dgpl=true \
   -Ddvdnav=enabled \
   -Dlibbluray=enabled \
+  -Dlibcurl=disabled \
   -Dlibarchive=enabled \
   -Dbuild-date=false \
   -Dcplayer=false \

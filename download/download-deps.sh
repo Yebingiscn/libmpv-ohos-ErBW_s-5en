@@ -205,7 +205,7 @@ fi
 # mpv
 if [ ! -d mpv ]; then
   echo "Downloading mpv..."
-  git -c advice.detachedHead=false clone -q --depth 1 -b $V_MPV https://github.com/ErBWs/mpv.git mpv > /dev/null
+  git -c advice.detachedHead=false clone -q --depth 1 -b "$V_MPV" "$V_MPV_REPOSITORY" mpv > /dev/null
 else
   echo "mpv already exists, skipping."
 fi
@@ -213,7 +213,7 @@ fi
 actual_mpv_commit=$(git -C mpv rev-parse HEAD)
 if [ "$actual_mpv_commit" != "$V_MPV_COMMIT" ]; then
   echo "Checking out pinned mpv commit $V_MPV_COMMIT..."
-  git -C mpv fetch -q --depth 1 origin "$V_MPV_COMMIT"
+  git -C mpv fetch -q --depth 1 "$V_MPV_REPOSITORY" "$V_MPV_COMMIT"
   git -C mpv -c advice.detachedHead=false checkout -q "$V_MPV_COMMIT"
 fi
 

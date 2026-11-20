@@ -1,20 +1,8 @@
-diff --git a/sub/osd_state.h b/sub/osd_state.h
---- a/sub/osd_state.h
-+++ b/sub/osd_state.h
-@@ -85,6 +85,9 @@ struct osd_state {
-     // One independently owned renderer for the first external ASS overlay.
-     // Only populated by the OHCodec startup prewarm path.
-     struct ass_state external_preload;
-+    mp_thread font_thread;
-+    bool font_thread_started;
-+    bool fonts_pending; // protected by lock, as are all renderer transfers
-     struct mp_draw_sub_cache *draw_cache;
- };
- 
 diff --git a/sub/osd.c b/sub/osd.c
+index b672e15fb192bfa23cf636295783c09a214e5712..0fb0a942c62879601f69afc3d1a0c9bfd6161d94 100644
 --- a/sub/osd.c
 +++ b/sub/osd.c
-@@ -190,6 +190,10 @@ void osd_free(struct osd_state *osd)
+@@ -191,6 +191,10 @@ void osd_free(struct osd_state *osd)
  {
      if (!osd)
          return;
@@ -23,20 +11,21 @@ diff --git a/sub/osd.c b/sub/osd.c
 +    if (osd->font_thread_started)
 +        mp_thread_join(osd->font_thread);
      osd_destroy_backend(osd);
-     talloc_free(osd->objs[OSDTYPE_EXTERNAL2]->external2);
-     mp_mutex_destroy(&osd->lock);
+     talloc_free(osd->objs[OSDTYPE_EXTERNAL2]->image_overlay);
+     talloc_free(osd->objs[OSDTYPE_DISC_MENU]->image_overlay);
 diff --git a/sub/osd_libass.c b/sub/osd_libass.c
+index e057d0ab748a95e791d3db064df91535d41e37dd..d4c4d60d02ee56df018d39ba1898a3f4873da852 100644
 --- a/sub/osd_libass.c
 +++ b/sub/osd_libass.c
-@@ -35,6 +35,7 @@ static const char osd_font_pfb[] =
- #include "sub/ass_mp.h"
+@@ -36,6 +36,7 @@ static const char osd_font_pfb[] =
+ #include "sub/packer.h"
  #include "options/options.h"
  #include "options/m_config.h"
 +#include "osdep/timer.h"
  
  
  #define ASS_USE_OSD_FONT "{\\fnmpv-osd-symbols}"
-@@ -61,17 +62,64 @@ static void create_ass_renderer(struct osd_state *osd, struct ass_state *ass)
+@@ -62,17 +63,64 @@ static void create_ass_renderer(struct osd_state *osd, struct ass_state *ass)
      ass_set_pixel_aspect(ass->render, 1.0);
  }
  
@@ -109,7 +98,7 @@ diff --git a/sub/osd_libass.c b/sub/osd_libass.c
      mp_mutex_unlock(&osd->lock);
  }
  
-@@ -311,6 +359,13 @@ void osd_get_text_size(struct osd_state *osd, int *out_screen_h, int *out_font_h
+@@ -312,6 +360,13 @@ void osd_get_text_size(struct osd_state *osd, int *out_screen_h, int *out_font_h
  {
      mp_mutex_lock(&osd->lock);
      struct osd_object *obj = osd->objs[OSDTYPE_OSD];
@@ -123,7 +112,7 @@ diff --git a/sub/osd_libass.c b/sub/osd_libass.c
      ASS_Style *style = prepare_osd_ass(osd, obj);
      *out_screen_h = obj->ass.track->PlayResY - style->MarginV;
      *out_font_h = style->FontSize;
-@@ -598,7 +653,7 @@ void osd_set_external(struct osd_state *osd, struct osd_external_ass *ov)
+@@ -599,7 +654,7 @@ void osd_set_external(struct osd_state *osd, struct osd_external_ass *ov)
              osd->external_preload = (struct ass_state){0};
              MP_DBG(osd, "[Perf] osd-font-reuse external id=%lld\n", (long long)ov->id);
          } else {
@@ -132,7 +121,7 @@ diff --git a/sub/osd_libass.c b/sub/osd_libass.c
          }
          new->ov.owner = ov->owner;
          new->ov.id = ov->id;
-@@ -635,14 +690,19 @@ void osd_set_external(struct osd_state *osd, struct osd_external_ass *ov)
+@@ -636,14 +691,19 @@ void osd_set_external(struct osd_state *osd, struct osd_external_ass *ov)
      entry->ov.z = ov->z;
      entry->ov.hidden = ov->hidden;
  
@@ -154,7 +143,7 @@ diff --git a/sub/osd_libass.c b/sub/osd_libass.c
          struct mp_osd_res vo_res = entry->ass.vo_res;
          // Defined fallback if VO has not drawn this yet
          if (vo_res.w < 1 || vo_res.h < 1) {
-@@ -711,6 +771,14 @@ static void append_ass(struct ass_state *ass, struct mp_osd_res *res,
+@@ -712,6 +772,14 @@ static void append_ass(struct ass_state *ass, struct mp_osd_res *res,
  struct sub_bitmaps *osd_object_get_bitmaps(struct osd_state *osd,
                                             struct osd_object *obj, int format)
  {
@@ -169,3 +158,17 @@ diff --git a/sub/osd_libass.c b/sub/osd_libass.c
      if (obj->type == OSDTYPE_OSD) {
          if (obj->osd_changed) {
              update_osd(osd, obj);
+diff --git a/sub/osd_state.h b/sub/osd_state.h
+index df6ce4fb2aae3f5133a52a7f8dd28530a6b483bf..2213051b193c6737c07232a89b431acd83522599 100644
+--- a/sub/osd_state.h
++++ b/sub/osd_state.h
+@@ -87,6 +87,9 @@ struct osd_state {
+     // One independently owned renderer for the first external ASS overlay.
+     // Only populated by the OHCodec startup prewarm path.
+     struct ass_state external_preload;
++    mp_thread font_thread;
++    bool font_thread_started;
++    bool fonts_pending; // protected by lock, as are all renderer transfers
+     struct mp_draw_sub_cache *draw_cache;
+ };
+ 

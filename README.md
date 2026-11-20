@@ -3,7 +3,8 @@
 Build scripts of [libmpv](https://github.com/mpv-player/mpv) for OpenHarmony ARM64 and x86_64.
 
 CI builds ARM64 only. The `artifact` download contains `libmpv_aarch64.zip`
-with its `libmpv.so`; CI does not build or package x86_64.
+with `libmpv.so` and its matching public headers under `include/`. Use the
+matching headers when rebuilding the app wrapper for FFmpeg 9.
 
 For a local Linux/macOS build, run `MPV_BUILD_ARCH=arm64 ./bundle.sh` (default) or
 `MPV_BUILD_ARCH=x86_64 ./bundle.sh`. Do not use `TARGET_ARCH`: GNU Make treats
@@ -95,8 +96,10 @@ back to opening `index.bdmv` as a video. This adapter adds no system-library dep
 `scripts/verify-network-bluray.sh` checks the patched sources and FFmpeg redirect
 option; `verify.sh` checks that the adapter is present in the final library.
 
-This tree is based on the `20260715` mpv-arkts binary baseline and pins
-`ErBWs/mpv` to commit `6edeee00a07b9b76f197aa71eee3d029fb090de4`.
+The core uses mpv 0.42.0, FFmpeg 9.0.2 and libplacebo 7.387.0, with
+OpenHarmony changes applied from `patches/`. It builds with the HarmonyOS 7.0
+Release native SDK (API 26). On OpenHarmony, `tls-verify` defaults to `no`.
+Set `tls-verify=yes` in `mpv.conf` to enable verification.
 
 ## Experimental optional HTTP/3
 
@@ -106,7 +109,7 @@ is unchanged. Plain HTTP IPTV, UDP/RTP, RTSP and local playback are unaffected.
 No application setting or URL rewrite is required. Both video output modes use
 the same network layer; actual improvement requires an HTTP/3-enabled source.
 
-QUIC APIs are dynamically resolved and nghttp3 1.18.0 is statically linked.
+QUIC APIs are dynamically resolved and nghttp3 1.19.0 is statically linked.
 Neither the application nor libmpv may require a system QUIC library at load
 time. Missing capabilities, unsupported TLS/proxy configuration or failed H3
 setup use existing TCP/TLS. Failed endpoints back off for five minutes. HLS can
@@ -349,13 +352,11 @@ Enabling libdvdnav and libdvdcss changes the resulting combined work to GPL.
 AVS+ support is based on the public
 [`ffmpeg_cavs_dra`](https://github.com/maliwen2015/ffmpeg_cavs_dra)
 implementation pinned in `download/deps-version.sh`. The build imports only
-its `libcavs` video decoder files into FFmpeg 8.1.2; the DRA audio decoder is
+its `libcavs` video decoder files into FFmpeg 9.0.2; the DRA audio decoder is
 not included. mpv selects the resulting `cavs` decoder automatically for CAVS
 streams, including AVS1-P16 broadcast TS files, with no player-side option.
 
-The output follows the current `mpv-arkts` native ABI. It does not restore the
-old SweetVideo buffer-overlay renderer; the new OSD plane uses mpv's current
-libass/OSD bitmap pipeline.
+The OSD plane uses mpv's libass/OSD bitmap pipeline.
 
 `libdvdcss` is included for CSS-encrypted DVDs. Blu-ray navigation is included,
 but BD-J, `libaacs` and `libbdplus` are not; encrypted Blu-ray images therefore

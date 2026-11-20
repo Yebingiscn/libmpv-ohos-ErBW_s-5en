@@ -1,4 +1,5 @@
 diff --git a/audio/output_timeline.h b/audio/output_timeline.h
+index c83b9034c0a87f208b29b55d3aac6d93f534bd1d..59e242804e8cef319f3faa10145ca0fd46a96146 100644
 --- a/audio/output_timeline.h
 +++ b/audio/output_timeline.h
 @@ -116,3 +116,43 @@ static inline bool audio_timeline_wait(const struct audio_output_timeline *t,
@@ -45,28 +46,8 @@ diff --git a/audio/output_timeline.h b/audio/output_timeline.h
 +    *offset = future - current;
 +    return true;
 +}
-diff --git a/player/core.h b/player/core.h
---- a/player/core.h
-+++ b/player/core.h
-@@ -172,6 +172,7 @@ struct vo_chain {
-     // - video consists of sparse still images
-     bool is_sparse;
-     bool sparse_eof_signalled;
-+    double decoder_speed;
- 
-     bool underrun;
-     bool underrun_signaled;
-@@ -508,6 +509,9 @@ void fill_audio_out_buffers(struct MPContext *mpctx);
- double written_audio_pts(struct MPContext *mpctx);
- void clear_audio_output_buffers(struct MPContext *mpctx);
- void update_playback_speed(struct MPContext *mpctx);
-+void update_video_decode_speed(struct MPContext *mpctx, bool force);
-+double audio_timeline_video_offset(struct MPContext *mpctx, double seconds);
-+double audio_timeline_video_duration(struct MPContext *mpctx, double pts, double duration);
- void uninit_audio_out(struct MPContext *mpctx);
- void uninit_audio_chain(struct MPContext *mpctx);
- void reinit_audio_chain_src(struct MPContext *mpctx, struct track *track);
 diff --git a/player/audio.c b/player/audio.c
+index 5d8c6cf37ae11d46922afb7a54fb3dbb0509869c..095897d8d95f257e3c1ab2db1bce77af8b36ceff 100644
 --- a/player/audio.c
 +++ b/player/audio.c
 @@ -199,12 +199,7 @@ void update_playback_speed(struct MPContext *mpctx)
@@ -83,7 +64,7 @@ diff --git a/player/audio.c b/player/audio.c
  
      update_speed_filters(mpctx);
  }
-@@ -642,6 +637,48 @@ static bool use_output_timeline(struct MPContext *mpctx)
+@@ -678,6 +673,48 @@ static bool use_output_timeline(struct MPContext *mpctx)
      return af_fmt_is_pcm(format);
  }
  
@@ -132,10 +113,33 @@ diff --git a/player/audio.c b/player/audio.c
  bool audio_timeline_frame_wait(struct MPContext *mpctx, double delay, double *wait)
  {
      if (!use_output_timeline(mpctx))
+diff --git a/player/core.h b/player/core.h
+index 923b47d0b99772a0a5b3036d4e74577f48e29d2d..385fa2f7971b13b65cca28a79b95babc9f5d440e 100644
+--- a/player/core.h
++++ b/player/core.h
+@@ -181,6 +181,7 @@ struct vo_chain {
+     // - video consists of sparse still images
+     bool is_sparse;
+     bool sparse_eof_signalled;
++    double decoder_speed;
+ 
+     bool underrun;
+     bool underrun_signaled;
+@@ -524,6 +525,9 @@ void fill_audio_out_buffers(struct MPContext *mpctx);
+ double written_audio_pts(struct MPContext *mpctx);
+ void clear_audio_output_buffers(struct MPContext *mpctx);
+ void update_playback_speed(struct MPContext *mpctx);
++void update_video_decode_speed(struct MPContext *mpctx, bool force);
++double audio_timeline_video_offset(struct MPContext *mpctx, double seconds);
++double audio_timeline_video_duration(struct MPContext *mpctx, double pts, double duration);
+ void uninit_audio_out(struct MPContext *mpctx);
+ void uninit_audio_chain(struct MPContext *mpctx);
+ void reinit_audio_chain_src(struct MPContext *mpctx, struct track *track);
 diff --git a/player/video.c b/player/video.c
+index 58f66383dd6c07de3f59f0d33f17fe1f3afce636..cdaafcf5439dbce3b8e841bf92c8840d73a8d217 100644
 --- a/player/video.c
 +++ b/player/video.c
-@@ -91,6 +91,7 @@ int reinit_video_filters(struct MPContext *mpctx)
+@@ -92,6 +92,7 @@ int reinit_video_filters(struct MPContext *mpctx)
  static void vo_chain_reset_state(struct vo_chain *vo_c)
  {
      vo_seek_reset(vo_c->vo);
@@ -143,7 +147,24 @@ diff --git a/player/video.c b/player/video.c
      vo_c->underrun = false;
      vo_c->underrun_signaled = false;
  }
-@@ -974,7 +975,7 @@ static void schedule_frame(struct MPContext *mpctx, struct vo_frame *frame)
+@@ -793,14 +794,14 @@ static bool using_spdif_passthrough(struct MPContext *mpctx)
+ // exponentially toward zero.
+ //
+ // The raw per-frame av_diff is dominated by vsync-rounding jitter
+-// (±1 vsync). Acting on it directly would modulate audio pitch at the
++// (卤1 vsync). Acting on it directly would modulate audio pitch at the
+ // jitter frequency. A low-pass filter on av_diff removes the jitter, so
+ // comp converges to the value that cancels the true underlying drift and
+ // then stops moving.
+ //
+ // From d(av_diff)/dt = other * (comp - 1) with other = playback_speed *
+ // speed_factor_v, the comp that makes av_diff_lp decay with time
+-// constant AVD_RECOVERY_TIME is (1 - av_diff_lp / (τ · other)).
++// constant AVD_RECOVERY_TIME is (1 - av_diff_lp / (蟿 路 other)).
+ static void adjust_audio_drift_compensation(struct MPContext *mpctx, double vsync)
+ {
+     struct MPOpts *opts = mpctx->opts;
+@@ -1009,7 +1010,7 @@ static void schedule_frame(struct MPContext *mpctx, struct vo_frame *frame)
          }
  
          update_av_diff(mpctx, mpctx->time_frame > 0 ?
@@ -152,16 +173,16 @@ diff --git a/player/video.c b/player/video.c
      }
  }
  
-@@ -1081,6 +1082,8 @@ void write_video(struct MPContext *mpctx)
+@@ -1116,6 +1117,8 @@ void write_video(struct MPContext *mpctx)
      if (mpctx->paused && mpctx->video_status >= STATUS_READY)
          return;
  
 +    update_video_decode_speed(mpctx, false);
 +
+     // Once the chain reached EOF nothing is read from it again.
      bool logical_eof = false;
-     int r = video_output_image(mpctx, &logical_eof);
-     MP_TRACE(mpctx, "video_output_image: r=%d/eof=%d/st=%s\n", r, logical_eof,
-@@ -1269,13 +1272,14 @@ void write_video(struct MPContext *mpctx)
+     int r = VD_EOF;
+@@ -1320,13 +1323,14 @@ void write_video(struct MPContext *mpctx)
      if (opts->untimed || (vo->driver->caps & VO_CAP_UNTIMED))
          diff = -1; // disable frame dropping and aspects of frame timing
      if (diff >= 0) {
@@ -178,10 +199,38 @@ diff --git a/player/video.c b/player/video.c
  
      shift_frames(mpctx);
  
+diff --git a/sub/ass_mp.c b/sub/ass_mp.c
+index b8e9e5aeabcc96544b001ac161465aa8717a475c..08b2dfb2dffee6664ca487d95984b0e837d89ddd 100644
+--- a/sub/ass_mp.c
++++ b/sub/ass_mp.c
+@@ -29,6 +29,7 @@
+ 
+ #include "common/common.h"
+ #include "common/msg.h"
++#include "osdep/timer.h"
+ #include "options/path.h"
+ #include "ass_mp.h"
+ #include "osd.h"
+@@ -92,9 +93,14 @@ void mp_ass_configure_fonts(ASS_Renderer *priv, struct osd_style_opts *opts,
+     if (opts->font_provider == 2)
+         font_provider = ASS_FONTPROVIDER_FONTCONFIG;
+ 
++    int64_t perf_begin = mp_msg_test(log, MSGL_DEBUG) ? mp_time_ns() : 0;
+     mp_verbose(log, "Setting up fonts...\n");
+     ass_set_fonts(priv, default_font, opts->font, font_provider, config, 1);
+     mp_verbose(log, "Done.\n");
++    if (perf_begin)
++        mp_msg(log, MSGL_DEBUG, "[Perf] font-setup monoNs=%lld costMs=%.3f provider=%d config=%d\n",
++               (long long)perf_begin, (mp_time_ns() - perf_begin) / 1e6,
++               (int)font_provider, !!config);
+ 
+     talloc_free(tmp);
+ }
 diff --git a/sub/osd.h b/sub/osd.h
+index b62836e517da134c749cec7ca7388c25e5f8f130..ddb1c1efebc3019cd1a149e5c7066f500e493728 100644
 --- a/sub/osd.h
 +++ b/sub/osd.h
-@@ -251,6 +251,7 @@ struct osd_external_ass {
+@@ -270,6 +270,7 @@ struct osd_external_ass {
  // defined in osd_libass.c and osd_dummy.c
  void osd_set_external(struct osd_state *osd, struct osd_external_ass *ov);
  void osd_set_external_remove_owner(struct osd_state *osd, void *owner);
@@ -190,17 +239,18 @@ diff --git a/sub/osd.h b/sub/osd.h
  void osd_get_function_sym(char *buffer, size_t buffer_size, int osd_function);
  void osd_mangle_ass(bstr *dst, const char *in, bool replace_newlines);
 diff --git a/sub/osd_libass.c b/sub/osd_libass.c
+index 7b0850954ccdb57f63db1bdaa755efc2e92a0a5b..7c9b89fcfd508b411486e449efff33ba6942e017 100644
 --- a/sub/osd_libass.c
 +++ b/sub/osd_libass.c
-@@ -34,6 +34,7 @@ static const char osd_font_pfb[] =
- 
+@@ -35,6 +35,7 @@ static const char osd_font_pfb[] =
  #include "sub/ass_mp.h"
+ #include "sub/packer.h"
  #include "options/options.h"
 +#include "options/m_config.h"
  
  
  #define ASS_USE_OSD_FONT "{\\fnmpv-osd-symbols}"
-@@ -60,6 +61,16 @@ static void create_ass_renderer(struct osd_state *osd, struct ass_state *ass)
+@@ -61,6 +62,16 @@ static void create_ass_renderer(struct osd_state *osd, struct ass_state *ass)
      ass_set_pixel_aspect(ass->render, 1.0);
  }
  
@@ -218,6 +268,7 @@ diff --git a/sub/osd_libass.c b/sub/osd_libass.c
  {
      if (ass->track)
 diff --git a/video/out/vo_ohcodec.c b/video/out/vo_ohcodec.c
+index ff5dcfad1ef8dc5cd411596fe190856c1c5807f8..dac3a7017855e23983913d7a8a79654f19957462 100644
 --- a/video/out/vo_ohcodec.c
 +++ b/video/out/vo_ohcodec.c
 @@ -742,11 +742,20 @@ static bool draw_osd_bitmap(struct vo *vo, enum sub_bitmap_format format,
@@ -256,29 +307,3 @@ diff --git a/video/out/vo_ohcodec.c b/video/out/vo_ohcodec.c
      p->osd_force_upload = true;
  
      mp_mutex_lock(&global_osd.lock);
-diff --git a/sub/ass_mp.c b/sub/ass_mp.c
---- a/sub/ass_mp.c
-+++ b/sub/ass_mp.c
-@@ -30,6 +30,7 @@
- 
- #include "common/common.h"
- #include "common/msg.h"
-+#include "osdep/timer.h"
- #include "options/path.h"
- #include "ass_mp.h"
- #include "img_convert.h"
-@@ -97,9 +98,14 @@ void mp_ass_configure_fonts(ASS_Renderer *priv, struct osd_style_opts *opts,
-     if (opts->font_provider == 2)
-         font_provider = ASS_FONTPROVIDER_FONTCONFIG;
- 
-+    int64_t perf_begin = mp_msg_test(log, MSGL_DEBUG) ? mp_time_ns() : 0;
-     mp_verbose(log, "Setting up fonts...\n");
-     ass_set_fonts(priv, default_font, opts->font, font_provider, config, 1);
-     mp_verbose(log, "Done.\n");
-+    if (perf_begin)
-+        mp_msg(log, MSGL_DEBUG, "[Perf] font-setup monoNs=%lld costMs=%.3f provider=%d config=%d\n",
-+               (long long)perf_begin, (mp_time_ns() - perf_begin) / 1e6,
-+               (int)font_provider, !!config);
- 
-     talloc_free(tmp);
- }

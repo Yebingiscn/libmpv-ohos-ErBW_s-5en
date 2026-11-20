@@ -1,4 +1,49 @@
+diff --git a/video/out/ohos_common.c b/video/out/ohos_common.c
+index c6a5fa12a5d46675acc2603549a01033cf67cd83..6b076607f1adda9a477070ce5de87a5fa323a4d2 100644
+--- a/video/out/ohos_common.c
++++ b/video/out/ohos_common.c
+@@ -189,6 +189,7 @@ bool vo_ohos_init(struct vo *vo)
+             vo->opts->ohos_surface_size.w, vo->opts->ohos_surface_size.h);
+         if (ctx->vpe)
+             ctx->native_window = ohos_vpe_input(ctx->vpe);
++        ohos_vpe_attach(ctx->vpe, vo);
+     }
+     return true;
+ fail:
+@@ -317,6 +318,22 @@ void vo_ohos_invalidate_color(struct vo *vo)
+     ctx->hdr_brightness_valid = false;
+ }
+ 
++static void vpe_wakeup(void *data)
++{
++    vo_wakeup(data);
++}
++
++void ohos_vpe_attach(struct ohos_vpe *vpe, struct vo *vo)
++{
++    ohos_vpe_set_wakeup(vpe, vpe_wakeup, vo);
++}
++
++void vo_ohos_super_resolution_input(struct vo *vo)
++{
++    if (vo->ohos)
++        ohos_vpe_note_input(vo->ohos->vpe);
++}
++
+ void vo_ohos_check_super_resolution(struct vo *vo)
+ {
+     struct vo_ohos_state *ctx = vo->ohos;
+diff --git a/video/out/ohos_common.h b/video/out/ohos_common.h
+index 7bd82c5f217ac6e7b8721d11dd9648b7fbf87bea..eafdcea60a96fa451cbca23630ff8e4a3c29123c 100644
+--- a/video/out/ohos_common.h
++++ b/video/out/ohos_common.h
+@@ -36,3 +36,4 @@ struct pl_color_space vo_ohos_preferred_csp(struct vo *vo);
+ bool vo_ohos_set_color(struct vo *vo, struct mp_image_params *params);
+ void vo_ohos_invalidate_color(struct vo *vo);
+ void vo_ohos_check_super_resolution(struct vo *vo);
++void vo_ohos_super_resolution_input(struct vo *vo);
 diff --git a/video/out/ohos_vpe.c b/video/out/ohos_vpe.c
+index 4cc2c04b843ec4b327d39a286ba2d89f6a0def93..9de8871ed03a6d3299f86d1e10ce77718d5374e8 100644
 --- a/video/out/ohos_vpe.c
 +++ b/video/out/ohos_vpe.c
 @@ -7,6 +7,11 @@
@@ -189,6 +234,7 @@ diff --git a/video/out/ohos_vpe.c b/video/out/ohos_vpe.c
      return vpe;
  fail:
 diff --git a/video/out/ohos_vpe.h b/video/out/ohos_vpe.h
+index 537ebc990a41c1ff72ace192ebd4d3a27f916e69..de2f96891037723eaa33a3135feda84b577a0551 100644
 --- a/video/out/ohos_vpe.h
 +++ b/video/out/ohos_vpe.h
 @@ -14,6 +14,10 @@ struct ohos_vpe *ohos_vpe_create(struct mp_log *log, OHNativeWindow *output,
@@ -202,52 +248,11 @@ diff --git a/video/out/ohos_vpe.h b/video/out/ohos_vpe.h
 +void ohos_vpe_set_wakeup(struct ohos_vpe *vpe, void (*wakeup)(void *), void *data);
 +void ohos_vpe_attach(struct ohos_vpe *vpe, struct vo *vo);
  void ohos_vpe_check(struct ohos_vpe *vpe, struct vo *vo);
-diff --git a/video/out/ohos_common.c b/video/out/ohos_common.c
---- a/video/out/ohos_common.c
-+++ b/video/out/ohos_common.c
-@@ -189,6 +189,7 @@ bool vo_ohos_init(struct vo *vo)
-             vo->opts->ohos_surface_size.w, vo->opts->ohos_surface_size.h);
-         if (ctx->vpe)
-             ctx->native_window = ohos_vpe_input(ctx->vpe);
-+        ohos_vpe_attach(ctx->vpe, vo);
-     }
-     return true;
- fail:
-@@ -317,6 +318,22 @@ void vo_ohos_invalidate_color(struct vo *vo)
-     ctx->hdr_brightness_valid = false;
- }
- 
-+static void vpe_wakeup(void *data)
-+{
-+    vo_wakeup(data);
-+}
-+
-+void ohos_vpe_attach(struct ohos_vpe *vpe, struct vo *vo)
-+{
-+    ohos_vpe_set_wakeup(vpe, vpe_wakeup, vo);
-+}
-+
-+void vo_ohos_super_resolution_input(struct vo *vo)
-+{
-+    if (vo->ohos)
-+        ohos_vpe_note_input(vo->ohos->vpe);
-+}
-+
- void vo_ohos_check_super_resolution(struct vo *vo)
- {
-     struct vo_ohos_state *ctx = vo->ohos;
-diff --git a/video/out/ohos_common.h b/video/out/ohos_common.h
---- a/video/out/ohos_common.h
-+++ b/video/out/ohos_common.h
-@@ -36,3 +36,4 @@ struct pl_color_space vo_ohos_preferred_csp(struct vo *vo);
- bool vo_ohos_set_color(struct vo *vo, struct mp_image_params *params);
- void vo_ohos_invalidate_color(struct vo *vo);
- void vo_ohos_check_super_resolution(struct vo *vo);
-+void vo_ohos_super_resolution_input(struct vo *vo);
 diff --git a/video/out/opengl/context_ohos.c b/video/out/opengl/context_ohos.c
+index e91aeeaa325f79fd4de8dfa19e7854b1839fc28f..5f066d2694222dc6b87374b7a295d0dd928038c7 100644
 --- a/video/out/opengl/context_ohos.c
 +++ b/video/out/opengl/context_ohos.c
-@@ -66,6 +66,7 @@ static void ohos_set_color(struct ra_ctx *ctx, struct mp_image_params *params)
+@@ -66,6 +66,7 @@ static bool ohos_set_color(struct ra_ctx *ctx, struct mp_image_params *params)
  static void ohos_swap_buffers(struct ra_ctx *ctx)
  {
      struct priv *p = ctx->priv;
@@ -255,30 +260,8 @@ diff --git a/video/out/opengl/context_ohos.c b/video/out/opengl/context_ohos.c
      eglSwapBuffers(p->egl_display, p->egl_surface);
  }
  
-diff --git a/video/out/vulkan/context_ohos.c b/video/out/vulkan/context_ohos.c
---- a/video/out/vulkan/context_ohos.c
-+++ b/video/out/vulkan/context_ohos.c
-@@ -37,6 +37,11 @@ static void ohos_set_color(struct ra_ctx *ctx, struct mp_image_params *params)
-     vo_ohos_set_color(ctx->vo, params);
- }
- 
-+static void ohos_swap_buffers(struct ra_ctx *ctx)
-+{
-+    vo_ohos_super_resolution_input(ctx->vo);
-+}
-+
- static void ohos_uninit(struct ra_ctx *ctx)
- {
-     struct priv *p = ctx->priv;
-@@ -64,6 +69,7 @@ static bool ohos_init(struct ra_ctx *ctx)
-     };
- 
-     struct ra_ctx_params params = {
-+        .swap_buffers = ohos_swap_buffers,
-         .preferred_csp = ohos_preferred_csp,
-         .set_color = ohos_set_color,
-     };
 diff --git a/video/out/vo_ohcodec.c b/video/out/vo_ohcodec.c
+index 858cfcc27e92398a3475874b680b9ec62628d3f0..fe6a2b23e9cb37f2e17698e3dd2a59c7381b861a 100644
 --- a/video/out/vo_ohcodec.c
 +++ b/video/out/vo_ohcodec.c
 @@ -201,6 +201,7 @@ static AVBufferRef *create_ohcodec_device_ref(struct vo *vo)
@@ -313,3 +296,27 @@ diff --git a/video/out/vo_ohcodec.c b/video/out/vo_ohcodec.c
  
      mp_mutex_lock(&global_osd.lock);
      if (global_osd.active_vo == vo)
+diff --git a/video/out/vulkan/context_ohos.c b/video/out/vulkan/context_ohos.c
+index 652edec7d039732cae0e36e57a0c4f467cfdea5d..c8d65d16de2d920765b2885fb8640b6928d67e73 100644
+--- a/video/out/vulkan/context_ohos.c
++++ b/video/out/vulkan/context_ohos.c
+@@ -37,6 +37,11 @@ static bool ohos_set_color(struct ra_ctx *ctx, struct mp_image_params *params)
+     return vo_ohos_set_color(ctx->vo, params);
+ }
+ 
++static void ohos_swap_buffers(struct ra_ctx *ctx)
++{
++    vo_ohos_super_resolution_input(ctx->vo);
++}
++
+ static void ohos_uninit(struct ra_ctx *ctx)
+ {
+     struct priv *p = ctx->priv;
+@@ -64,6 +69,7 @@ static bool ohos_init(struct ra_ctx *ctx)
+     };
+ 
+     struct ra_ctx_params params = {
++        .swap_buffers = ohos_swap_buffers,
+         .preferred_csp = ohos_preferred_csp,
+         .set_color = ohos_set_color,
+     };

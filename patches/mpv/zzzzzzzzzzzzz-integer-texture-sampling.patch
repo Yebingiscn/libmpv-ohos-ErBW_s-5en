@@ -1,7 +1,8 @@
 diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index d99809f2e8174e39e82038814456557155a6632a..def9ff5fcbefd921576aecd85146fc0a5cf97077 100644
 --- a/video/out/vo_gpu_next.c
 +++ b/video/out/vo_gpu_next.c
-@@ -646,6 +646,24 @@
+@@ -1005,6 +1005,24 @@ static bool upload_planes_sw(struct vo *vo, pl_gpu gpu, struct mp_image *mpi,
      return true;
  }
  
@@ -26,11 +27,29 @@ diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
  static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src,
                        struct pl_frame *frame)
  {
-@@ -1458,2 +1477,4 @@
+@@ -1676,7 +1694,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+         // Windows assumes the display is sRGB. It doesn't perform gamma
+         // conversion, or any conversions would roundtrip back to sRGB.
+         // In which case the EOTF depends on the display.
+-        // Ideally, compositors would agree on how to handle sRGB, but I鈥檒l
++        // Ideally, compositors would agree on how to handle sRGB, but I閳ユ獟l
+         // leave that part of the story for the reader to explore.
+         // Note: Older Windows versions, without ACM, were not able to convert
+         // sRGB to PQ output. We are not concerned about this case, as it would
+@@ -1792,6 +1810,8 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+     }
+ 
      // Render frame
 +    for (int i = 0; i < mix.num_frames; i++)
 +        adapt_sampling(mix.frames[i], &params);
-     if (!pl_render_image_mix(p->rr, &mix, &target, &params)) {
-@@ -1795,1 +1816,2 @@
+     stats_time_start(p->stats, "render");
+     bool render_ok = pl_render_image_mix(p->rr, &mix, &target, &params);
+     stats_time_end(p->stats, "render");
+@@ -2137,6 +2157,7 @@ static void video_screenshot(struct vo *vo, struct voctrl_screenshot *args)
+         image.num_overlays = 0;
+     }
+ 
 +    adapt_sampling(&image, &params);
      if (!pl_render_image(p->rr, &image, &target, &params)) {
+         MP_ERR(vo, "Failed rendering frame!\n");
+         goto done;

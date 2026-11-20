@@ -17,13 +17,12 @@ new file mode 100644
 +} AVAudioVividMetadata;
 +#endif
 diff --git a/libavutil/frame.h b/libavutil/frame.h
-index 866ff38..653a0ec 100644
 --- a/libavutil/frame.h
 +++ b/libavutil/frame.h
-@@ -260,6 +260,9 @@ enum AVFrameSideDataType {
-      * EXIF metadata, starting with either 49 49 2a 00, or 4d 4d 00 2a.
+@@ -299,6 +299,9 @@
+      * libavutil/raw_color_params.h.
       */
-      AV_FRAME_DATA_EXIF,
+     AV_FRAME_DATA_RAW_COLOR_PARAMS,
 +
 +    /** OHOS Audio Vivid PCM companion data; see audio_vivid.h. */
 +    AV_FRAME_DATA_AUDIO_VIVID,

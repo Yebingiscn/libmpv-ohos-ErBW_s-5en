@@ -1,19 +1,8 @@
-diff --git a/filters/f_decoder_wrapper.h b/filters/f_decoder_wrapper.h
---- a/filters/f_decoder_wrapper.h
-+++ b/filters/f_decoder_wrapper.h
-@@ -76,6 +76,8 @@ enum dec_ctrl {
-     VDCTRL_SET_FRAMEDROP,
-     VDCTRL_CHECK_FORCED_EOF,
-     VDCTRL_SET_PLAYBACK_SPEED,
-+    // int[2]: preroll performance hint, preserve all decoded frames
-+    VDCTRL_SET_DECODE_HINTS,
- };
- 
- int mp_decoder_wrapper_control(struct mp_decoder_wrapper *d,
 diff --git a/filters/f_decoder_wrapper.c b/filters/f_decoder_wrapper.c
+index 56b3d8e62d01f48ef3d54a5ee1358002b4701613..8c806acf4e2cfa80f676a034f3dcae167616097c 100644
 --- a/filters/f_decoder_wrapper.c
 +++ b/filters/f_decoder_wrapper.c
-@@ -301,6 +301,21 @@ static void thread_unlock(struct priv *p)
+@@ -314,6 +314,21 @@ static void thread_unlock(struct priv *p)
          mp_dispatch_unlock(p->dec_dispatch);
  }
  
@@ -35,7 +24,7 @@ diff --git a/filters/f_decoder_wrapper.c b/filters/f_decoder_wrapper.c
  // This resets only the decoder. Unlike a full reset(), this doesn't imply a
  // seek reset. This distinction exists only when using timeline stuff (EDL and
  // ordered chapters). timeline stuff needs to reset the decoder state, but keep
-@@ -769,6 +784,7 @@ static bool process_decoded_frame(struct priv *p, struct mp_frame *frame)
+@@ -840,6 +855,7 @@ static bool process_decoded_frame(struct priv *p, struct mp_frame *frame)
          // Stop hr-seek logic.
          if (mpi->pts == MP_NOPTS_VALUE || mpi->pts >= p->start_pts)
              p->start_pts = MP_NOPTS_VALUE;
@@ -43,7 +32,7 @@ diff --git a/filters/f_decoder_wrapper.c b/filters/f_decoder_wrapper.c
  
          if (mpi->pts != MP_NOPTS_VALUE) {
              segment_ended = p->end != MP_NOPTS_VALUE && mpi->pts >= p->end;
-@@ -959,6 +975,8 @@ static void feed_packet(struct priv *p)
+@@ -1040,6 +1056,8 @@ static void feed_packet(struct priv *p)
              MP_WARN(p, "[TimestampRepair] disabled: packet cadence changed\n");
      }
  
@@ -52,10 +41,24 @@ diff --git a/filters/f_decoder_wrapper.c b/filters/f_decoder_wrapper.c
      // For video framedropping, including parts of the hr-seek logic.
      if (p->decoder->control) {
          double start_pts = p->start_pts;
+diff --git a/filters/f_decoder_wrapper.h b/filters/f_decoder_wrapper.h
+index 52f55912ec3f0f1ac33315a2f26b0ddd5a460154..7d475d8906562d30f31bbafa275d3f37c8cd7384 100644
+--- a/filters/f_decoder_wrapper.h
++++ b/filters/f_decoder_wrapper.h
+@@ -82,6 +82,8 @@ enum dec_ctrl {
+     VDCTRL_SET_EXTRA_HW_FRAMES,
+     VDCTRL_CHECK_FORCED_EOF,
+     VDCTRL_SET_PLAYBACK_SPEED,
++    // int[2]: preroll performance hint, preserve all decoded frames
++    VDCTRL_SET_DECODE_HINTS,
+ };
+ 
+ int mp_decoder_wrapper_control(struct mp_decoder_wrapper *d,
 diff --git a/video/decode/vd_lavc.c b/video/decode/vd_lavc.c
+index 033d9956f4501a48d577dc674f6da2238f95f9bb..94e64196a0a27ddadf13502cf866ec78fcbf4f87 100644
 --- a/video/decode/vd_lavc.c
 +++ b/video/decode/vd_lavc.c
-@@ -1413,6 +1413,15 @@ static int control(struct mp_filter *vd, enum dec_ctrl cmd, void *arg)
+@@ -1479,6 +1479,15 @@ static int control(struct mp_filter *vd, enum dec_ctrl cmd, void *arg)
      case VDCTRL_REINIT:
          reinit(vd);
          return CONTROL_TRUE;
