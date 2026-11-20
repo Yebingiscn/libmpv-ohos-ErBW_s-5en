@@ -443,6 +443,15 @@ Transfer failures include source location, queue state and URB/packet errors;
 the application must handle audio-output failure by reloading ordinary output
 at the saved position, rather than leaving the video stopped or silent.
 
+Local SACD ISO playback uses the backported
+[FFmpeg SACD demuxer](https://github.com/FFmpeg/FFmpeg/commit/7791b7562bf4f5fd6893300a65e027998ecb8207).
+It reads 2048-byte and raw 2064-byte sector images without extracting tracks.
+Stereo is preferred when both stereo and multi-channel mixes are present.
+SACD tracks appear as MPV chapters for the primary mix; DST seeking requires
+a valid access list. Network images and physical discs are outside the app's
+SACD integration.
+The host-side FATE smoke test is documented in `tests/sacd-image.py`.
+
 `audio-spdif=dop` plus `usb-exclusive-dsd-mode=dop` preserves raw DSD, DST and
 DSD WavPack as DoP; the DAC must explicitly support DoP. The legacy
 `usb-exclusive-dop=yes` option remains compatible. `audio-spdif=native-dsd` plus

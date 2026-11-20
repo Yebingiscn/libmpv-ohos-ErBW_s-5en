@@ -18,6 +18,10 @@ if ! "$STRINGS" "$LIBMPV" | grep -F 'Network Blu-ray clip open/seek failed' >/de
   echo 'Missing network Blu-ray file access adapter' >&2
   exit 1
 fi
+if ! "$STRINGS" "$LIBMPV" | grep -Fx 'Super Audio CD (SACD)' >/dev/null; then
+  echo 'Missing SACD image demuxer' >&2
+  exit 1
+fi
 if ! "$STRINGS" "$LIBMPV" | grep -F '[OHCodecFormat] pixel=' >/dev/null; then
   echo 'Missing OHCodec actual output format negotiation' >&2
   exit 1

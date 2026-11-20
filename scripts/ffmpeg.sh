@@ -52,6 +52,7 @@ cd .build
   --disable-avdevice \
   --disable-muxers \
   --enable-muxer=spdif \
+  --enable-demuxer=sacd \
   --disable-encoders \
   --enable-decoder=cavs \
   --enable-ohcodec \
