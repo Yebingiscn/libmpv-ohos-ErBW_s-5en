@@ -1,3 +1,16 @@
+diff --git a/player/discnav.c b/player/discnav.c
+index 8c8ad52b41fda462267d31e9a18b6003ac77e26c..f4da024e5a35ba065dd3b0a41ba16d822b153a08 100644
+--- a/player/discnav.c
++++ b/player/discnav.c
+@@ -253,7 +253,7 @@ static void push_bd_overlay(struct MPContext *mpctx, struct stream *s,
+         .change_id = nav->change_id ? (int)nav->change_id : 1,
+         .video_color_space = true,
+     };
+-    osd_rescale_bitmaps(&imgs, nav->src_w, nav->src_h, vo_res, 0);
++    osd_rescale_bitmaps(&imgs, nav->src_w, nav->src_h, vo_res, 0, false);
+     osd_set_bitmaps(mpctx->osd, OSDTYPE_DISC_MENU, &imgs);
+     st->bd_last_change_id = nav->change_id;
+     st->bd_last_vo_res = vo_res;
 diff --git a/sub/osd.c b/sub/osd.c
 index 0fb0a942c62879601f69afc3d1a0c9bfd6161d94..b59d6ed2df6349e6970a78e0a278298cd36e0b72 100644
 --- a/sub/osd.c
