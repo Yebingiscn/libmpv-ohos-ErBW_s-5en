@@ -1,0 +1,350 @@
+diff --git a/demux/demux.c b/demux/demux.c
+index 296993b63f6c386e6979427b6269f6eb0a4bbfe5..ba87d951cf6b7d0756e5fc3892494f9dec57492b 100644
+--- a/demux/demux.c
++++ b/demux/demux.c
+@@ -2624,8 +2624,13 @@ static void execute_seek(struct demux_internal *in)
+ 
+     MP_VERBOSE(in, "execute seek (to %f flags %d)\n", pts, flags);
+ 
++    int64_t begin = mp_msg_test(in->log, MSGL_DEBUG) ? mp_time_ns() : 0;
+     if (in->d_thread->desc->seek)
+         in->d_thread->desc->seek(in->d_thread, pts, flags);
++    if (begin)
++        MP_DBG(in, "[Perf] seek-demux monoNs=%" PRId64
++               " demuxer=%s pts=%.6f flags=%d callbackMs=%.3f\n",
++               begin, in->d_thread->desc->name, pts, flags, (mp_time_ns() - begin) / 1e6);
+ 
+     MP_VERBOSE(in, "seek done\n");
+ 
+diff --git a/player/core.h b/player/core.h
+index 385fa2f7971b13b65cca28a79b95babc9f5d440e..74ddbf34b6052e0bce2332652d79fcce91128037 100644
+--- a/player/core.h
++++ b/player/core.h
+@@ -437,6 +437,9 @@ typedef struct MPContext {
+     // Counted down each frame, stop playback if 0 is reached. (-1 = disable)
+     int max_frames;
+     bool playing_msg_shown;
++    int64_t startup_log_ns;
++    int64_t startup_resume_ns;
++    int64_t seek_log_ns;
+ 
+     int remaining_file_loops;
+     int remaining_ab_loops;
+diff --git a/player/loadfile.c b/player/loadfile.c
+index d4427dff116d7bff3080aa990740ac717a53918c..a5da5f2626e17021f14b70d1ff4d59445135170f 100644
+--- a/player/loadfile.c
++++ b/player/loadfile.c
+@@ -1819,6 +1819,9 @@ static void play_current_file(struct MPContext *mpctx)
+     if (mpctx->stop_play || !mpctx->playlist->current)
+         return;
+ 
++    mpctx->startup_log_ns = mp_msg_test(mpctx->log, MSGL_DEBUG) ? mp_time_ns() : 0;
++    mpctx->startup_resume_ns = 0;
++    mpctx->seek_log_ns = 0;
+     mpv_event_start_file start_event = {
+         .playlist_entry_id = mpctx->playlist->current->id,
+     };
+@@ -1826,6 +1829,9 @@ static void play_current_file(struct MPContext *mpctx)
+         .playlist_entry_id = start_event.playlist_entry_id,
+     };
+ 
++    if (mpctx->startup_log_ns)
++        MP_DBG(mpctx, "[Perf] startup-begin entry=%" PRId64 " monoNs=%" PRId64 "\n",
++               start_event.playlist_entry_id, mpctx->startup_log_ns);
+     mp_notify(mpctx, MPV_EVENT_START_FILE, &start_event);
+ 
+     mp_cancel_reset(mpctx->playback_abort);
+@@ -2100,8 +2106,18 @@ static void play_current_file(struct MPContext *mpctx)
+         play_start_pts = get_start_time(mpctx, -1);
+ 
+     if (play_start_pts != MP_NOPTS_VALUE) {
++        int64_t resume_begin = mpctx->startup_log_ns &&
++            opts->play_start.type != REL_TIME_NONE ? mp_time_ns() : 0;
+         queue_seek(mpctx, MPSEEK_ABSOLUTE, play_start_pts, MPSEEK_DEFAULT, 0);
+         execute_queued_seek(mpctx);
++        if (resume_begin) {
++            bool accepted = mpctx->current_seek.type == MPSEEK_ABSOLUTE;
++            mpctx->startup_resume_ns = accepted ? resume_begin : 0;
++            MP_DBG(mpctx, "[Perf] startup-resume-seek entry=%" PRId64
++                   " monoNs=%" PRId64 " targetPts=%.6f dispatchMs=%.3f accepted=%d\n",
++                   start_event.playlist_entry_id, resume_begin,
++                   play_start_pts, (mp_time_ns() - resume_begin) / 1e6, accepted);
++        }
+     }
+ 
+     update_internal_pause_state(mpctx);
+diff --git a/player/playloop.c b/player/playloop.c
+index 0f9d5a99660ab7868f3ebd8f0c0cb929f6a14370..7d36d7a1317bcd658c6a1f4208e82915416ee682 100644
+--- a/player/playloop.c
++++ b/player/playloop.c
+@@ -378,7 +378,16 @@ static void mp_seek(MPContext *mpctx, struct seek_params seek)
+ 
+     demux_flags |= SEEK_BLOCK;
+ 
++    const bool measure_seek = mpctx->playing_msg_shown && mpctx->playing &&
++                              mp_msg_test(mpctx->log, MSGL_DEBUG);
++    int64_t seek_begin = measure_seek ? mp_time_ns() : 0;
++    if (seek_begin)
++        MP_DBG(mpctx, "[Perf] seek-begin entry=%" PRId64 " seekNs=%" PRId64
++               " targetPts=%.6f demuxPts=%.6f exact=%d flags=%d\n",
++               mpctx->playing->id, seek_begin, seek_pts, demux_pts, seek.exact, demux_flags);
+     if (!demux_seek(mpctx->demuxer, demux_pts, demux_flags)) {
++        if (seek_begin)
++            MP_DBG(mpctx, "[Perf] seek-rejected seekNs=%" PRId64 "\n", seek_begin);
+         if (!mpctx->demuxer->seekable) {
+             MP_ERR(mpctx, "Cannot seek in this stream.\n");
+             MP_ERR(mpctx, "You can force it with '--force-seekable=yes'.\n");
+@@ -406,6 +415,10 @@ static void mp_seek(MPContext *mpctx, struct seek_params seek)
+         clear_audio_output_buffers(mpctx);
+ 
+     reset_playback_state(mpctx);
++    // A later seek supersedes the resume measurement. The initial loadfile
++    // seek starts its measurement after this call has been accepted.
++    mpctx->startup_resume_ns = 0;
++    mpctx->seek_log_ns = seek_begin;
+ 
+     demux_block_reading(mpctx->demuxer, false);
+     for (int t = 0; t < mpctx->num_tracks; t++) {
+@@ -451,6 +464,9 @@ static void mp_seek(MPContext *mpctx, struct seek_params seek)
+ 
+     mpctx->current_seek = seek;
+     redraw_subs(mpctx);
++    if (seek_begin)
++        MP_DBG(mpctx, "[Perf] seek-dispatched seekNs=%" PRId64 " dispatchMs=%.3f\n",
++               seek_begin, (mp_time_ns() - seek_begin) / 1e6);
+ }
+ 
+ // This combines consecutive seek requests.
+@@ -1186,11 +1202,24 @@ static void handle_playback_restart(struct MPContext *mpctx)
+     if (!mpctx->restart_complete) {
+         mpctx->hrseek_active = false;
+         mpctx->restart_complete = true;
++        int64_t seek_begin = mpctx->current_seek.type ? mpctx->seek_log_ns : 0;
+         mpctx->current_seek = (struct seek_params){0};
+         handle_playback_time(mpctx);
++        if (seek_begin)
++            MP_DBG(mpctx, "[Perf] seek-ready seekNs=%" PRId64
++                   " elapsedMs=%.3f playbackPts=%.6f audioStatus=%d videoStatus=%d\n",
++                   seek_begin, (mp_time_ns() - seek_begin) / 1e6, mpctx->playback_pts,
++                   mpctx->audio_status, mpctx->video_status);
+         mp_notify(mpctx, MPV_EVENT_PLAYBACK_RESTART, NULL);
+         update_core_idle_state(mpctx);
+         if (!mpctx->playing_msg_shown) {
++            if (mpctx->startup_resume_ns && mpctx->playing) {
++                int64_t now = mp_time_ns();
++                MP_DBG(mpctx, "[Perf] startup-resume-ready entry=%" PRId64
++                       " monoNs=%" PRId64 " seekToReadyMs=%.3f playbackPts=%.6f\n",
++                       mpctx->playing->id, now, (now - mpctx->startup_resume_ns) / 1e6,
++                       mpctx->playback_pts);
++            }
+             if (opts->playing_msg && opts->playing_msg[0]) {
+                 char *msg =
+                     mp_property_expand_escaped_string(mpctx, opts->playing_msg);
+diff --git a/player/video.c b/player/video.c
+index 207a6288b4eb42d64da0205fad4704e009183cee..d8d277fd8a35a31cac1acc81428b598c60ec5f4a 100644
+--- a/player/video.c
++++ b/player/video.c
+@@ -24,6 +24,7 @@
+ #include "mpv_talloc.h"
+ 
+ #include "common/msg.h"
++#include "common/playlist.h"
+ #include "options/options.h"
+ #include "options/m_config.h"
+ #include "options/m_option.h"
+@@ -1330,6 +1331,11 @@ void write_video(struct MPContext *mpctx)
+     mp_assert(req >= 1 && req <= VO_MAX_REQ_FRAMES);
+     struct vo_frame dummy = {
+         .pts = pts,
++        .startup_log_ns = vo_c->is_coverart ? 0 :
++                          (mpctx->seek_log_ns ? mpctx->seek_log_ns : mpctx->startup_log_ns),
++        .diagnostic_seek = mpctx->seek_log_ns != 0,
++        .startup_resume_ns = mpctx->startup_resume_ns,
++        .startup_entry = mpctx->playing ? mpctx->playing->id : 0,
+         .duration = -1,
+         .still = mpctx->step_frames > 0,
+         .can_drop = opts->frame_dropping & 1,
+diff --git a/video/out/opengl/context_ohos.c b/video/out/opengl/context_ohos.c
+index 0399a9f03daa515c9d1f83676802452113a5b953..bdb27559f104ff6208d6b2d69833076758f61730 100644
+--- a/video/out/opengl/context_ohos.c
++++ b/video/out/opengl/context_ohos.c
+@@ -66,10 +66,12 @@ static bool ohos_set_color(struct ra_ctx *ctx, struct mp_image_params *params)
+ static void ohos_swap_buffers(struct ra_ctx *ctx)
+ {
+     struct priv *p = ctx->priv;
+-    if (eglSwapBuffers(p->egl_display, p->egl_surface))
++    if (eglSwapBuffers(p->egl_display, p->egl_surface)) {
++        vo_report_startup_submit(ctx->vo, "egl-swap");
+         vo_ohos_super_resolution_input(ctx->vo);
+-    else
++    } else {
+         MP_ERR(ctx, "EGL swap failed: 0x%x\n", eglGetError());
++    }
+ }
+ 
+ static void ohos_uninit(struct ra_ctx *ctx)
+diff --git a/video/out/vo.c b/video/out/vo.c
+index e3090a7fe1a757b81737a6cef8ab391fc6e9b7e8..a2cfd7626152a643db5c6836a7adfe93b04bc3a5 100644
+--- a/video/out/vo.c
++++ b/video/out/vo.c
+@@ -176,6 +176,7 @@ struct vo_internal {
+     int req_frames;                 // VO's requested value of num_frames
+     int frame_refs;                 // max frames the VO may reference at once
+     uint64_t current_frame_id;
++    int64_t startup_logged_ns;
+ 
+     double display_fps;
+     double reported_display_fps;
+@@ -898,6 +899,14 @@ void vo_queue_frame(struct vo *vo, struct vo_frame *frame)
+ 
+ // If a frame is currently being rendered (or queued), wait until it's done.
+ // Otherwise, return immediately.
++void vo_report_startup_submit(struct vo *vo, const char *stage)
++{
++    if (vo->startup_submit_pending) {
++        vo->startup_submit_ns = mp_time_ns();
++        vo->startup_submit_stage = stage;
++    }
++}
++
+ void vo_wait_frame(struct vo *vo)
+ {
+     struct vo_internal *in = vo->in;
+@@ -1014,6 +1023,11 @@ static bool render_frame(struct vo *vo)
+ 
+         stats_time_start(in->stats, "video-draw");
+ 
++        vo->startup_submit_pending = !(vo->driver->caps & VO_CAP_FRAMEOWNER) &&
++            frame->startup_log_ns && frame->startup_log_ns != in->startup_logged_ns &&
++            !frame->redraw && !frame->repeat && frame->current &&
++            mp_msg_test(vo->log, MSGL_DEBUG);
++        vo->startup_submit_ns = 0;
+         in->visible = vo->driver->draw_frame(vo, frame);
+ 
+         stats_time_end(in->stats, "video-draw");
+@@ -1023,6 +1037,7 @@ static bool render_frame(struct vo *vo)
+         stats_time_start(in->stats, "video-flip");
+ 
+         vo->driver->flip_page(vo);
++        vo->startup_submit_pending = false;
+ 
+         struct vo_vsync_info vsync = {
+             .last_queue_display_time = -1,
+@@ -1031,6 +1046,28 @@ static bool render_frame(struct vo *vo)
+         if (vo->driver->get_vsync)
+             vo->driver->get_vsync(vo, &vsync);
+ 
++        if (vo->startup_submit_ns) {
++            int64_t submitted = vo->startup_submit_ns;
++            if (frame->diagnostic_seek) {
++                MP_DBG(vo, "[Perf] seek-first-video-submit entry=%" PRId64
++                       " seekNs=%" PRId64 " monoNs=%" PRId64 " stage=%s pts=%.6f"
++                       " elapsedMs=%.3f queueDisplayNs=%" PRId64 "\n",
++                       frame->startup_entry, frame->startup_log_ns, submitted,
++                       vo->startup_submit_stage, frame->current->pts,
++                       (submitted - frame->startup_log_ns) / 1e6, vsync.last_queue_display_time);
++            } else {
++                MP_DBG(vo, "[Perf] startup-first-video-submit entry=%" PRId64
++                       " monoNs=%" PRId64 " stage=%s pts=%.6f startToSubmitMs=%.3f"
++                       " seekToSubmitMs=%.3f queueDisplayNs=%" PRId64 "\n",
++                       frame->startup_entry, submitted, vo->startup_submit_stage,
++                       frame->current->pts, (submitted - frame->startup_log_ns) / 1e6,
++                       frame->startup_resume_ns ?
++                           (submitted - frame->startup_resume_ns) / 1e6 : -1.0,
++                       vsync.last_queue_display_time);
++            }
++            in->startup_logged_ns = frame->startup_log_ns;
++        }
++
+         // Make up some crap if presentation feedback is missing.
+         if (vsync.last_queue_display_time <= 0)
+             vsync.last_queue_display_time = mp_time_ns();
+diff --git a/video/out/vo.h b/video/out/vo.h
+index 58c195b22615410f4d69a4a4d35d8bc98ec8089e..531dc0d619b0c4cf855796e19ef5d8446b666bb6 100644
+--- a/video/out/vo.h
++++ b/video/out/vo.h
+@@ -238,6 +238,10 @@ struct vo_extra {
+ };
+ 
+ struct vo_frame {
++    int64_t startup_log_ns;
++    int64_t startup_resume_ns;
++    int64_t startup_entry;
++    bool diagnostic_seek;
+     // If > 0, realtime when frame should be shown, in mp_time_ns() units.
+     // If 0, present immediately.
+     int64_t pts;
+@@ -487,6 +491,10 @@ struct vo {
+     struct osd_state *osd;
+     struct encode_lavc_context *encode_lavc_ctx;
+     struct vo_internal *in;
++    // Written only on the VO thread, while flipping a measured startup frame.
++    bool startup_submit_pending;
++    const char *startup_submit_stage;
++    int64_t startup_submit_ns;
+     struct vo_extra extra;
+ 
+     // --- The following fields are generally only changed during initialization.
+@@ -542,6 +550,7 @@ void vo_control_async(struct vo *vo, int request, void *data);
+ bool vo_is_ready_for_frame(struct vo *vo, int64_t next_pts);
+ bool vo_is_visible(struct vo *vo);
+ void vo_queue_frame(struct vo *vo, struct vo_frame *frame);
++void vo_report_startup_submit(struct vo *vo, const char *stage);
+ void vo_wait_frame(struct vo *vo);
+ void vo_wait_on_vo(struct vo *vo, bool wait);
+ bool vo_still_displaying(struct vo *vo);
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index 9620d78afbc113818402c7b624aff3067d2778f2..12c644ac728a04937241dc9799c5bbcb314fe738 100644
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -162,6 +162,7 @@ struct priv {
+     int last_ref_white;
+     int last_srgb_power22;
+     bool vivid_frame_pending;
++    bool startup_video_pending;
+     // OHCodec's NativeImage interop exposes one mutable external image. Keep
+     // temporal mixing disabled until the interop can retain independently
+     // addressable source images; this does not restrict the decoder queue.
+@@ -1935,6 +1936,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+ 
+ done:
+     p->vivid_frame_pending = valid && vivid_passthrough;
++    p->startup_video_pending = valid && !frame->redraw && mix.num_frames > 0;
+     if (!valid) // clear with purple to indicate error
+         pl_tex_clear(gpu, swframe.fbo, vivid_passthrough
+             ? (float[4]){0.0, 0.0, 0.0, 1.0} : (float[4]){0.5, 0.0, 1.0, 1.0});
+@@ -1955,16 +1957,21 @@ static void flip_page(struct vo *vo)
+ 
+     if (p->frame_pending) {
+         bool submitted = pl_swapchain_submit_frame(p->sw);
++        vo->startup_submit_pending &= submitted && p->startup_video_pending;
+         if (!submitted) {
+             MP_ERR(vo, "Failed presenting frame!\n");
+             p->want_reset = true;
+         }
+ #if HAVE_OHOS
++        if (vo->startup_submit_pending && !strcmp(p->ra_ctx->fns->name, "ohosvk"))
++            vo_report_startup_submit(vo, "vulkan-present");
+         if (submitted && p->vivid_frame_pending)
+             vo_ohos_vivid_audit(vo);
+ #endif
+         p->frame_pending = false;
+         p->vivid_frame_pending = false;
++    } else {
++        vo->startup_submit_pending = false;
+     }
+ 
+     sw->fns->swap_buffers(sw);
+diff --git a/video/out/vo_ohcodec.c b/video/out/vo_ohcodec.c
+index bb29448e460e5fe8e391b8f41e780022c45496eb..23738632cd41aaf530e1e49f9804f8002c0020f0 100644
+--- a/video/out/vo_ohcodec.c
++++ b/video/out/vo_ohcodec.c
+@@ -998,6 +998,8 @@ static void flip_page(struct vo *vo)
+             MP_DBG(vo, "[Perf] surface-submit monoNs=%lld pts=%.6f leadMs=%.3f costMs=%.3f ret=%d\n",
+                    (long long)begin, p->next_image->pts, lead / 1e6,
+                    (mp_time_ns() - begin) / 1e6, ret);
++        if (ret == 0)
++            vo_report_startup_submit(vo, output->vpe ? "ohcodec-vpe-input" : "ohcodec-surface");
+         if (ret < 0 && ret != AVERROR(EALREADY) && ret != AVERROR(ESTALE))
+             MP_ERR(vo, "Failed to present OHCodec Surface frame: %d\n", ret);
+     }
