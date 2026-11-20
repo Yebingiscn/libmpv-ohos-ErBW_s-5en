@@ -79,6 +79,9 @@ struct vo {
     struct mp_image_params *params;
     int dwidth, dheight;
     bool want_redraw, prepare_supported;
+    bool startup_submit_pending;
+    int64_t startup_submit_ns;
+    const char *startup_submit_stage;
 };
 struct ohos_vpe {
     OHNativeWindow input;
@@ -341,8 +344,11 @@ static void test_reopen_mode(int saved_width)
     f.priv.next_image = frame(f.priv.hwctx.av_device_ref, &token);
     f.priv.next_render_time_ns = 1000;
     unsigned notes = input_notes;
+    f.vo.startup_submit_pending = true;
     flip_page(&f.vo);
     assert(token.renders == 1 && !token.discards && input_notes == notes + 1);
+    assert(f.vo.startup_submit_ns == mp_time_ns());
+    assert(strcmp(f.vo.startup_submit_stage, "ohcodec-vpe-input") == 0);
     assert(!f.priv.next_image);
     finish(&f);
 }
@@ -382,8 +388,10 @@ static void test_source_change_and_old_frames(void)
     assert(old_output->retired && old_vpe->stopped && vpe_stops == stopped + 1);
     assert(device_destroys == destroyed); /* decoder/frame owners still live */
     assert_dar(output_of(replacement)->vpe, 1080.0 / 1920);
+    f.vo.startup_submit_pending = true;
     flip_page(&f.vo);
     assert(token.discards == 1 && !token.renders && input_notes == notes);
+    assert(!f.vo.startup_submit_ns);
     assert(device_destroys == destroyed);
     av_buffer_unref(&old_decoder);
     assert(device_destroys == destroyed + 1);

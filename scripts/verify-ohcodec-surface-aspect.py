@@ -50,6 +50,7 @@ def main():
     parser.add_argument("mpv", nargs="?", type=Path, default=root / "libmpv/mpv")
     args = parser.parse_args()
     surface = (args.mpv / "video/out/vo_ohcodec.c").read_text(encoding="utf-8")
+    vo = (args.mpv / "video/out/vo.c").read_text(encoding="utf-8")
     decoder = (args.mpv / "video/decode/vd_lavc.c").read_text(encoding="utf-8")
     header = (args.mpv / "video/out/vo.h").read_text(encoding="utf-8")
     image = (args.mpv / "video/mp_image.c").read_text(encoding="utf-8")
@@ -87,7 +88,7 @@ def main():
         function(surface, "get_video_surface_size"),
         function(surface, "update_video_scaling_mode"), resize,
         function(surface, "frame_uses_current_device"),
-        function(surface, "flip_page"),
+        function(vo, "vo_report_startup_submit"), function(surface, "flip_page"),
         "static int decoder_before_open(struct decoder_context *ctx, "
         "AVCodecContext *avctx, const AVCodec *lavc_codec, "
         "const struct mp_codec_params *c)\n{\n"
