@@ -19,10 +19,10 @@ new file mode 100644
 diff --git a/libavutil/frame.h b/libavutil/frame.h
 --- a/libavutil/frame.h
 +++ b/libavutil/frame.h
-@@ -299,6 +299,9 @@
-      * libavutil/raw_color_params.h.
+@@ -312,6 +312,9 @@
+      * struct defined in libavutil/gain_map.h.
       */
-     AV_FRAME_DATA_RAW_COLOR_PARAMS,
+     AV_FRAME_DATA_GAIN_MAP_PARAMS,
 +
 +    /** OHOS Audio Vivid PCM companion data; see audio_vivid.h. */
 +    AV_FRAME_DATA_AUDIO_VIVID,

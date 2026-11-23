@@ -96,7 +96,7 @@ back to opening `index.bdmv` as a video. This adapter adds no system-library dep
 `scripts/verify-network-bluray.sh` checks the patched sources and FFmpeg redirect
 option; `verify.sh` checks that the adapter is present in the final library.
 
-The core uses mpv 0.42.0, FFmpeg 9.0.2 and libplacebo 7.387.0, with
+The core uses mpv 0.42.0, FFmpeg 9.1 and libplacebo 7.387.0, with
 OpenHarmony changes applied from `patches/`. It builds with the HarmonyOS 7.0
 Release native SDK (API 26). On OpenHarmony, `tls-verify` defaults to `no`.
 Set `tls-verify=yes` in `mpv.conf` to enable verification.
@@ -352,7 +352,7 @@ Enabling libdvdnav and libdvdcss changes the resulting combined work to GPL.
 AVS+ support is based on the public
 [`ffmpeg_cavs_dra`](https://github.com/maliwen2015/ffmpeg_cavs_dra)
 implementation pinned in `download/deps-version.sh`. The build imports only
-its `libcavs` video decoder files into FFmpeg 9.0.2; the DRA audio decoder is
+its `libcavs` video decoder files into FFmpeg 9.1; the DRA audio decoder is
 not included. mpv selects the resulting `cavs` decoder automatically for CAVS
 streams, including AVS1-P16 broadcast TS files, with no player-side option.
 
@@ -459,9 +459,10 @@ DSD WavPack as DoP; the DAC must explicitly support DoP. The legacy
 USB device IDs/alternate settings (including the listed XMOS devices and known
 Amanero firmware revisions). Unknown devices/revisions are rejected. This does
 not implement every vendor-specific mode switch or U8/U16 native transport.
-DST/WavPack use an opt-in FFmpeg `dsd_raw` decoder option; normal playback keeps
-its existing PCM decoder output. Compressed DSD is unpacked losslessly before
-DoP/native framing, without a DSD-to-PCM step. PCM WavPack remains PCM.
+DST/WavPack retain their compatibility decoders on FFmpeg 9.1. The opt-in
+`dsd_raw` option preserves the existing byte layout for USB output. Normal
+playback uses the existing PCM conversion. Compressed DSD is unpacked
+losslessly before DoP/native framing, without a DSD-to-PCM step. PCM WavPack remains PCM.
 The current implementation supports mono
 and stereo integer PCM, direct UAC2 clocks and explicit asynchronous feedback;
 float decoded audio requires compatible mode; implicit feedback and complex

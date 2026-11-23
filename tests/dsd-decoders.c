@@ -9,7 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "libavcodec/avcodec.h"
-#include "libavcodec/dsd.h"
+#include "libavcodec/ohos_dsd_compat.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/opt.h"
 

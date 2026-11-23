@@ -1,0 +1,11 @@
+diff --git a/libavcodec/pcm-dvda.c b/libavcodec/pcm-dvda.c
+--- a/libavcodec/pcm-dvda.c
++++ b/libavcodec/pcm-dvda.c
+@@ -22,6 +22,7 @@
+ #include <stddef.h>
+
+ #include "libavutil/channel_layout.h"
++#include "libavutil/internal.h"
+
+ #include "avcodec.h"
+ #include "bytestream.h"

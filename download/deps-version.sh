@@ -43,7 +43,7 @@ V_LCMS=lcms2.20
 V_SHADERC=v2026.4
 
 # mpv and its tightly coupled dependencies. Keep Lua on the supported 5.2 ABI.
-V_FFMPEG=n9.0.2
+V_FFMPEG=n9.1
 V_LIBASS=0.17.5
 V_LIBPLACEBO=v7.387.0
 V_LUA=5.2.4

@@ -1,24 +1,23 @@
 diff --git a/configure b/configure
-index 2bc5c6f..3532f01 100755
 --- a/configure
 +++ b/configure
-@@ -330,6 +330,7 @@ External library support:
+@@ -332,6 +332,7 @@
    --disable-metal          disable Apple Metal framework [autodetect]
    --enable-libmysofa       enable libmysofa, needed for sofalizer filter [no]
    --enable-ohcodec         enable OpenHarmony Codec support [no]
 +  --enable-ohos-http3      enable optional HarmonyOS RCP QUIC transport [no]
    --enable-openal          enable OpenAL 1.1 capture support [no]
    --enable-opencl          enable OpenCL processing [no]
-   --enable-opengl          enable OpenGL rendering [no]
-@@ -2114,6 +2115,7 @@ EXTERNAL_LIBRARY_LIST="
+   --enable-openssl         enable openssl, needed for https support
+@@ -2131,6 +2132,7 @@
      lv2
      mediacodec
      ohcodec
 +    ohos_http3
      openal
-     opengl
      openssl
-@@ -4045,6 +4047,7 @@ httpproxy_protocol_select="tcp_protocol"
+     pocketsphinx
+@@ -4080,6 +4082,7 @@
  httpproxy_protocol_suggest="zlib"
  https_protocol_select="tls_protocol"
  https_protocol_suggest="zlib"
@@ -26,9 +25,9 @@ index 2bc5c6f..3532f01 100755
  icecast_protocol_select="http_protocol"
  mmsh_protocol_select="http_protocol"
  mmst_protocol_select="network"
-@@ -7268,6 +7271,7 @@ enabled libcelt           && require libcelt celt/celt.h celt_decode -lcelt0 &&
- enabled libcaca           && require_pkg_config libcaca caca caca.h caca_create_canvas
+@@ -7259,6 +7262,7 @@
  enabled libcodec2         && require libcodec2 codec2/codec2.h codec2_create -lcodec2
+ enabled libcurl           && check_pkg_config libcurl "libcurl >= 7.88.0" curl/curl.h curl_easy_init
  enabled libdav1d          && require_pkg_config libdav1d "dav1d >= 1.0.0" "dav1d/dav1d.h" dav1d_version
 +enabled ohos_http3        && require_pkg_config ohos_http3 "libnghttp3 >= 1.18.0" "nghttp3/nghttp3.h" nghttp3_conn_read_stream2
  enabled libdavs2          && require_pkg_config libdavs2 "davs2 >= 1.6.0" davs2.h davs2_decoder_open
@@ -45,7 +44,6 @@ index 1d42474..6a49da0 100644
  
  HEADERS = avformat.h                                                    \
 diff --git a/libavformat/http.c b/libavformat/http.c
-index b56ef5e..b71eea1 100644
 --- a/libavformat/http.c
 +++ b/libavformat/http.c
 @@ -48,6 +48,9 @@
@@ -58,7 +56,7 @@ index b56ef5e..b71eea1 100644
  
  /* XXX: POST protocol is not completely implemented because ffmpeg uses
   * only a subset of it. */
-@@ -313,15 +316,46 @@ static int http_open_cnx_internal(URLContext *h, AVDictionary **options)
+@@ -348,15 +351,46 @@
  
      if (!s->hd) {
          s->nb_connections++;
@@ -107,7 +105,7 @@ index b56ef5e..b71eea1 100644
  }
  
  static int http_should_reconnect(HTTPContext *s, int err)
-@@ -1303,6 +1337,10 @@ static int process_line(URLContext *h, char *line, int line_count, int *parsed_h
+@@ -1386,6 +1420,10 @@
          } else if (!av_strcasecmp(tag, "Content-Type")) {
              av_free(s->mime_type);
              s->mime_type = av_get_token((const char **)&p, ";");
@@ -116,7 +114,7 @@ index b56ef5e..b71eea1 100644
 +            ff_ohos_http3_observe(s->location, p);
 +#endif
          } else if (!av_strcasecmp(tag, "Set-Cookie")) {
-             if (parse_cookie(s, p, &s->cookie_dict))
+             if (parse_cookie(s, p, s->host, &s->cookie_dict))
                  av_log(h, AV_LOG_WARNING, "Unable to parse '%s'\n", p);
 diff --git a/libavformat/ohos_http3.c b/libavformat/ohos_http3.c
 new file mode 100644

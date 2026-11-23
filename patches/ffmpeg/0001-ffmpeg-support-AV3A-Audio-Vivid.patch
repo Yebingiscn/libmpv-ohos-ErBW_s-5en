@@ -1164,11 +1164,10 @@ index 615d60c..46f2123 100644
      }
  
 diff --git a/libavformat/Makefile b/libavformat/Makefile
-index 4786a93..1d42474 100644
 --- a/libavformat/Makefile
 +++ b/libavformat/Makefile
-@@ -149,6 +149,7 @@ OBJS-$(CONFIG_AVI_DEMUXER)               += avidec.o
- OBJS-$(CONFIG_AVI_MUXER)                 += avienc.o mpegtsenc.o avlanguage.o rawutils.o
+@@ -153,6 +153,7 @@
+ OBJS-$(CONFIG_AVI_MUXER)                 += avienc.o mpegtsenc.o rawutils.o
  OBJS-$(CONFIG_AVM2_MUXER)                += swfenc.o swf.o
  OBJS-$(CONFIG_AVR_DEMUXER)               += avr.o pcm.o
 +OBJS-$(CONFIG_AV3A_DEMUXER)              += av3adec.o
