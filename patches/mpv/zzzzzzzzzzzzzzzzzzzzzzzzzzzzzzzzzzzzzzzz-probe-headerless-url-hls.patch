@@ -1,0 +1,29 @@
+diff --git a/demux/demux_lavf.c b/demux/demux_lavf.c
+--- a/demux/demux_lavf.c
++++ b/demux/demux_lavf.c
+@@ -540,7 +540,24 @@
+                 final_probe = true;
+             avpd.buf_size = nsize;
+
+-            priv->avif = av_probe_input_format2(&avpd, avpd.buf_size > 0, &score);
++            // Some IPTV servers omit the playlist extension and send a generic
++            // MIME type. Prefer HLS only when the HTTP body has both the M3U
++            // header and a line identifying an HLS master or media playlist.
++            const char *playlist = (const char *)avpd.buf;
++            if ((av_stristart(priv->filename, "http://", NULL) ||
++                 av_stristart(priv->filename, "https://", NULL)) &&
++                (strncmp(playlist, "#EXTM3U\n", 8) == 0 ||
++                 strncmp(playlist, "#EXTM3U\r\n", 9) == 0) &&
++                (strstr(playlist, "\n#EXT-X-STREAM-INF:") ||
++                 strstr(playlist, "\n#EXT-X-TARGETDURATION:") ||
++                 strstr(playlist, "\n#EXT-X-MEDIA-SEQUENCE:"))) {
++                priv->avif = av_find_input_format("hls");
++            }
++            if (priv->avif) {
++                score = AVPROBE_SCORE_MAX;
++            } else {
++                priv->avif = av_probe_input_format2(&avpd, avpd.buf_size > 0, &score);
++            }
+         }
+
+         if (priv->avif) {
