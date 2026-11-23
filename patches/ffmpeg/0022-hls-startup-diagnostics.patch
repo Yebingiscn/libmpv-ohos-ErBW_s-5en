@@ -1,0 +1,69 @@
+diff --git a/libavformat/hls.c b/libavformat/hls.c
+--- a/libavformat/hls.c
++++ b/libavformat/hls.c
+@@ -33,6 +33,7 @@
+ #include "libavutil/aes.h"
+ #include "libavutil/avstring.h"
+ #include "libavutil/avassert.h"
++#include "libavutil/internal.h"
+ #include "libavutil/intreadwrite.h"
+ #include "libavutil/mathematics.h"
+ #include "libavutil/mem.h"
+@@ -247,6 +247,7 @@
+ };
+
+ typedef struct HLSContext {
+     AVClass *class;
+     AVFormatContext *ctx;
++    int startup_segment_log_budget;
+     int n_variants;
+@@ -1932,7 +1933,15 @@
+             v->input_next_requested = 0;
+             ret = 0;
+         } else {
++            int64_t segment_start_us = c->startup_segment_log_budget > 0 ?
++                av_gettime_relative() : 0;
+             ret = open_input(c, v, seg, &v->input, &v->input_end);
++            if (segment_start_us) {
++                av_log(v->parent, AV_LOG_VERBOSE,
++                       "[Perf] hls-first-segment-open index=%d ret=%d ms=%.3f\n",
++                       v->index, ret, (av_gettime_relative() - segment_start_us) / 1000.0);
++                c->startup_segment_log_budget = ret < 0 ? c->startup_segment_log_budget - 1 : 0;
++            }
+         }
+         if (ret < 0) {
+             if (ff_check_interrupt(c->interrupt_callback))
+@@ -2475,6 +2484,7 @@
+     int ret = 0, i;
+     int64_t highest_cur_seq_no = 0;
+
++    c->startup_segment_log_budget = 3;
+     c->ctx                = s;
+     c->interrupt_callback = &s->interrupt_callback;
+
+@@ -2508,7 +2518,11 @@
+        the range header */
+     av_dict_set_int(&c->avio_opts, "seekable", c->http_seekable, 0);
+
+-    if ((ret = parse_playlist(c, s->url, NULL, s->pb)) < 0)
++    int64_t playlist_start_us = av_gettime_relative();
++    ret = parse_playlist(c, s->url, NULL, s->pb);
++    av_log(s, AV_LOG_VERBOSE, "[Perf] hls-playlist kind=entry ret=%d ms=%.3f\n",
++           ret, (av_gettime_relative() - playlist_start_us) / 1000.0);
++    if (ret < 0)
+         return ret;
+
+     if (c->n_variants == 0) {
+@@ -2521,7 +2535,11 @@
+         for (i = 0; i < c->n_playlists; i++) {
+             struct playlist *pls = c->playlists[i];
+             pls->m3u8_hold_counters = 0;
+-            if ((ret = parse_playlist(c, pls->url, pls, NULL)) < 0) {
++            playlist_start_us = av_gettime_relative();
++            ret = parse_playlist(c, pls->url, pls, NULL);
++            av_log(s, AV_LOG_VERBOSE, "[Perf] hls-playlist kind=media index=%d ret=%d ms=%.3f\n",
++                   pls->index, ret, (av_gettime_relative() - playlist_start_us) / 1000.0);
++            if (ret < 0) {
+                 av_log(s, AV_LOG_WARNING, "parse_playlist error %s [%s]\n", av_err2str(ret), pls->url);
+                 pls->broken = 1;
+                 if (c->n_playlists > 1)

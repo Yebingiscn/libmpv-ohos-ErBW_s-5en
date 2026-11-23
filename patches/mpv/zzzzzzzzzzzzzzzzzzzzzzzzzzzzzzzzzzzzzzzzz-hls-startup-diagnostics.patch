@@ -1,0 +1,113 @@
+diff --git a/demux/demux_lavf.c b/demux/demux_lavf.c
+--- a/demux/demux_lavf.c
++++ b/demux/demux_lavf.c
+@@ -59,6 +59,7 @@
+ #include "options/m_option.h"
+ #include "options/options.h"
+ #include "options/path.h"
++#include "osdep/timer.h"
+ #include "video/csputils.h"
+
+ #define INITIAL_PROBE_SIZE STREAM_BUFFER_SIZE
+@@ -524,6 +525,9 @@
+     if (!avpd.buf)
+         return -1;
+
++    int64_t probe_ns = s->is_network && mp_msg_test(demuxer->log, MSGL_DEBUG) ?
++        mp_time_ns() : 0;
++    bool first_peek = true;
+     bool final_probe = false;
+     do {
+         int score = 0;
+@@ -534,7 +538,13 @@
+         } else {
+             int nsize = av_clip(avpd.buf_size * 2, INITIAL_PROBE_SIZE,
+                                 PROBE_BUF_SIZE);
++            int requested = nsize;
+             nsize = stream_read_peek(s, avpd.buf, nsize);
++            if (probe_ns && first_peek) {
++                MP_DBG(demuxer, "[Perf] network-first-probe-read requested=%d bytes=%d ms=%.3f\n",
++                       requested, nsize, (mp_time_ns() - probe_ns) / 1e6);
++                first_peek = false;
++            }
+             memset(avpd.buf + nsize, 0, AV_INPUT_BUFFER_PADDING_SIZE);
+             if (nsize <= avpd.buf_size)
+                 final_probe = true;
+@@ -592,6 +602,10 @@
+         priv->format_hack = (struct format_hack){0};
+     } while (!final_probe);
+
++    if (probe_ns)
++        MP_DBG(demuxer, "[Perf] network-probe format=%s bytes=%d ms=%.3f\n",
++               priv->avif ? priv->avif->name : "unknown", avpd.buf_size,
++               (mp_time_ns() - probe_ns) / 1e6);
+     av_free(avpd.buf);
+
+     if (priv->avif && !forced_format && priv->format_hack.ignore) {
+@@ -1626,7 +1640,13 @@
+         MP_VERBOSE(demuxer, "...did read %d bytes.\n", r);
+     }
+
+-    if (avformat_open_input(&avfc, priv->filename, priv->avif, &dopts) < 0) {
++    int64_t hls_ns = matches_avinputformat_name(priv, "hls") &&
++        mp_msg_test(demuxer->log, MSGL_DEBUG) ? mp_time_ns() : 0;
++    int open_result = avformat_open_input(&avfc, priv->filename, priv->avif, &dopts);
++    if (hls_ns)
++        MP_DBG(demuxer, "[Perf] hls-open-input ret=%d ms=%.3f\n",
++               open_result, (mp_time_ns() - hls_ns) / 1e6);
++    if (open_result < 0) {
+         MP_ERR(demuxer, "avformat_open_input() failed\n");
+         goto fail;
+     }
+@@ -1657,7 +1677,12 @@
+         for (int i = 0; i < nb_streams; i++)
+             av_dict_set_int(&opts[i], "max_pixels", 2048 * 2048, 0);
+ #endif
++        if (hls_ns)
++            hls_ns = mp_time_ns();
+         int r = avformat_find_stream_info(avfc, opts);
++        if (hls_ns)
++            MP_DBG(demuxer, "[Perf] hls-stream-info ret=%d ms=%.3f\n",
++                   r, (mp_time_ns() - hls_ns) / 1e6);
+         for (int i = 0; i < nb_streams; i++)
+             av_dict_free(&opts[i]);
+         talloc_free(opts);
+diff --git a/stream/stream_lavf.c b/stream/stream_lavf.c
+--- a/stream/stream_lavf.c
++++ b/stream/stream_lavf.c
+@@ -28,6 +28,7 @@
+ #include "network.h"
+ #include "options/m_config.h"
+ #include "options/m_option.h"
++#include "osdep/timer.h"
+
+ #include "cookies.h"
+
+@@ -57,7 +58,12 @@
+ static int fill_buffer(stream_t *s, void *buffer, int max_len)
+ {
+     AVIOContext *avio = s->priv;
++    int64_t start_ns = s->is_network && mp_msg_test(s->log, MSGL_DEBUG) &&
++        avio_tell(avio) == 0 ? mp_time_ns() : 0;
+     int r = avio_read_partial(avio, buffer, max_len);
++    if (start_ns)
++        MP_DBG(s, "[Perf] network-read-at-start requested=%d ret=%d ms=%.3f\n",
++               max_len, r, (mp_time_ns() - start_ns) / 1e6);
+     return (r <= 0) ? -1 : r;
+ }
+
+@@ -409,7 +415,14 @@
+         av_dict_set(&dict, "timeout", "0", 0);
+     }
+
++    int64_t start_ns = stream->info->stream_origin == STREAM_ORIGIN_NET &&
++        mp_msg_test(stream->log, MSGL_DEBUG) ? mp_time_ns() : 0;
++    if (start_ns)
++        MP_DBG(stream, "[Perf] network-open-begin\n");
+     int err = avio_open2(&avio, filename, flags, &cb, &dict);
++    if (start_ns)
++        MP_DBG(stream, "[Perf] network-open ret=%d ms=%.3f\n",
++               err, (mp_time_ns() - start_ns) / 1e6);
+     if (err < 0) {
+         if (err == AVERROR_PROTOCOL_NOT_FOUND)
+             MP_ERR(stream, "Protocol not found. Make sure"
