@@ -1,0 +1,241 @@
+diff --git a/audio/out/ao_ohaudio.c b/audio/out/ao_ohaudio.c
+index a5df246..639d25d 100644
+--- a/audio/out/ao_ohaudio.c
++++ b/audio/out/ao_ohaudio.c
+@@ -390,7 +390,7 @@ static OH_AudioStream_SampleFormat stream_sample_format(int format)
+     }
+ }
+ 
+-static void select_suite_formats(struct ao *ao)
++static bool select_suite_formats(struct ao *ao, bool preserve_pcm)
+ {
+     struct priv *p = ao->priv;
+     int input_rate = 48000;
+@@ -414,9 +414,13 @@ static void select_suite_formats(struct ao *ao)
+         break;
+     case SUITE_EFFECT_AUDIO_SEPARATION:
+     case SUITE_EFFECT_AUDIO_MIXER:
++        if (preserve_pcm)
++            return false;
+         input_format = output_format = AF_FORMAT_FLOAT;
+         break;
+     case SUITE_EFFECT_HOA_SPACE_RENDER:
++        if (preserve_pcm)
++            return false;
+         input_layout = suite_hoa_layout(p->suite_hoa_layout, &input_channels);
+         input_format = output_format = AF_FORMAT_S32;
+         break;
+@@ -424,6 +428,26 @@ static void select_suite_formats(struct ao *ao)
+         break;
+     }
+ 
++    if (preserve_pcm) {
++        int channels = ao->channels.num;
++        int format = af_fmt_from_planar(ao->format);
++        int rate = ao->samplerate;
++        if ((channels != 1 && channels != 2) ||
++            (input_channels == 1 && channels != 1) ||
++            rate < 8000 || rate > 192000 ||
++            (format != AF_FORMAT_U8 && format != AF_FORMAT_S16 &&
++             format != AF_FORMAT_S32 && format != AF_FORMAT_FLOAT))
++            return false;
++        if (rate == input_rate && channels == input_channels && format == input_format)
++            return false;
++
++        // The AudioSuite node adapters handle the effect's internal format.
++        input_rate = output_rate = rate;
++        input_channels = output_channels = channels;
++        input_format = output_format = format;
++        input_layout = channels == 1 ? CH_LAYOUT_MONO : CH_LAYOUT_STEREO;
++    }
++
+     ao->samplerate = input_rate;
+     ao->format = input_format;
+     // HOA coefficients must retain the input track's channel order. A normal
+@@ -448,6 +472,7 @@ static void select_suite_formats(struct ao *ao)
+     p->suite_input_stride = af_fmt_to_bytes(input_format) * input_channels;
+     p->suite_output_stride = af_fmt_to_bytes(output_format) * output_channels;
+     p->suite_output_rate = output_rate;
++    return true;
+ }
+ 
+ static int32_t suite_request_data(OH_AudioNode *node, void *user_data,
+@@ -682,8 +707,6 @@ static bool init_audio_suite(struct ao *ao)
+     }
+     p->suite_active = true;
+     suite_api.OH_AudioSuiteNodeBuilder_Destroy(builder);
+-    MP_INFO(ao, "AudioSuite real-time effect enabled: %s.\n",
+-            suite_effect_name(p->suite_effect));
+     return true;
+ 
+ error:
+@@ -794,6 +817,8 @@ static int render_audio_suite(struct ao *ao, void *audio_data,
+     return MPCLAMP(response_size, 0, audio_data_size);
+ }
+ 
++static bool init_renderer(struct ao *ao);
++
+ static int32_t audio_on_write_callback(
+     OH_AudioRenderer* renderer,
+     void* userData,
+@@ -891,22 +916,10 @@ static int init(struct ao* ao)
+     if (!af_fmt_is_pcm(ao->format))
+         return -1;
+     struct priv* p = ao->priv;
+-    OH_AudioStream_Result res = 0;
+-    int renderer_rate;
+-    int renderer_channels;
+-    int renderer_format;
+-
+     bool wg_available = ohaudio_wg_init(&p->workgroup);
+     MP_INFO(ao, "Audio workgroup %s; default automatic policy covers PCM and AudioSuite.\n",
+                wg_available ? "ready (awaiting callback thread)" : "unavailable, using normal scheduling");
+ 
+-    res = OH_AudioStreamBuilder_Create(&p->builder, AUDIOSTREAM_TYPE_RENDERER);
+-
+-    if (res != AUDIOSTREAM_SUCCESS) {
+-        MP_ERR(ao, "Fail to create audio stream: error code %d.\n", res);
+-        goto error;
+-    }
+-
+ #if !HAVE_OHAUDIOSUITE_HOA
+     if (p->suite_effect == SUITE_EFFECT_HOA_SPACE_RENDER) {
+         MP_WARN(ao, "AudioSuite HOA is unavailable in this build's SDK; "
+@@ -930,10 +943,27 @@ static int init(struct ao* ao)
+         int original_rate = ao->samplerate;
+         int original_format = ao->format;
+         struct mp_chmap original_channels = ao->channels;
+-        select_suite_formats(ao);
+         if (p->encoding_type != AUDIOSTREAM_ENCODING_TYPE_RAW)
+             MP_WARN(ao, "AudioSuite requires raw PCM; ignoring encoding_type=%d.\n",
+                     p->encoding_type);
++        if (select_suite_formats(ao, true)) {
++            if (init_audio_suite(ao)) {
++                if (init_renderer(ao))
++                    goto renderer_ready;
++                if (p->renderer)
++                    goto error;
++                if (p->builder) {
++                    OH_AudioStreamBuilder_Destroy(p->builder);
++                    p->builder = NULL;
++                }
++                uninit_audio_suite(p);
++            }
++            ao->samplerate = original_rate;
++            ao->format = original_format;
++            ao->channels = original_channels;
++            MP_WARN(ao, "AudioSuite could not start with input PCM; retrying with the effect's default format.\n");
++        }
++        select_suite_formats(ao, false);
+         if (!init_audio_suite(ao)) {
+             MP_WARN(ao, "Continuing with plain OHAudio output.\n");
+             ao->samplerate = original_rate;
+@@ -954,6 +984,45 @@ static int init(struct ao* ao)
+         }
+     }
+ 
++    if (!init_renderer(ao))
++        goto error;
++
++renderer_ready:
++    if (p->suite_active) {
++        MP_INFO(ao, "AudioSuite real-time effect enabled: %s (%d Hz, %d channels, %s).\n",
++                suite_effect_name(p->suite_effect), p->suite_output_rate,
++                p->suite_output_format.channelCount, af_fmt_to_str(ao->format));
++    }
++    MP_INFO(ao, "OHAudio route policy: %s; offload selection is device-managed.\n",
++            (ao->init_flags & AO_INIT_MEDIA_ROLE_MUSIC) && !p->suite_active
++                ? "music (power-saving eligible, 250ms clock polling)"
++                : "movie (video/effects timing)");
++
++    init_timing(p);
++    if (!start_clock_thread(ao)) {
++        MP_ERR(ao, "Fail to create OHAudio clock thread.\n");
++        goto error;
++    }
++
++    return 0;
++error:
++    uninit(ao);
++    return -1;
++}
++
++static bool init_renderer(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++    int renderer_rate;
++    int renderer_channels;
++    int renderer_format;
++    OH_AudioStream_Result res =
++        OH_AudioStreamBuilder_Create(&p->builder, AUDIOSTREAM_TYPE_RENDERER);
++    if (res != AUDIOSTREAM_SUCCESS) {
++        MP_ERR(ao, "Fail to create audio stream: error code %d.\n", res);
++        return false;
++    }
++
+     if (p->suite_active) {
+         renderer_rate = p->suite_output_format.samplingRate;
+         renderer_channels = p->suite_output_format.channelCount;
+@@ -988,7 +1057,7 @@ static int init(struct ao* ao)
+             p->builder, stream_sample_format(renderer_format));
+     if (res != AUDIOSTREAM_SUCCESS) {
+         MP_ERR(ao, "Fail to configure audio stream: error code %d.\n", res);
+-        goto error;
++        return false;
+     }
+ 
+     OH_AudioRenderer_OnWriteDataCallbackAdvanced callback = audio_on_write_callback;
+@@ -996,33 +1065,16 @@ static int init(struct ao* ao)
+         p->builder, callback, ao);
+     if (res != AUDIOSTREAM_SUCCESS) {
+         MP_ERR(ao, "Fail to set audio callback: error code %d.\n", res);
+-        goto error;
++        return false;
+     }
+ 
+     res = OH_AudioStreamBuilder_GenerateRenderer(p->builder, &p->renderer);
+ 
+-    if (res == AUDIOSTREAM_SUCCESS) {
+-        MP_INFO(ao, "OHAudio route policy: %s; offload selection is device-managed.\n",
+-            (ao->init_flags & AO_INIT_MEDIA_ROLE_MUSIC) && !p->suite_active
+-                ? "music (power-saving eligible, 250ms clock polling)"
+-                : "movie (video/effects timing)");
+-    }
+-
+     if (res != AUDIOSTREAM_SUCCESS) {
+         MP_ERR(ao, "Fail to generate audio renderer: error code %d.\n", res);
+-        goto error;
+-    }
+-
+-    init_timing(p);
+-    if (!start_clock_thread(ao)) {
+-        MP_ERR(ao, "Fail to create OHAudio clock thread.\n");
+-        goto error;
++        return false;
+     }
+-
+-    return 0;
+-error:
+-    uninit(ao);
+-    return -1;
++    return true;
+ }
+ 
+ static int control(struct ao *ao, enum aocontrol cmd, void *arg)
+diff --git a/DOCS/man/ao.rst b/DOCS/man/ao.rst
+index e4311d6..9d69b3c 100644
+--- a/DOCS/man/ao.rst
++++ b/DOCS/man/ao.rst
+@@ -167,6 +167,12 @@ Available audio output drivers are:
+     default and requires API 23 or newer (HOA space rendering requires API
+     26). The build SDK must also expose the HOA node declaration; some
+     OpenHarmony SDKs do not provide it. Such builds disable HOA processing.
++    For supported mono and stereo PCM, effects such as the equalizer use the
++    input rate, channel count and packed sample format for AudioSuite I/O and
++    OHAudio output. Effect algorithms can still use an internal fixed format.
++    If the device rejects the PCM configuration, mpv retries the effect with
++    its default format. Multichannel input, stereo input to mono-only effects,
++    separation, mixing and HOA use their effect-specific formats.
+     Unsupported effects fall back to plain OHAudio output.
+ 
+     ``--ohaudio-suite-effect=<effect>``
